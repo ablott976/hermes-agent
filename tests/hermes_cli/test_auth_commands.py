@@ -483,6 +483,183 @@ def test_auth_add_codex_oauth_keeps_distinct_pool_accounts(tmp_path, monkeypatch
     assert payload["active_provider"] == "openai-codex"
 
 
+def test_codex_profile_reads_shared_root_auth_without_copying(tmp_path, monkeypatch):
+    """Profile Codex auth should borrow the root auth store when local auth is absent."""
+    root = tmp_path / "hermes"
+    profile_home = root / "profiles" / "evacausin"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "shared-access-token",
+                        "refresh_token": "shared-refresh-token",
+                    },
+                    "last_refresh": "2026-06-10T10:00:00Z",
+                    "auth_mode": "chatgpt",
+                }
+            },
+        },
+    )
+
+    from hermes_cli.auth import resolve_codex_runtime_credentials
+
+    creds = resolve_codex_runtime_credentials(refresh_if_expiring=False)
+
+    assert creds["api_key"] == "shared-access-token"
+    assert creds["source"] == "hermes-auth-store"
+    assert not (profile_home / "auth.json").exists()
+
+
+def test_codex_profile_refresh_writes_shared_root_auth(tmp_path, monkeypatch):
+    """Refreshing borrowed Codex auth must update the root store, not clone into the profile."""
+    root = tmp_path / "hermes"
+    profile_home = root / "profiles" / "evacausin"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "old-shared-access-token",
+                        "refresh_token": "old-shared-refresh-token",
+                    },
+                    "last_refresh": "2026-06-10T10:00:00Z",
+                    "auth_mode": "chatgpt",
+                }
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "device",
+                        "label": "shared",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "device_code",
+                        "access_token": "old-shared-access-token",
+                        "refresh_token": "old-shared-refresh-token",
+                        "last_status": "dead",
+                    }
+                ]
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.refresh_codex_oauth_pure",
+        lambda access_token, refresh_token, *, timeout_seconds=20.0: {
+            "access_token": "new-shared-access-token",
+            "refresh_token": "new-shared-refresh-token",
+            "last_refresh": "2026-06-10T10:05:00Z",
+        },
+    )
+
+    from hermes_cli.auth import resolve_codex_runtime_credentials
+
+    creds = resolve_codex_runtime_credentials(force_refresh=True)
+
+    assert creds["api_key"] == "new-shared-access-token"
+    assert not (profile_home / "auth.json").exists()
+    payload = json.loads((root / "auth.json").read_text())
+    state = payload["providers"]["openai-codex"]
+    assert state["tokens"]["access_token"] == "new-shared-access-token"
+    assert state["tokens"]["refresh_token"] == "new-shared-refresh-token"
+    entry = payload["credential_pool"]["openai-codex"][0]
+    assert entry["access_token"] == "new-shared-access-token"
+    assert entry["refresh_token"] == "new-shared-refresh-token"
+    assert entry["last_status"] is None
+
+
+def test_codex_profile_reads_shared_root_pool_without_singleton(tmp_path, monkeypatch):
+    """Profile Codex auth should also borrow root pool-only entries."""
+    root = tmp_path / "hermes"
+    profile_home = root / "profiles" / "evacausin"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {},
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "manual",
+                        "label": "shared-manual",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "shared-pool-access-token",
+                        "refresh_token": "shared-pool-refresh-token",
+                    }
+                ]
+            },
+        },
+    )
+
+    from hermes_cli.auth import resolve_codex_runtime_credentials
+
+    creds = resolve_codex_runtime_credentials(refresh_if_expiring=False)
+
+    assert creds["api_key"] == "shared-pool-access-token"
+    assert creds["source"] == "credential_pool"
+    assert not (profile_home / "auth.json").exists()
+
+
+def test_codex_shared_auth_prefer_overrides_profile_local(tmp_path, monkeypatch):
+    """prefer mode lets operators enforce one root Codex auth across old profiles."""
+    root = tmp_path / "hermes"
+    profile_home = root / "profiles" / "evacausin"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("HERMES_CODEX_SHARED_AUTH", "prefer")
+    (profile_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "providers": {
+                    "openai-codex": {
+                        "tokens": {
+                            "access_token": "local-old-access-token",
+                            "refresh_token": "local-old-refresh-token",
+                        },
+                        "auth_mode": "chatgpt",
+                    }
+                },
+            }
+        )
+    )
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "shared-preferred-access-token",
+                        "refresh_token": "shared-preferred-refresh-token",
+                    },
+                    "last_refresh": "2026-06-10T10:00:00Z",
+                    "auth_mode": "chatgpt",
+                }
+            },
+        },
+    )
+
+    from hermes_cli.auth import resolve_codex_runtime_credentials
+
+    creds = resolve_codex_runtime_credentials(refresh_if_expiring=False)
+
+    assert creds["api_key"] == "shared-preferred-access-token"
+    assert creds["auth_scope"] == "shared"
+
+
 def test_auth_add_xai_oauth_sets_active_provider(tmp_path, monkeypatch):
     """hermes auth add xai-oauth must write providers singleton and set active_provider.
 
