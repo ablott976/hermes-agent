@@ -3324,3 +3324,320 @@ def test_sync_anthropic_entry_clears_all_error_fields(tmp_path, monkeypatch):
     assert synced.last_error_reason is None
     assert synced.last_error_message is None
     assert synced.last_error_reset_at is None
+# ── OAuth refresh keep-alive while exhausted ─────────────────────────────
+
+def _make_exhausted_codex_pool(tmp_path, monkeypatch, *, auth_type: str = "oauth"):
+    """Build a pool with a single OAuth Codex entry sitting in cooldown."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr(
+        "hermes_cli.auth._import_codex_cli_tokens",
+        lambda: None,
+    )
+    reset_at = time.time() + 30 * 60  # 30 minutes in the future
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-keepalive",
+                        "label": "weekly-cooldown",
+                        "auth_type": auth_type,
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "old-access",
+                        "refresh_token": "old-refresh",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time() - 60,
+                        "last_error_code": 429,
+                        "last_error_reason": "weekly_quota",
+                        "last_error_message": "weekly limit",
+                        "last_error_reset_at": reset_at,
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    return load_pool("openai-codex"), reset_at
+
+
+def test_oauth_refresh_keepalive_while_exhausted(tmp_path, monkeypatch):
+    """Exhausted OAuth entries should still rotate refresh_tokens in the background.
+
+    Regression for #44799: long cooldown windows (e.g. ChatGPT weekly quota)
+    can outlive the upstream refresh_token's lifetime.  The pool must keep
+    the token chain warm without flipping the entry back to STATUS_OK.
+    """
+    from dataclasses import replace as dc_replace
+
+    from agent.credential_pool import STATUS_OK, STATUS_EXHAUSTED
+
+    pool, reset_at = _make_exhausted_codex_pool(tmp_path, monkeypatch)
+
+    refresh_calls = []
+
+    def _fake_refresh(entry, *, force):
+        refresh_calls.append((entry.id, force))
+        return dc_replace(
+            entry,
+            access_token="new-access",
+            refresh_token="new-refresh",
+            last_status=STATUS_OK,
+            last_status_at=None,
+            last_error_code=None,
+            last_error_reason=None,
+            last_error_message=None,
+            last_error_reset_at=None,
+        )
+
+    monkeypatch.setattr(pool, "_entry_needs_refresh", lambda e: True)
+    monkeypatch.setattr(pool, "_refresh_entry", _fake_refresh)
+
+    available = pool._available_entries(refresh=True)
+
+    assert available == []
+    assert refresh_calls == [("cred-keepalive", False)]
+
+    rotated = pool._entries[0]
+    assert rotated.access_token == "new-access"
+    assert rotated.refresh_token == "new-refresh"
+    # Exhaustion gating must remain intact.
+    assert rotated.last_status == STATUS_EXHAUSTED
+    assert rotated.last_error_reset_at == reset_at
+    assert rotated.last_error_code == 429
+    assert rotated.last_error_reason == "weekly_quota"
+
+
+def test_oauth_keepalive_skipped_when_no_refresh_needed(tmp_path, monkeypatch):
+    pool, _ = _make_exhausted_codex_pool(tmp_path, monkeypatch)
+
+    refresh_calls = []
+    monkeypatch.setattr(pool, "_entry_needs_refresh", lambda e: False)
+    monkeypatch.setattr(
+        pool,
+        "_refresh_entry",
+        lambda entry, *, force: refresh_calls.append(entry.id) or None,
+    )
+
+    available = pool._available_entries(refresh=True)
+
+    assert available == []
+    assert refresh_calls == []
+    untouched = pool._entries[0]
+    assert untouched.access_token == "old-access"
+    assert untouched.refresh_token == "old-refresh"
+
+
+def test_api_key_exhausted_entry_is_not_keepalive_refreshed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "cred-api",
+                        "label": "api-key",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-ant-api",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time(),
+                        "last_error_code": 429,
+                        "last_error_reset_at": time.time() + 30 * 60,
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("anthropic")
+    refresh_calls = []
+    monkeypatch.setattr(pool, "_entry_needs_refresh", lambda e: True)
+    monkeypatch.setattr(
+        pool,
+        "_refresh_entry",
+        lambda entry, *, force: refresh_calls.append(entry.id) or None,
+    )
+
+    available = pool._available_entries(refresh=True)
+
+    assert available == []
+    # API key entries have no refresh token to rotate; keep-alive must not fire.
+    assert refresh_calls == []
+
+
+def test_oauth_keepalive_swallows_refresh_failure(tmp_path, monkeypatch):
+    from agent.credential_pool import STATUS_EXHAUSTED
+
+    pool, reset_at = _make_exhausted_codex_pool(tmp_path, monkeypatch)
+
+    def _boom(entry, *, force):
+        raise RuntimeError("network is down")
+
+    monkeypatch.setattr(pool, "_entry_needs_refresh", lambda e: True)
+    monkeypatch.setattr(pool, "_refresh_entry", _boom)
+
+    available = pool._available_entries(refresh=True)
+
+    assert available == []
+    untouched = pool._entries[0]
+    assert untouched.access_token == "old-access"
+    assert untouched.refresh_token == "old-refresh"
+    assert untouched.last_status == STATUS_EXHAUSTED
+    assert untouched.last_error_reset_at == reset_at
+
+
+def test_oauth_keepalive_preserves_reset_window_on_refresh_returning_none(
+    tmp_path, monkeypatch
+):
+    """Non-terminal refresh failure must not collapse the cooldown window.
+
+    _refresh_entry() catches non-fatal errors internally and falls through to
+    _mark_exhausted(entry, None), which rewrites the entry with a freshly-
+    defaulted exhaustion window.  The keep-alive path must restore the
+    original snapshot regardless of the refresh outcome.
+    """
+    from dataclasses import replace as dc_replace
+
+    from agent.credential_pool import STATUS_EXHAUSTED
+
+    pool, reset_at = _make_exhausted_codex_pool(tmp_path, monkeypatch)
+
+    def _fake_refresh_returns_none(entry, *, force):
+        # Mimic _mark_exhausted(entry, None) damaging the entry in place.
+        current = next(e for e in pool._entries if e.id == entry.id)
+        damaged = dc_replace(
+            current,
+            last_status=STATUS_EXHAUSTED,
+            last_status_at=time.time(),
+            last_error_code=None,
+            last_error_reason=None,
+            last_error_message=None,
+            last_error_reset_at=None,
+        )
+        pool._replace_entry(current, damaged)
+        return None
+
+    monkeypatch.setattr(pool, "_entry_needs_refresh", lambda e: True)
+    monkeypatch.setattr(pool, "_refresh_entry", _fake_refresh_returns_none)
+
+    available = pool._available_entries(refresh=True)
+
+    assert available == []
+    restored = pool._entries[0]
+    assert restored.last_error_reset_at == reset_at
+    assert restored.last_error_code == 429
+    assert restored.last_error_reason == "weekly_quota"
+    assert restored.last_status == STATUS_EXHAUSTED
+
+
+def test_oauth_keepalive_persists_restored_state(tmp_path, monkeypatch):
+    """After keep-alive, on-disk pool must reflect rotated tokens + cooldown."""
+    from dataclasses import replace as dc_replace
+
+    from agent.credential_pool import STATUS_OK, STATUS_EXHAUSTED, load_pool
+
+    pool, reset_at = _make_exhausted_codex_pool(tmp_path, monkeypatch)
+
+    def _fake_refresh(entry, *, force):
+        return dc_replace(
+            entry,
+            access_token="new-access",
+            refresh_token="new-refresh",
+            last_status=STATUS_OK,
+            last_status_at=None,
+            last_error_code=None,
+            last_error_reason=None,
+            last_error_message=None,
+            last_error_reset_at=None,
+        )
+
+    monkeypatch.setattr(pool, "_entry_needs_refresh", lambda e: True)
+    monkeypatch.setattr(pool, "_refresh_entry", _fake_refresh)
+
+    pool._available_entries(refresh=True)
+
+    reloaded = load_pool("openai-codex")
+    on_disk = reloaded._entries[0]
+    assert on_disk.access_token == "new-access"
+    assert on_disk.refresh_token == "new-refresh"
+    assert on_disk.last_status == STATUS_EXHAUSTED
+    assert on_disk.last_error_reset_at == reset_at
+
+
+def test_xai_oauth_keepalive_while_exhausted(tmp_path, monkeypatch):
+    """Keep-alive isn't openai-codex-specific; xai-oauth must work the same."""
+    from dataclasses import replace as dc_replace
+
+    from agent.credential_pool import STATUS_OK, STATUS_EXHAUSTED, load_pool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    reset_at = time.time() + 30 * 60
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "xai-oauth": [
+                    {
+                        "id": "cred-xai",
+                        "label": "xai-cooldown",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "device_code",
+                        "access_token": "old-access",
+                        "refresh_token": "old-refresh",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time() - 60,
+                        "last_error_code": 429,
+                        "last_error_reason": "weekly_quota",
+                        "last_error_message": "weekly limit",
+                        "last_error_reset_at": reset_at,
+                    }
+                ]
+            },
+        },
+    )
+
+    pool = load_pool("xai-oauth")
+
+    refresh_calls = []
+
+    def _fake_refresh(entry, *, force):
+        refresh_calls.append((entry.id, force))
+        return dc_replace(
+            entry,
+            access_token="new-access",
+            refresh_token="new-refresh",
+            last_status=STATUS_OK,
+            last_status_at=None,
+            last_error_code=None,
+            last_error_reason=None,
+            last_error_message=None,
+            last_error_reset_at=None,
+        )
+
+    monkeypatch.setattr(pool, "_entry_needs_refresh", lambda e: True)
+    monkeypatch.setattr(pool, "_refresh_entry", _fake_refresh)
+
+    available = pool._available_entries(refresh=True)
+
+    assert available == []
+    assert refresh_calls == [("cred-xai", False)]
+
+    rotated = pool._entries[0]
+    assert rotated.access_token == "new-access"
+    assert rotated.refresh_token == "new-refresh"
+    assert rotated.last_status == STATUS_EXHAUSTED
+    assert rotated.last_error_reset_at == reset_at
+    assert rotated.last_error_code == 429
+    assert rotated.last_error_reason == "weekly_quota"

@@ -1459,6 +1459,83 @@ class CredentialPool:
             if entry.last_status == STATUS_EXHAUSTED:
                 exhausted_until = _exhausted_until(entry)
                 if exhausted_until is not None and now < exhausted_until:
+                    # Keep the OAuth refresh chain alive even while the entry
+                    # is sitting out a cooldown window.  Provider refresh-token
+                    # exchanges (Codex, xAI, Anthropic) do NOT count against
+                    # the same quota that put us in exhaustion — they only
+                    # rotate tokens.  But refresh_tokens themselves expire on
+                    # their own clock (and many providers are single-use).
+                    # If the cooldown (e.g. ChatGPT's ~7-day weekly window)
+                    # outlives the refresh_token's lifetime, the user is
+                    # forced to redo a device-code login as soon as the
+                    # cooldown clears.  Refreshing in place here keeps the
+                    # token chain warm without changing the exhaustion gate:
+                    # we restore the exhausted status fields after the
+                    # rotation so the entry is still NOT returned for use.
+                    if (
+                        refresh
+                        and entry.auth_type == AUTH_TYPE_OAUTH
+                        and self._entry_needs_refresh(entry)
+                    ):
+                        snapshot = (
+                            entry.last_status,
+                            entry.last_status_at,
+                            entry.last_error_code,
+                            entry.last_error_reason,
+                            entry.last_error_message,
+                            entry.last_error_reset_at,
+                        )
+                        try:
+                            refreshed = self._refresh_entry(entry, force=False)
+                        except Exception as exc:  # pragma: no cover - defensive
+                            logger.debug(
+                                "credential pool: keepalive refresh raised for "
+                                "exhausted %s entry %s: %s",
+                                self.provider,
+                                entry.label or entry.id[:8],
+                                exc,
+                            )
+                            refreshed = None
+
+                        # Whether _refresh_entry succeeded, returned None, or
+                        # raised, it may have rewritten our pool entry in place
+                        # (either with rotated tokens + STATUS_OK on success, or
+                        # with a short default-cooldown via _mark_exhausted on
+                        # non-terminal failure). Either outcome would corrupt
+                        # the original quota window. Pick the most-recent view
+                        # of the entry — preferring the rotated copy returned
+                        # by _refresh_entry (real impl swaps it in via
+                        # _replace_entry already; we still cover the case
+                        # where it didn't) — restore the original exhaustion
+                        # fields, and persist exactly once so the visible-on-
+                        # disk gap is the smallest window we can achieve
+                        # without touching _refresh_entry's signature.
+                        current = next(
+                            (e for e in self._entries if e.id == entry.id),
+                            None,
+                        )
+                        base = refreshed if refreshed is not None else current
+                        if base is not None and (
+                            base.last_status != snapshot[0]
+                            or base.last_status_at != snapshot[1]
+                            or base.last_error_code != snapshot[2]
+                            or base.last_error_reason != snapshot[3]
+                            or base.last_error_message != snapshot[4]
+                            or base.last_error_reset_at != snapshot[5]
+                            or current is not base
+                        ):
+                            restored = replace(
+                                base,
+                                last_status=snapshot[0],
+                                last_status_at=snapshot[1],
+                                last_error_code=snapshot[2],
+                                last_error_reason=snapshot[3],
+                                last_error_message=snapshot[4],
+                                last_error_reset_at=snapshot[5],
+                            )
+                            anchor = current if current is not None else base
+                            self._replace_entry(anchor, restored)
+                            cleared_any = True
                     continue
                 if clear_expired:
                     cleared = replace(
