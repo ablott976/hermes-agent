@@ -108,7 +108,9 @@ SUPPORTED_POOL_STRATEGIES = {
 # Cooldown before retrying an exhausted credential.
 # Transient 401 auth failures cool down briefly so single-key setups can recover.
 # 429 (rate-limited), 402 (billing/quota), and other failures cool down after 1 hour.
-# Provider-supplied reset_at timestamps override these defaults.
+# Provider-supplied reset_at timestamps may shorten the cooldown, but must not
+# extend it: users can reset provider quotas/limits out-of-band, so a stale
+# reset_at is only advisory and should not freeze a credential for days.
 EXHAUSTED_TTL_401_SECONDS = 5 * 60           # 5 minutes
 EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour
 EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
@@ -338,11 +340,14 @@ def _exhausted_until(entry: PooledCredential) -> Optional[float]:
     if entry.last_status != STATUS_EXHAUSTED:
         return None
     reset_at = _parse_absolute_timestamp(getattr(entry, "last_error_reset_at", None))
-    if reset_at is not None:
-        return reset_at
+    ttl_until = None
     if entry.last_status_at:
-        return entry.last_status_at + _exhausted_ttl(entry.last_error_code)
-    return None
+        ttl_until = entry.last_status_at + _exhausted_ttl(entry.last_error_code)
+    if reset_at is not None and ttl_until is not None:
+        return min(reset_at, ttl_until)
+    if ttl_until is not None:
+        return ttl_until
+    return reset_at
 
 
 def _normalize_custom_pool_name(name: str) -> str:
