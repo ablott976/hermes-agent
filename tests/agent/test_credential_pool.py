@@ -337,6 +337,43 @@ def test_explicit_reset_timestamp_does_not_extend_default_429_ttl(tmp_path, monk
     assert entry.last_status == "ok"
 
 
+def test_explicit_reset_timestamp_keeps_recent_429_in_cooldown(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr(
+        "hermes_cli.auth._import_codex_cli_tokens",
+        lambda: None,
+    )
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "recent-weekly-reset",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "tok-1",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time(),
+                        "last_error_code": 429,
+                        "last_error_reason": "device_code_exhausted",
+                        "last_error_reset_at": time.time() + 7 * 24 * 60 * 60,
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    assert pool.has_available() is False
+    assert pool.select() is None
+
+
 def test_legacy_reset_timestamp_without_status_at_is_advisory(tmp_path, monkeypatch):
     """Future provider reset_at must not freeze legacy entries missing last_status_at."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
