@@ -348,7 +348,13 @@ def _exhausted_until(entry: PooledCredential) -> Optional[float]:
         return min(reset_at, ttl_until)
     if ttl_until is not None:
         return ttl_until
-    return reset_at
+    if reset_at is not None:
+        # Legacy/corrupt auth.json entries may have a provider reset timestamp
+        # without the local exhaustion timestamp needed to anchor Hermes' TTL.
+        # Keep reset_at advisory in that shape too: a past reset can clear the
+        # entry, but a future provider timestamp must not freeze it for days.
+        return reset_at if reset_at <= time.time() else None
+    return None
 
 
 def _normalize_custom_pool_name(name: str) -> str:
