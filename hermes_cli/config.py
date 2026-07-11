@@ -2974,6 +2974,10 @@ DEFAULT_CONFIG = {
         "wait_mode": "document",
         "wait_timeout": 5.0,
 
+        # Reclaim language-server processes after this many seconds of
+        # inactivity. Set to 0 to keep clients for the process lifetime.
+        "idle_timeout": 600,
+
         # How to handle missing server binaries.
         # ``"auto"`` — try to install via npm/go/pip into
         #              ``<HERMES_HOME>/lsp/bin/`` on first use.
