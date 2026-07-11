@@ -177,6 +177,7 @@ class LSPService:
         self._spawning: Dict[Tuple[str, str], asyncio.Future] = {}
         self._last_used: Dict[Tuple[str, str], float] = {}
         self._in_flight: Dict[Tuple[str, str], int] = {}
+        self._reaping: Dict[Tuple[str, str], LSPClient] = {}
         self._state_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutdown_started = False
@@ -324,6 +325,7 @@ class LSPService:
                     self._clients.pop(key, None)
                     self._last_used.pop(key, None)
                     self._in_flight.pop(key, None)
+                    self._reaping[key] = client
         if not to_reap:
             return
         logger.info(
@@ -336,11 +338,19 @@ class LSPService:
             )
             try:
                 await client.shutdown()
+            except asyncio.CancelledError:
+                # Keep the client in ``_reaping`` so service shutdown
+                # can retry it after cancelling the reaper task.
+                raise
             except Exception as exc:  # noqa: BLE001
                 logger.debug(
                     "LSP idle reaper shutdown failed for %s (%s): %s",
                     key[0], key[1], exc,
                 )
+            else:
+                with self._state_lock:
+                    if self._reaping.get(key) is client:
+                        self._reaping.pop(key, None)
 
     # ------------------------------------------------------------------
     # public API
@@ -713,11 +723,15 @@ class LSPService:
 
     async def _shutdown_async(self) -> None:
         with self._state_lock:
-            clients = list(self._clients.values())
+            clients = list(self._clients.values()) + list(self._reaping.values())
             self._clients.clear()
+            self._reaping.clear()
             self._broken.clear()
             self._last_used.clear()
             self._in_flight.clear()
+        # A client should live in exactly one lifecycle map, but deduplicate
+        # defensively so shutdown stays safe if a future transition overlaps.
+        clients = list({id(client): client for client in clients}.values())
         await asyncio.gather(
             *(c.shutdown() for c in clients),
             return_exceptions=True,

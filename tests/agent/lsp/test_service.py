@@ -7,7 +7,9 @@ on.
 """
 from __future__ import annotations
 
+import asyncio
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import cast
@@ -211,6 +213,22 @@ class _FakeClient:
         self.is_running = False
 
 
+class _CancelThenStopClient(_FakeClient):
+    """Block the first shutdown until reaper cancellation, then stop."""
+
+    def __init__(self, server_id: str, workspace_root: str):
+        super().__init__(server_id, workspace_root)
+        self.shutdown_started = threading.Event()
+
+    async def shutdown(self):
+        self.shutdown_calls += 1
+        self.shutdown_started.set()
+        if self.shutdown_calls == 1:
+            await asyncio.Event().wait()
+        self.state = "stopped"
+        self.is_running = False
+
+
 def test_idle_reaper_runs_automatically_and_client_respawns(mock_pyright):
     repo = mock_pyright
     f = repo / "x.py"
@@ -403,3 +421,27 @@ def test_shutdown_cancels_reaper_before_stopping_loop_and_is_idempotent():
     assert svc._reaper_running is False
     assert svc._loop._thread is None
     assert task.done()
+
+
+def test_shutdown_retries_client_interrupted_during_idle_reap(tmp_path):
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=1.0,
+        install_strategy="manual",
+        idle_timeout=0.1,
+    )
+    key = ("pyright", str(tmp_path / "stale"))
+    client = _CancelThenStopClient(*key)
+    with svc._state_lock:
+        svc._clients[key] = cast(LSPClient, client)
+        svc._last_used[key] = time.monotonic() - 1.0
+
+    assert client.shutdown_started.wait(timeout=2.0)
+    svc.shutdown()
+
+    assert client.shutdown_calls == 2
+    assert client.is_running is False
+    assert svc._reaping == {}
+    assert svc._reaper_running is False
+    assert svc._loop._thread is None
