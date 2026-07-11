@@ -1022,8 +1022,10 @@ def test_auth_list_shows_auth_failure_when_exhausted_entry_is_unauthorized(monke
     assert "left" not in out
 
 
-def test_auth_list_prefers_explicit_reset_time(monkeypatch, capsys):
+def test_auth_list_uses_earlier_explicit_reset_time(monkeypatch, capsys):
     from hermes_cli.auth_commands import auth_list_command
+
+    now = datetime(2026, 4, 5, 10, 30, tzinfo=timezone.utc).timestamp()
 
     class _Entry:
         id = "cred-1"
@@ -1034,8 +1036,8 @@ def test_auth_list_prefers_explicit_reset_time(monkeypatch, capsys):
         last_error_code = 429
         last_error_reason = "device_code_exhausted"
         last_error_message = "Weekly credits exhausted."
-        last_error_reset_at = "2026-04-12T10:30:00Z"
-        last_status_at = 1000.0
+        last_error_reset_at = "2026-04-05T11:00:00Z"
+        last_status_at = now
 
     class _Pool:
         def entries(self):
@@ -1047,7 +1049,7 @@ def test_auth_list_prefers_explicit_reset_time(monkeypatch, capsys):
     monkeypatch.setattr("hermes_cli.auth_commands.load_pool", lambda provider: _Pool())
     monkeypatch.setattr(
         "hermes_cli.auth_commands.time.time",
-        lambda: datetime(2026, 4, 5, 10, 30, tzinfo=timezone.utc).timestamp(),
+        lambda: now,
     )
 
     class _Args:
@@ -1057,7 +1059,7 @@ def test_auth_list_prefers_explicit_reset_time(monkeypatch, capsys):
 
     out = capsys.readouterr().out
     assert "device_code_exhausted" in out
-    assert "7d 0h left" in out
+    assert "30m 0s left" in out
 
 
 def test_auth_remove_env_seeded_clears_env_var(tmp_path, monkeypatch):
