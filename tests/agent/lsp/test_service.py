@@ -322,6 +322,42 @@ def test_idle_reaper_tracks_workspaces_independently_and_isolates_shutdown_error
         svc.shutdown()
 
 
+def test_idle_reaper_preserves_failed_client_when_workspace_is_reused(tmp_path):
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=1.0,
+        install_strategy="manual",
+        idle_timeout=100.0,
+    )
+    key = ("pyright", str(tmp_path / "reused"))
+    failed = _FakeClient(*key, fail_shutdown=True)
+    replacement = _FakeClient(*key)
+    try:
+        with svc._state_lock:
+            svc._clients[key] = cast(LSPClient, failed)
+            svc._last_used[key] = time.monotonic() - 200.0
+
+        svc._loop.run(svc._reap_idle_clients(), timeout=2.0)
+
+        with svc._state_lock:
+            svc._clients[key] = cast(LSPClient, replacement)
+            svc._last_used[key] = time.monotonic() - 200.0
+
+        svc._loop.run(svc._reap_idle_clients(), timeout=2.0)
+
+        with svc._state_lock:
+            assert svc._reaping[key] == [failed]
+        assert failed.shutdown_calls == 1
+        assert replacement.shutdown_calls == 1
+    finally:
+        failed.fail_shutdown = False
+        svc.shutdown()
+
+    assert failed.shutdown_calls == 2
+    assert failed.is_running is False
+
+
 def test_client_claim_blocks_reaping_until_operation_finishes(mock_pyright):
     repo = mock_pyright
     f = repo / "x.py"

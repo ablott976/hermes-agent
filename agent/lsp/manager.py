@@ -177,7 +177,7 @@ class LSPService:
         self._spawning: Dict[Tuple[str, str], asyncio.Future] = {}
         self._last_used: Dict[Tuple[str, str], float] = {}
         self._in_flight: Dict[Tuple[str, str], int] = {}
-        self._reaping: Dict[Tuple[str, str], LSPClient] = {}
+        self._reaping: Dict[Tuple[str, str], List[LSPClient]] = {}
         self._state_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutdown_started = False
@@ -325,7 +325,7 @@ class LSPService:
                     self._clients.pop(key, None)
                     self._last_used.pop(key, None)
                     self._in_flight.pop(key, None)
-                    self._reaping[key] = client
+                    self._reaping.setdefault(key, []).append(client)
         if not to_reap:
             return
         logger.info(
@@ -349,8 +349,15 @@ class LSPService:
                 )
             else:
                 with self._state_lock:
-                    if self._reaping.get(key) is client:
-                        self._reaping.pop(key, None)
+                    reaping = self._reaping.get(key)
+                    if reaping is not None:
+                        remaining = [
+                            candidate for candidate in reaping if candidate is not client
+                        ]
+                        if remaining:
+                            self._reaping[key] = remaining
+                        else:
+                            self._reaping.pop(key, None)
 
     # ------------------------------------------------------------------
     # public API
@@ -723,7 +730,11 @@ class LSPService:
 
     async def _shutdown_async(self) -> None:
         with self._state_lock:
-            clients = list(self._clients.values()) + list(self._reaping.values())
+            clients = list(self._clients.values()) + [
+                client
+                for reaping in self._reaping.values()
+                for client in reaping
+            ]
             self._clients.clear()
             self._reaping.clear()
             self._broken.clear()
