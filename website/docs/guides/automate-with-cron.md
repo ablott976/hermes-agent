@@ -11,7 +11,7 @@ The [daily briefing bot tutorial](/guides/daily-briefing-bot) covers the basics.
 For the full feature reference, see [Scheduled Tasks (Cron)](/user-guide/features/cron).
 
 :::info Key Concept
-Cron jobs run in fresh agent sessions with no memory of your current chat. Prompts must be **completely self-contained** — include everything the agent needs to know.
+Cron jobs use fresh agent conversations by default. Prompts must be **completely self-contained** for monitors, reports, and other recurring jobs. For finite work that must advance across several ticks, opt in to `session_mode="persistent"` (or `--session-mode persistent`) so Hermes resumes one durable conversation instead.
 :::
 
 :::tip Don't need the LLM? You have two zero-token options.
@@ -71,7 +71,7 @@ Set up the cron job:
 ```
 
 :::tip The [SILENT] Trick
-When the agent's final response contains `[SILENT]`, delivery is suppressed. This means you only get notified when something actually happens — no spam on quiet hours.
+For cron monitoring jobs, instruct the agent to respond with only `[SILENT]` when nothing changed. Cron delivery treats `[SILENT]` as the quiet marker, so you only get notified when something actually happens — no spam on quiet hours.
 :::
 
 ---
@@ -253,7 +253,7 @@ The `--deliver` flag controls where results go:
 
 **Make prompts self-contained.** The agent in a cron job has no memory of your conversations. Include URLs, repo names, format preferences, and delivery instructions directly in the prompt.
 
-**Use `[SILENT]` liberally.** For monitoring jobs, always include instructions like "if nothing changed, respond with `[SILENT]`." This prevents notification noise.
+**Use `[SILENT]` deliberately.** For monitoring jobs, include instructions like "if nothing changed, respond with only `[SILENT]`." Do not ask the agent to explain the token in quiet cases — cron treats `[SILENT]` as the delivery-suppression marker.
 
 **Use scripts for data collection.** The `script` parameter lets a Python script handle the boring parts (HTTP requests, file I/O, state tracking). The agent only sees the script's stdout and applies reasoning to it. This is cheaper and more reliable than having the agent do the fetching itself.
 

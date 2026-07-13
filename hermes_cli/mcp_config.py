@@ -9,6 +9,7 @@ configuration in ~/.hermes/config.yaml under the ``mcp_servers`` key.
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -25,7 +26,8 @@ from hermes_cli.config import (
 )
 from hermes_cli.colors import Colors, color
 from hermes_constants import display_hermes_home
-from tools.mcp_tool import _ENV_VAR_PATTERN
+from hermes_cli.mcp_security import validate_mcp_server_entry
+from tools.mcp_tool import _ENV_VAR_PATTERN, _env_ref_name
 
 logger = logging.getLogger(__name__)
 
@@ -84,11 +86,23 @@ def _get_mcp_servers(config: Optional[dict] = None) -> Dict[str, dict]:
     return servers
 
 
-def _save_mcp_server(name: str, server_config: dict):
-    """Add or update a server entry in config.yaml."""
+def _save_mcp_server(name: str, server_config: dict) -> bool:
+    """Add or update a server entry in config.yaml.
+
+    Returns False when a high-signal exfiltration-shaped stdio command is
+    rejected. MCP stdio servers are user-chosen local commands, so this blocks
+    shell+egress payloads rather than whitelisting command families.
+    """
+    issues = validate_mcp_server_entry(name, server_config)
+    if issues:
+        for issue in issues:
+            _warning(issue)
+        _warning(f"Server '{name}' was NOT saved due to suspicious configuration.")
+        return False
     config = load_config()
     config.setdefault("mcp_servers", {})[name] = server_config
     save_config(config)
+    return True
 
 
 def _remove_mcp_server(name: str) -> bool:
@@ -102,6 +116,39 @@ def _remove_mcp_server(name: str) -> bool:
         config.pop("mcp_servers", None)
     save_config(config)
     return True
+
+
+def _replace_mcp_servers(servers: Dict[str, dict]) -> Tuple[bool, List[str]]:
+    """Replace the WHOLE ``mcp_servers`` map in config.yaml.
+
+    Unlike ``_save_mcp_server`` (per-key upsert), this sets the entire map so
+    the GUI's mcp.json editor can delete servers, drop an ``enabled: false``
+    flag (re-enable), or remove nested fields and have those *removals* land on
+    disk.  A plain ``/api/config`` deep-merge can only add/override keys, never
+    delete them — which is why edits appeared to succeed but the old entry
+    survived (see MCP tab persistence bug).
+
+    Every entry is validated up front; on any suspicious command/args the whole
+    save is rejected (returns ``(False, issues)``) so a bad paste can't be
+    partially applied.  An empty map removes the key entirely.
+    """
+    issues: List[str] = []
+    for name, cfg in servers.items():
+        if not isinstance(cfg, dict):
+            issues.append(f"Server '{name}': expected an object")
+            continue
+        issues.extend(validate_mcp_server_entry(name, cfg))
+
+    if issues:
+        return False, issues
+
+    config = load_config()
+    if servers:
+        config["mcp_servers"] = dict(servers)
+    else:
+        config.pop("mcp_servers", None)
+    save_config(config)
+    return True, []
 
 
 def _env_key_for_server(name: str) -> str:
@@ -201,18 +248,26 @@ def _resolve_mcp_server_config(config: dict) -> dict:
 
 
 def _probe_single_server(
-    name: str, config: dict, connect_timeout: float = 30
+    name: str, config: dict, connect_timeout: float = 30, *, details: Optional[dict] = None
 ) -> List[Tuple[str, str]]:
     """Temporarily connect to one MCP server, list its tools, disconnect.
 
     Returns list of ``(tool_name, description)`` tuples.
     Raises on connection failure.
+
+    ``details``: optional dict the probe fills with extra capability counts
+    (``prompts``, ``resources``) — an out-param so the return shape stays
+    stable for existing CLI callers.
     """
+    issues = validate_mcp_server_entry(name, config)
+    if issues:
+        raise ValueError("; ".join(issues))
+
     from tools.mcp_tool import (
         _ensure_mcp_loop,
         _run_on_mcp_loop,
         _connect_server,
-        _stop_mcp_loop,
+        _stop_mcp_loop_if_idle,
     )
 
     config = _resolve_mcp_server_config(config)
@@ -232,6 +287,19 @@ def _probe_single_server(
                 if len(desc) > 80:
                     desc = desc[:77] + "..."
                 tools_found.append((t.name, desc))
+            if details is not None:
+                # Capability probes are best-effort: servers without the
+                # capability raise, which just means "0".
+                try:
+                    result = await server.session.list_prompts()
+                    details["prompts"] = len(result.prompts)
+                except Exception:
+                    pass
+                try:
+                    result = await server.session.list_resources()
+                    details["resources"] = len(result.resources)
+                except Exception:
+                    pass
         finally:
             await server.shutdown()
 
@@ -240,7 +308,7 @@ def _probe_single_server(
     except BaseException as exc:
         raise _unwrap_exception_group(exc) from None
     finally:
-        _stop_mcp_loop()
+        _stop_mcp_loop_if_idle()
 
     return tools_found
 
@@ -288,6 +356,8 @@ def cmd_mcp_add(args):
     # hermes_cli/main.py for why the dest is renamed.
     command = getattr(args, "mcp_command", None)
     cmd_args = getattr(args, "args", None) or []
+    if cmd_args and cmd_args[0] == "--":
+        cmd_args = cmd_args[1:]
     auth_type = getattr(args, "auth", None)
     preset_name = getattr(args, "preset", None)
     raw_env = getattr(args, "env", None)
@@ -337,6 +407,12 @@ def cmd_mcp_add(args):
         if explicit_env:
             server_config["env"] = explicit_env
 
+    issues = validate_mcp_server_entry(name, server_config)
+    if issues:
+        for issue in issues:
+            _warning(issue)
+        _warning(f"Server '{name}' was NOT saved due to suspicious configuration.")
+        return
 
     # ── Authentication ────────────────────────────────────────────────
 
@@ -401,16 +477,16 @@ def cmd_mcp_add(args):
         _error(f"Failed to connect: {exc}")
         if _confirm("Save config anyway (you can test later)?", default=False):
             server_config["enabled"] = False
-            _save_mcp_server(name, server_config)
-            _success(f"Saved '{name}' to config (disabled)")
-            _info("Fix the issue, then: hermes mcp test " + name)
+            if _save_mcp_server(name, server_config):
+                _success(f"Saved '{name}' to config (disabled)")
+                _info("Fix the issue, then: hermes mcp test " + name)
         return
 
     if not tools:
         _warning("Server connected but reported no tools.")
         if _confirm("Save config anyway?", default=True):
-            _save_mcp_server(name, server_config)
-            _success(f"Saved '{name}' to config")
+            if _save_mcp_server(name, server_config):
+                _success(f"Saved '{name}' to config")
         return
 
     # ── Tool selection ────────────────────────────────────────────────
@@ -467,11 +543,10 @@ def cmd_mcp_add(args):
     # ── Save ──────────────────────────────────────────────────────────
 
     server_config["enabled"] = True
-    _save_mcp_server(name, server_config)
-
-    print()
-    _success(f"Saved '{name}' to {display_hermes_home()}/config.yaml ({tool_count}/{total} tools enabled)")
-    _info("Start a new session to use these tools.")
+    if _save_mcp_server(name, server_config):
+        print()
+        _success(f"Saved '{name}' to {display_hermes_home()}/config.yaml ({tool_count}/{total} tools enabled)")
+        _info("Start a new session to use these tools.")
 
 
 # ─── hermes mcp remove ───────────────────────────────────────────────────────
@@ -608,8 +683,8 @@ def cmd_mcp_test(args):
     elif headers:
         for k, v in headers.items():
             if isinstance(v, str) and ("key" in k.lower() or "auth" in k.lower()):
-                # Mask the value
-                resolved = _ENV_VAR_PATTERN.sub(lambda m: os.getenv(m.group(1), ""), v)
+                # Mask the value (accepts ${VAR} and Cursor-style ${env:VAR})
+                resolved = _ENV_VAR_PATTERN.sub(lambda m: os.getenv(_env_ref_name(m.group(1)), ""), v)
                 if len(resolved) > 8:
                     masked = resolved[:4] + "***" + resolved[-4:]
                 else:
@@ -641,44 +716,28 @@ def cmd_mcp_test(args):
 
 # ─── hermes mcp login ────────────────────────────────────────────────────────
 
-def cmd_mcp_login(args):
-    """Force re-authentication for an OAuth-based MCP server.
+def _reauth_oauth_server(name: str, server_config: dict) -> bool:
+    """Force a fresh OAuth flow for one server. Returns True on success.
 
-    Deletes cached tokens (both on disk and in the running process's
-    MCPOAuthManager cache) and triggers a fresh OAuth flow via the
-    existing probe path.
-
-    Use this when:
-      - Tokens are stuck in a bad state (server revoked, refresh token
-        consumed by an external process, etc.)
-      - You want to re-authenticate to change scopes or account
-      - A tool call returned ``needs_reauth: true``
+    Wipes cached OAuth state (disk + in-process MCPOAuthManager cache),
+    re-probes to trigger the browser flow, and verifies a token actually
+    landed before reporting success. Shared by ``hermes mcp login`` and
+    ``hermes mcp reauth`` so both behave identically for a single server.
     """
-    name = args.name
-    servers = _get_mcp_servers()
-
-    if name not in servers:
-        _error(f"Server '{name}' not found in config.")
-        if servers:
-            _info(f"Available servers: {', '.join(servers)}")
-        return
-
-    server_config = servers[name]
     url = server_config.get("url")
     if not url:
         _error(f"Server '{name}' has no URL — not an OAuth-capable server")
-        return
+        return False
     if server_config.get("auth") != "oauth":
         _error(f"Server '{name}' is not configured for OAuth (auth={server_config.get('auth')})")
         _info("Use `hermes mcp remove` + `hermes mcp add` to reconfigure auth.")
-        return
+        return False
 
     # Wipe both disk and in-memory cache so the next probe forces a fresh
     # OAuth flow.
     try:
         from tools.mcp_oauth_manager import get_manager
-        mgr = get_manager()
-        mgr.remove(name)
+        get_manager().remove(name)
     except Exception as exc:
         _warning(f"Could not clear existing OAuth state: {exc}")
 
@@ -717,13 +776,90 @@ def cmd_mcp_login(args):
             print(color(f"          client_secret: \"<your-oauth-client-secret>\"", Colors.DIM))
             print()
             _info("Then re-run `hermes mcp login " + name + "`.")
-            return
+            return False
         if tools:
             _success(f"Authenticated — {len(tools)} tool(s) available")
         else:
             _success("Authenticated (server reported no tools)")
+        return True
     except Exception as exc:
         _error(f"Authentication failed: {exc}")
+        return False
+
+
+def cmd_mcp_login(args):
+    """Force re-authentication for an OAuth-based MCP server.
+
+    Deletes cached tokens (both on disk and in the running process's
+    MCPOAuthManager cache) and triggers a fresh OAuth flow via the
+    existing probe path.
+
+    Use this when:
+      - Tokens are stuck in a bad state (server revoked, refresh token
+        consumed by an external process, etc.)
+      - You want to re-authenticate to change scopes or account
+      - A tool call returned ``needs_reauth: true``
+    """
+    name = args.name
+    servers = _get_mcp_servers()
+
+    if name not in servers:
+        _error(f"Server '{name}' not found in config.")
+        if servers:
+            _info(f"Available servers: {', '.join(servers)}")
+        return
+
+    _reauth_oauth_server(name, servers[name])
+
+
+def cmd_mcp_reauth(args):
+    """Re-authenticate one OAuth MCP server, or all of them sequentially.
+
+    ``hermes mcp reauth <name>`` re-auths a single server (same as ``login``).
+    ``hermes mcp reauth --all`` discovers every ``auth: oauth`` server in
+    config and re-auths them ONE AT A TIME.
+
+    Serial-by-design: a human can only complete one browser OAuth flow at a
+    time, so re-authing all servers concurrently would open N tabs at once
+    and N-1 would time out. This is the self-service fix for the recurring
+    stale-client ritual in GH#36767 (and avoids the startup popup storm when
+    several servers go stale at once).
+    """
+    servers = _get_mcp_servers()
+    do_all = getattr(args, "all", False)
+    name = getattr(args, "name", None)
+
+    if do_all:
+        oauth_servers = [
+            (n, c) for n, c in servers.items()
+            if c.get("auth") == "oauth" and c.get("url")
+        ]
+        if not oauth_servers:
+            _info("No OAuth-based MCP servers found in config.")
+            return
+        print()
+        _info(f"Re-authenticating {len(oauth_servers)} OAuth server(s) one at a time...")
+        succeeded = 0
+        for n, c in oauth_servers:
+            print()
+            print(color(f"  ── {n} ──", Colors.CYAN + Colors.BOLD))
+            if _reauth_oauth_server(n, c):
+                succeeded += 1
+        print()
+        _success(f"Re-authenticated {succeeded}/{len(oauth_servers)} server(s)")
+        return
+
+    if not name:
+        _error("Specify a server name, or use --all to re-auth every OAuth server.")
+        _info("Usage: hermes mcp reauth <name>   |   hermes mcp reauth --all")
+        return
+    if name not in servers:
+        _error(f"Server '{name}' not found in config.")
+        if servers:
+            _info(f"Available servers: {', '.join(servers)}")
+        return
+
+    _reauth_oauth_server(name, servers[name])
 
 
 # ─── hermes mcp configure ────────────────────────────────────────────────────
@@ -825,6 +961,58 @@ def cmd_mcp_configure(args):
     _info("Start a new session for changes to take effect.")
 
 
+# ─── Profile-router bearer token UX ──────────────────────────────────────────
+
+def cmd_profile_router_token(args):
+    """Manage hash-stored bearer tokens for the profile-router HTTP server."""
+
+    import importlib
+
+    auth_mod = importlib.import_module("mcp_profile_router_auth")
+    try:
+        store = auth_mod.ProfileRouterTokenStore()
+        action = getattr(args, "token_action", None) or "list"
+        if action == "create":
+            created = store.create_token(
+                scopes=getattr(args, "scopes", None) or auth_mod.DEFAULT_PROFILE_ROUTER_SCOPES,
+                name=getattr(args, "name", "") or "",
+                expires_at=getattr(args, "expires_at", None),
+            )
+            print(json.dumps({"ok": True, **created}, indent=2, sort_keys=True))
+            _warning("Copy the token now; Hermes stores only its hash and cannot show it again.")
+            return
+        if action in {"list", "ls"}:
+            print(json.dumps({"ok": True, "tokens": store.list_tokens()}, indent=2, sort_keys=True))
+            return
+        if action == "revoke":
+            revoked = store.revoke_token(getattr(args, "token_id", ""))
+            print(json.dumps({"ok": True, "revoked": revoked}, indent=2, sort_keys=True))
+            return
+        if action == "rotate":
+            rotated = store.rotate_token(getattr(args, "token_id", ""))
+            print(json.dumps({"ok": True, **rotated}, indent=2, sort_keys=True))
+            _warning("Copy the replacement token now; Hermes stores only its hash and cannot show it again.")
+            return
+        _error("Usage: hermes mcp profile-router-token create|list|revoke|rotate")
+    except auth_mod.ProfileRouterAuthError as exc:
+        _error(f"{exc.code}: {exc.message}")
+
+
+def _profile_router_only_serve_flag_used(args) -> bool:
+    """Return whether profile-router-only serve flags were used without it."""
+
+    return any(
+        (
+            bool(getattr(args, "http", False)),
+            getattr(args, "transport", "stdio") != "stdio",
+            getattr(args, "host", "127.0.0.1") != "127.0.0.1",
+            getattr(args, "port", 8765) != 8765,
+            getattr(args, "streamable_http_path", "/mcp") != "/mcp",
+            bool(getattr(args, "public_url", None)),
+        )
+    )
+
+
 # ─── Dispatcher ───────────────────────────────────────────────────────────────
 
 def mcp_command(args):
@@ -832,8 +1020,26 @@ def mcp_command(args):
     action = getattr(args, "mcp_action", None)
 
     if action == "serve":
-        from mcp_serve import run_mcp_server
-        run_mcp_server(verbose=getattr(args, "verbose", False))
+        import importlib
+        mcp_serve = importlib.import_module("mcp_serve")
+        if getattr(args, "profile_router", False):
+            transport = "streamable-http" if getattr(args, "http", False) else getattr(args, "transport", "stdio")
+            mcp_serve.run_profile_router_mcp_server(
+                verbose=getattr(args, "verbose", False),
+                transport=transport,
+                host=getattr(args, "host", "127.0.0.1"),
+                port=getattr(args, "port", 8765),
+                streamable_http_path=getattr(args, "streamable_http_path", "/mcp"),
+                public_url=getattr(args, "public_url", None),
+            )
+        else:
+            if _profile_router_only_serve_flag_used(args):
+                _error(
+                    "HTTP/profile-router serve flags require --profile-router in this branch. "
+                    "See PR #43633 for the generic MCP HTTP transport work."
+                )
+                return
+            mcp_serve.run_mcp_server(verbose=getattr(args, "verbose", False))
         return
 
     # Catalog subcommands live in mcp_picker / mcp_catalog. Import lazily so
@@ -855,6 +1061,8 @@ def mcp_command(args):
         return
 
     handlers = {
+        "profile-router-token": cmd_profile_router_token,
+        "profile-router-tokens": cmd_profile_router_token,
         "add": cmd_mcp_add,
         "remove": cmd_mcp_remove,
         "rm": cmd_mcp_remove,
@@ -864,6 +1072,7 @@ def mcp_command(args):
         "configure": cmd_mcp_configure,
         "config": cmd_mcp_configure,
         "login": cmd_mcp_login,
+        "reauth": cmd_mcp_reauth,
     }
 
     handler = handlers.get(action)
@@ -878,7 +1087,10 @@ def mcp_command(args):
         _info("hermes mcp                                    Open the catalog picker (default)")
         _info("hermes mcp catalog                            List Nous-approved MCPs")
         _info("hermes mcp install <name>                     Install a catalog MCP")
-        _info("hermes mcp serve                              Run as MCP server")
+        _info("hermes mcp serve                              Run conversation bridge MCP server")
+        _info("hermes mcp serve --profile-router             Run no-model profile router MCP server over stdio")
+        _info("hermes mcp serve --profile-router --http      Run localhost HTTP profile router with bearer auth")
+        _info("hermes mcp profile-router-token create       Generate a bearer token for HTTP profile router")
         _info("hermes mcp add <name> --url <endpoint>        Add a custom MCP server")
         _info("hermes mcp add <name> --command <cmd>         Add a stdio server")
         _info("hermes mcp add <name> --preset <preset>       Add from a known preset")
@@ -887,4 +1099,5 @@ def mcp_command(args):
         _info("hermes mcp test <name>                        Test connection")
         _info("hermes mcp configure <name>                   Toggle tools")
         _info("hermes mcp login <name>                       Re-authenticate OAuth")
+        _info("hermes mcp reauth <name> | --all              Re-auth one or all OAuth servers")
         print()
