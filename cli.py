@@ -8430,6 +8430,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             print(f"    2. Or configure settings in {display_hermes_home()}/config.yaml")
             print()
     
+    def _restore_model_after_moa_turn(self) -> None:
+        """Restore the pre-/moa route after the one-shot turn finishes."""
+        if not getattr(self, "_pending_moa_disable_after_turn", False):
+            return
+        restore = getattr(self, "_pending_moa_restore_model", None) or {}
+        for key, value in restore.items():
+            if value is not None:
+                setattr(self, key, value)
+        self.agent = None
+        self._pending_moa_restore_model = None
+        self._pending_moa_disable_after_turn = False
+
     def process_command(self, command: str) -> bool:
         """
         Process a slash command.
@@ -12364,14 +12376,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         persist_user_message=message if _voice_prefix else None,
                         moa_config=_moa_cfg,
                     )
-                    if getattr(self, "_pending_moa_disable_after_turn", False):
-                        _restore = getattr(self, "_pending_moa_restore_model", None) or {}
-                        for _key, _value in _restore.items():
-                            if _value is not None:
-                                setattr(self, _key, _value)
-                        self.agent = None
-                        self._pending_moa_restore_model = None
-                        self._pending_moa_disable_after_turn = False
                 except Exception as exc:
                     logging.error("run_conversation raised: %s", exc, exc_info=True)
                     _summary = getattr(self.agent, '_summarize_api_error', lambda e: str(e)[:300])(exc)
@@ -12384,6 +12388,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         "error": _summary,
                     }
                 finally:
+                    self._restore_model_after_moa_turn()
                     # Surface any credit notices queued during the turn (cold-start
                     # seed / per-turn capture) now that the response is done — printing
                     # at this boundary paints cleanly above the prompt instead of being

@@ -10097,6 +10097,7 @@ class CronJobCreate(BaseModel):
     enabled_toolsets: Optional[List[str]] = None
     workdir: Optional[str] = None
     no_agent: bool = False
+    session_mode: str = "fresh"
 
 
 class CronJobUpdate(BaseModel):
@@ -10245,7 +10246,9 @@ def _cron_profile_home(profile: Optional[str]) -> Tuple[str, Path]:
 
 
 def _annotate_cron_job(job: Dict[str, Any], profile: str, home: Path) -> Dict[str, Any]:
-    annotated = dict(job)
+    from cron.jobs import public_job_view
+
+    annotated = dict(public_job_view(job) or {})
     annotated["profile"] = profile
     annotated["profile_name"] = profile
     annotated["hermes_home"] = str(home)
@@ -10419,6 +10422,7 @@ def _create_cron_job_sync(body: CronJobCreate, profile: str = "default"):
             enabled_toolsets=_cron_string_list(body.enabled_toolsets),
             workdir=_cron_optional_text(body.workdir),
             no_agent=no_agent,
+            session_mode=body.session_mode,
         )
     except HTTPException:
         raise

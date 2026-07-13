@@ -1,4 +1,4 @@
-import type { CronJob, CronJobMutation } from "./api";
+import type { CronJob, CronJobMutation, CronSessionMode } from "./api";
 
 export interface CronJobFormState {
   name: string;
@@ -14,6 +14,7 @@ export interface CronJobFormState {
   context_from: string;
   enabled_toolsets: string[];
   workdir: string;
+  session_mode: CronSessionMode;
 }
 
 /** Split a comma/newline list (or array) into trimmed, non-empty items. */
@@ -63,6 +64,7 @@ export function buildCronJobPayload(form: CronJobFormState): CronJobMutation {
     context_from: contextFrom.length > 0 ? contextFrom : null,
     enabled_toolsets: enabledToolsets.length > 0 ? enabledToolsets : null,
     workdir: optionalText(form.workdir),
+    session_mode: form.no_agent ? "fresh" : form.session_mode,
   };
 }
 
@@ -91,5 +93,6 @@ export function cronJobFormFromJob(job: CronJob): CronJobFormState {
     context_from: listToText(job.context_from),
     enabled_toolsets: splitCronList(job.enabled_toolsets),
     workdir: asString(job.workdir),
+    session_mode: job.session_mode === "persistent" ? "persistent" : "fresh",
   };
 }

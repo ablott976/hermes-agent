@@ -97,6 +97,28 @@ class TestListJobs:
                 assert "jobs" in data
                 assert data["jobs"] == [SAMPLE_JOB]
 
+    @pytest.mark.asyncio
+    async def test_list_jobs_hides_persistent_scheduler_metadata(self, adapter):
+        """Internal continuation pointers never leave the authenticated API."""
+        app = _create_app(adapter)
+        private_job = {
+            **SAMPLE_JOB,
+            "session_mode": "persistent",
+            "session_root_id": "cron_private_root",
+            "session_runtime_fingerprint": "private-fingerprint",
+        }
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_list", return_value=[private_job]
+            ):
+                resp = await cli.get("/api/jobs")
+                assert resp.status == 200
+                job = (await resp.json())["jobs"][0]
+
+        assert job["session_mode"] == "persistent"
+        assert "session_root_id" not in job
+        assert "session_runtime_fingerprint" not in job
+
     # -------------------------------------------------------------------
     # 2. test_list_jobs_include_disabled
     # -------------------------------------------------------------------
@@ -152,6 +174,7 @@ class TestCreateJob:
                     "name": "test-job",
                     "schedule": "*/5 * * * *",
                     "prompt": "do something",
+                    "session_mode": "persistent",
                 }, headers={
                     "X-Forwarded-For": "203.0.113.11",
                     "User-Agent": "cron-client",
@@ -164,10 +187,29 @@ class TestCreateJob:
                 assert call_kwargs["name"] == "test-job"
                 assert call_kwargs["schedule"] == "*/5 * * * *"
                 assert call_kwargs["prompt"] == "do something"
+                assert call_kwargs["session_mode"] == "persistent"
                 assert call_kwargs["origin"]["platform"] == "api_server"
                 assert call_kwargs["origin"]["chat_id"] == "api"
                 assert call_kwargs["origin"]["forwarded_for"] == "203.0.113.11"
                 assert call_kwargs["origin"]["user_agent"] == "cron-client"
+
+    @pytest.mark.asyncio
+    async def test_create_job_rejects_invalid_session_mode(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.post(
+                    "/api/jobs",
+                    json={
+                        "name": "test-job",
+                        "schedule": "every 1h",
+                        "session_mode": "endless",
+                    },
+                )
+                data = await resp.json()
+
+        assert resp.status == 400
+        assert "session_mode" in data["error"]
 
     @pytest.mark.asyncio
     async def test_create_job_missing_name(self, adapter):
@@ -331,7 +373,11 @@ class TestUpdateJob:
             ):
                 resp = await cli.patch(
                     f"/api/jobs/{VALID_JOB_ID}",
-                    json={"name": "updated-name", "schedule": "0 * * * *"},
+                    json={
+                        "name": "updated-name",
+                        "schedule": "0 * * * *",
+                        "session_mode": "persistent",
+                    },
                 )
                 assert resp.status == 200
                 data = await resp.json()
@@ -342,6 +388,7 @@ class TestUpdateJob:
                 sanitized = call_args[0][1]
                 assert "name" in sanitized
                 assert "schedule" in sanitized
+                assert sanitized["session_mode"] == "persistent"
 
     @pytest.mark.asyncio
     async def test_update_job_rejects_unknown_fields(self, adapter):
@@ -369,6 +416,20 @@ class TestUpdateJob:
                 assert "name" in sanitized
                 assert "evil_field" not in sanitized
                 assert "__proto__" not in sanitized
+
+    @pytest.mark.asyncio
+    async def test_update_job_rejects_invalid_session_mode(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"session_mode": "endless"},
+                )
+                data = await resp.json()
+
+        assert resp.status == 400
+        assert "session_mode" in data["error"]
 
     @pytest.mark.asyncio
     async def test_update_job_no_valid_fields(self, adapter):

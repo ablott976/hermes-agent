@@ -23,6 +23,8 @@ from cron.jobs import (
     heartbeat_run_claim,
     get_due_jobs,
     save_job_output,
+    set_persistent_session_state,
+    public_job_view,
 )
 
 
@@ -276,6 +278,72 @@ class TestJobCRUD:
         assert jobs[0]["prompt"] == ""
         assert jobs[0]["schedule_display"] == "every 60m"
         assert jobs[0]["state"] == "scheduled"
+        assert jobs[0]["session_mode"] == "fresh"
+
+    def test_create_defaults_to_fresh_without_persisting_redundant_field(self, tmp_cron_dir):
+        job = create_job(prompt="Independent run", schedule="every 1h")
+
+        assert job["session_mode"] == "fresh"
+        assert "session_mode" not in load_jobs()[0]
+
+    def test_create_persistent_session_mode(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Continue development",
+            schedule="every 1m",
+            session_mode="persistent",
+        )
+
+        assert job["session_mode"] == "persistent"
+        assert load_jobs()[0]["session_mode"] == "persistent"
+
+    def test_public_view_keeps_mode_but_hides_scheduler_session_metadata(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Continue development",
+            schedule="every 1m",
+            session_mode="persistent",
+        )
+        internal = set_persistent_session_state(job["id"], "cron_root", "fingerprint")
+
+        public = public_job_view(internal)
+
+        assert public["session_mode"] == "persistent"
+        assert "session_root_id" not in public
+        assert "session_runtime_fingerprint" not in public
+        assert get_job(job["id"])["session_root_id"] == "cron_root"
+
+    @pytest.mark.parametrize("value", ["resume", "continuable", "", 123])
+    def test_create_rejects_invalid_session_mode(self, tmp_cron_dir, value):
+        with pytest.raises(ValueError, match="session_mode"):
+            create_job(prompt="Bad mode", schedule="every 1h", session_mode=value)
+
+    def test_persistent_session_mode_requires_agent(self, tmp_cron_dir):
+        with pytest.raises(ValueError, match="persistent.*no_agent"):
+            create_job(
+                prompt="",
+                schedule="every 1h",
+                script="watchdog.py",
+                no_agent=True,
+                session_mode="persistent",
+            )
+
+    def test_legacy_no_agent_record_forces_fresh_view(self, tmp_cron_dir):
+        job = create_job(
+            prompt="",
+            schedule="every 1h",
+            script="watchdog.py",
+            no_agent=True,
+        )
+        stored = load_jobs()
+        stored[0]["session_mode"] = "persistent"
+        stored[0]["session_root_id"] = "stale-root"
+        stored[0]["session_runtime_fingerprint"] = "stale-fingerprint"
+        save_jobs(stored)
+
+        normalized = get_job(job["id"])
+
+        assert normalized["session_mode"] == "fresh"
+        assert "session_root_id" not in normalized
+        assert "session_runtime_fingerprint" not in normalized
 
     def test_remove_job(self, tmp_cron_dir):
         job = create_job(prompt="Temp job", schedule="30m")
@@ -424,6 +492,42 @@ class TestUpdateJob:
         # Original job still resolvable, no rename happened.
         assert get_job(job["id"]) is not None
         assert get_job("../escape") is None
+
+    def test_update_session_mode_and_clear_state_when_returning_to_fresh(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Continue",
+            schedule="every 1m",
+            session_mode="persistent",
+        )
+        set_persistent_session_state(job["id"], "cron_root", "abc123")
+
+        updated = update_job(job["id"], {"session_mode": "fresh"})
+
+        assert updated["session_mode"] == "fresh"
+        stored = load_jobs()[0]
+        assert "session_mode" not in stored
+        assert "session_root_id" not in stored
+        assert "session_runtime_fingerprint" not in stored
+
+    def test_update_rejects_invalid_session_mode(self, tmp_cron_dir):
+        job = create_job(prompt="Continue", schedule="every 1m")
+
+        with pytest.raises(ValueError, match="session_mode"):
+            update_job(job["id"], {"session_mode": "resume"})
+
+    def test_persistent_session_metadata_is_internal_only(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Continue",
+            schedule="every 1m",
+            session_mode="persistent",
+        )
+
+        state = set_persistent_session_state(job["id"], "cron_root", "abc123")
+        assert state["session_root_id"] == "cron_root"
+        assert state["session_runtime_fingerprint"] == "abc123"
+
+        with pytest.raises(ValueError, match="session_root_id"):
+            update_job(job["id"], {"session_root_id": "attacker-controlled"})
 
 
 class TestPauseResumeJob:
