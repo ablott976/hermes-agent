@@ -3938,12 +3938,10 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
         try:
-            success, output, final_response, error = run_job(
-                job,
-                adapters=adapters,
-                loop=loop,
-                defer_agent_teardown=_deferred_agents,
-            )
+            _run_job_kwargs: dict[str, Any] = {"defer_agent_teardown": _deferred_agents}
+            if adapters is not None or loop is not None:
+                _run_job_kwargs.update({"adapters": adapters, "loop": loop})
+            success, output, final_response, error = run_job(job, **_run_job_kwargs)
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
             # it down here so a failed run never leaks its async resources
