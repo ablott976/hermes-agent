@@ -109,7 +109,9 @@ SUPPORTED_POOL_STRATEGIES = {
 # Cooldown before retrying an exhausted credential.
 # Transient 401 auth failures cool down briefly so single-key setups can recover.
 # 429 (rate-limited), 402 (billing/quota), and other failures cool down after 1 hour.
-# Provider-supplied reset_at timestamps override these defaults.
+# Provider-supplied reset_at timestamps may shorten the cooldown, but must not
+# extend it: users can reset provider quotas/limits out-of-band, so a stale
+# reset_at is only advisory and should not freeze a credential for days.
 EXHAUSTED_TTL_401_SECONDS = 5 * 60           # 5 minutes
 EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour
 EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
@@ -339,11 +341,47 @@ def _exhausted_until(entry: PooledCredential) -> Optional[float]:
     if entry.last_status != STATUS_EXHAUSTED:
         return None
     reset_at = _parse_absolute_timestamp(getattr(entry, "last_error_reset_at", None))
-    if reset_at is not None:
-        return reset_at
+    ttl_until = None
     if entry.last_status_at:
-        return entry.last_status_at + _exhausted_ttl(entry.last_error_code)
+        ttl_until = entry.last_status_at + _exhausted_ttl(entry.last_error_code)
+    if reset_at is not None and ttl_until is not None:
+        return min(reset_at, ttl_until)
+    if ttl_until is not None:
+        return ttl_until
+    if reset_at is not None:
+        # Legacy/corrupt auth.json entries may have a provider reset timestamp
+        # without the local exhaustion timestamp needed to anchor Hermes' TTL.
+        # Keep reset_at advisory in that shape too: a past reset can clear the
+        # entry, but a future provider timestamp must not freeze it for days.
+        return reset_at if reset_at <= time.time() else None
     return None
+
+
+def _timestamp_newer(candidate: Any, reference: Any) -> bool:
+    """True when both timestamps parse and candidate is strictly newer."""
+    candidate_ts = _parse_absolute_timestamp(candidate)
+    reference_ts = _parse_absolute_timestamp(reference)
+    return (
+        candidate_ts is not None
+        and reference_ts is not None
+        and candidate_ts > reference_ts
+    )
+
+
+def _with_cleared_failure_status(
+    entry: "PooledCredential",
+    **field_updates: Any,
+) -> "PooledCredential":
+    return replace(
+        entry,
+        last_status=None,
+        last_status_at=None,
+        last_error_code=None,
+        last_error_reason=None,
+        last_error_message=None,
+        last_error_reset_at=None,
+        **field_updates,
+    )
 
 
 def _normalize_custom_pool_name(name: str) -> str:
@@ -723,10 +761,18 @@ class CredentialPool:
             # another process means our entry's pair is consumed/stale.
             entry_access = entry.access_token or ""
             entry_refresh = entry.refresh_token or ""
-            if store_access and (
+            tokens_differ = bool(store_access) and (
                 store_access != entry_access
                 or (store_refresh and store_refresh != entry_refresh)
-            ):
+            )
+            auth_refresh_after_failure = (
+                entry.last_status == STATUS_EXHAUSTED
+                and _timestamp_newer(
+                    state.get("last_refresh"),
+                    entry.last_status_at or entry.last_refresh,
+                )
+            )
+            if store_access and (tokens_differ or auth_refresh_after_failure):
                 logger.debug(
                     "Pool entry %s: syncing Codex tokens from auth.json "
                     "(refreshed by another process)",
@@ -735,16 +781,10 @@ class CredentialPool:
                 field_updates: Dict[str, Any] = {
                     "access_token": store_access,
                     "refresh_token": store_refresh or entry.refresh_token,
-                    "last_status": None,
-                    "last_status_at": None,
-                    "last_error_code": None,
-                    "last_error_reason": None,
-                    "last_error_message": None,
-                    "last_error_reset_at": None,
                 }
                 if state.get("last_refresh"):
                     field_updates["last_refresh"] = state["last_refresh"]
-                updated = replace(entry, **field_updates)
+                updated = _with_cleared_failure_status(entry, **field_updates)
                 self._replace_entry(entry, updated)
                 self._persist()
                 return updated
@@ -1497,6 +1537,83 @@ class CredentialPool:
             if entry.last_status == STATUS_EXHAUSTED:
                 exhausted_until = _exhausted_until(entry)
                 if exhausted_until is not None and now < exhausted_until:
+                    # Keep the OAuth refresh chain alive even while the entry
+                    # is sitting out a cooldown window.  Provider refresh-token
+                    # exchanges (Codex, xAI, Anthropic) do NOT count against
+                    # the same quota that put us in exhaustion — they only
+                    # rotate tokens.  But refresh_tokens themselves expire on
+                    # their own clock (and many providers are single-use).
+                    # If the cooldown (e.g. ChatGPT's ~7-day weekly window)
+                    # outlives the refresh_token's lifetime, the user is
+                    # forced to redo a device-code login as soon as the
+                    # cooldown clears.  Refreshing in place here keeps the
+                    # token chain warm without changing the exhaustion gate:
+                    # we restore the exhausted status fields after the
+                    # rotation so the entry is still NOT returned for use.
+                    if (
+                        refresh
+                        and entry.auth_type == AUTH_TYPE_OAUTH
+                        and self._entry_needs_refresh(entry)
+                    ):
+                        snapshot = (
+                            entry.last_status,
+                            entry.last_status_at,
+                            entry.last_error_code,
+                            entry.last_error_reason,
+                            entry.last_error_message,
+                            entry.last_error_reset_at,
+                        )
+                        try:
+                            refreshed = self._refresh_entry(entry, force=False)
+                        except Exception as exc:  # pragma: no cover - defensive
+                            logger.debug(
+                                "credential pool: keepalive refresh raised for "
+                                "exhausted %s entry %s: %s",
+                                self.provider,
+                                entry.label or entry.id[:8],
+                                exc,
+                            )
+                            refreshed = None
+
+                        # Whether _refresh_entry succeeded, returned None, or
+                        # raised, it may have rewritten our pool entry in place
+                        # (either with rotated tokens + STATUS_OK on success, or
+                        # with a short default-cooldown via _mark_exhausted on
+                        # non-terminal failure). Either outcome would corrupt
+                        # the original quota window. Pick the most-recent view
+                        # of the entry — preferring the rotated copy returned
+                        # by _refresh_entry (real impl swaps it in via
+                        # _replace_entry already; we still cover the case
+                        # where it didn't) — restore the original exhaustion
+                        # fields, and persist exactly once so the visible-on-
+                        # disk gap is the smallest window we can achieve
+                        # without touching _refresh_entry's signature.
+                        current = next(
+                            (e for e in self._entries if e.id == entry.id),
+                            None,
+                        )
+                        base = refreshed if refreshed is not None else current
+                        if base is not None and (
+                            base.last_status != snapshot[0]
+                            or base.last_status_at != snapshot[1]
+                            or base.last_error_code != snapshot[2]
+                            or base.last_error_reason != snapshot[3]
+                            or base.last_error_message != snapshot[4]
+                            or base.last_error_reset_at != snapshot[5]
+                            or current is not base
+                        ):
+                            restored = replace(
+                                base,
+                                last_status=snapshot[0],
+                                last_status_at=snapshot[1],
+                                last_error_code=snapshot[2],
+                                last_error_reason=snapshot[3],
+                                last_error_message=snapshot[4],
+                                last_error_reset_at=snapshot[5],
+                            )
+                            anchor = current if current is not None else base
+                            self._replace_entry(anchor, restored)
+                            cleared_any = True
                     continue
                 if clear_expired:
                     cleared = replace(
@@ -2091,6 +2208,37 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         if isinstance(tokens, dict) and tokens.get("access_token"):
             active_sources.add("device_code")
             custom_label = str(state.get("label") or "").strip()
+            existing_singleton = next(
+                (entry for entry in entries if entry.source == "device_code"),
+                None,
+            )
+            store_access = tokens.get("access_token", "")
+            store_refresh = tokens.get("refresh_token", "")
+            tokens_differ = existing_singleton is not None and bool(store_access) and (
+                store_access != (existing_singleton.access_token or "")
+                or (
+                    store_refresh
+                    and store_refresh != (existing_singleton.refresh_token or "")
+                )
+            )
+            auth_refresh_after_failure = existing_singleton is not None and (
+                existing_singleton.last_status == STATUS_EXHAUSTED
+                and _timestamp_newer(
+                    state.get("last_refresh"),
+                    existing_singleton.last_status_at or existing_singleton.last_refresh,
+                )
+            )
+            clear_seeded_failure = bool(
+                existing_singleton is not None
+                and (
+                    tokens_differ
+                    or auth_refresh_after_failure
+                )
+                and (
+                    existing_singleton.last_status != STATUS_DEAD
+                    or tokens_differ
+                )
+            )
             changed |= _upsert_entry(
                 entries,
                 provider,
@@ -2105,6 +2253,12 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                     "label": custom_label or label_from_token(tokens.get("access_token", ""), "device_code"),
                 },
             )
+            if clear_seeded_failure:
+                for idx, entry in enumerate(entries):
+                    if entry.source == "device_code":
+                        entries[idx] = _with_cleared_failure_status(entry)
+                        changed = True
+                        break
 
     elif provider == "xai-oauth":
         # When the user logs in via ``hermes model`` -> xAI Grok OAuth,
