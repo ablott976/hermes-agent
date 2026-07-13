@@ -3729,6 +3729,11 @@ def test_oauth_keepalive_skipped_when_no_refresh_needed(tmp_path, monkeypatch):
 
 def test_api_key_exhausted_entry_is_not_keepalive_refreshed(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    isolated_home = tmp_path / "home"
+    isolated_home.mkdir()
+    monkeypatch.setenv("HOME", str(isolated_home))
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
     _write_auth_store(
         tmp_path,
         {
