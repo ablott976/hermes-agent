@@ -11,7 +11,7 @@ The [daily briefing bot tutorial](/guides/daily-briefing-bot) covers the basics.
 For the full feature reference, see [Scheduled Tasks (Cron)](/user-guide/features/cron).
 
 :::info Key Concept
-Cron jobs run in fresh agent sessions with no memory of your current chat. Prompts must be **completely self-contained** — include everything the agent needs to know.
+Cron jobs use fresh agent conversations by default. Prompts must be **completely self-contained** for monitors, reports, and other recurring jobs. For finite work that must advance across several ticks, opt in to `session_mode="persistent"` (or `--session-mode persistent`) so Hermes resumes one durable conversation instead.
 :::
 
 :::tip Don't need the LLM? You have two zero-token options.

@@ -59,7 +59,10 @@ Jobs are stored in `~/.hermes/cron/jobs.json` with atomic write semantics (write
   "created_at": "2025-01-01T00:00:00Z",
   "model": null,
   "provider": null,
-  "script": null
+  "script": null,
+  "session_mode": "persistent",
+  "session_root_id": "cron_a1b2c3d4e5f6_20250101_090000_7fa31c0d",
+  "session_runtime_fingerprint": "<sha256>"
 }
 ```
 
@@ -76,6 +79,8 @@ Jobs are stored in `~/.hermes/cron/jobs.json` with atomic write semantics (write
 
 Older jobs may have a single `skill` field instead of the `skills` array. The scheduler normalizes this at load time — single `skill` is promoted to `skills: [skill]`.
 
+`session_mode` is also optional on disk. A missing or invalid value normalizes to `fresh`, preserving historical behavior and the compact legacy record shape. `session_root_id` and `session_runtime_fingerprint` are scheduler-owned and cannot be changed through public update surfaces.
+
 ## Scheduler Runtime
 
 ### Tick Cycle
@@ -89,11 +94,13 @@ tick()
   3. Filter to due jobs (next_run <= now AND state == "scheduled")
   4. For each due job:
      a. Set state to "running"
-     b. Create fresh AIAgent session (no conversation history)
-     c. Load attached skills in order (injected as user messages)
-     d. Run the job prompt through the agent
+     b. Create a new in-memory AIAgent for the tick
+     c. Fresh: start a new session and load prompt/skills
+        Persistent: resolve root → active compression tip, sanitize replay,
+        validate the runtime fingerprint, and restore persisted history/prompt
+     d. Run the job prompt or compact continuation turn through the agent
      e. Deliver the response to the configured target
-     f. Update run_count, compute next_run
+     f. Persist per-tick usage and update run_count / next_run
      g. If repeat count exhausted → state = "completed"
      h. Otherwise → state = "scheduled"
   5. Write updated jobs back to jobs.json
@@ -171,14 +178,25 @@ cron never loses its trigger. Recurring jobs re-arm after each fire; `repeat`-N
 jobs stop cleanly when the count is exhausted (no orphaned one-shot). The full
 agent↔Nous wire contract lives in `docs/chronos-managed-cron-contract.md`.
 
-### Fresh Session Isolation
+### Conversation Lifecycle Modes
 
-Each cron job runs in a completely fresh agent session:
+`session_mode="fresh"` is the default. It preserves complete isolation:
 
-- No conversation history from previous runs
-- No memory of previous cron executions (unless persisted to memory/files)
-- The prompt must be self-contained — cron jobs cannot ask clarifying questions
-- The `cronjob` toolset is disabled (recursion guard)
+- no history from previous runs
+- full prompt and attached skills loaded each run
+- self-contained prompts required
+- the `cronjob` toolset disabled (recursion guard)
+
+`session_mode="persistent"` keeps one durable conversation across ticks while still constructing a fresh in-memory `AIAgent` for each execution:
+
+1. The first tick creates a root session and atomically stores its ID plus a SHA-256 runtime fingerprint on the job before the model call.
+2. Later ticks resolve the root through `SessionDB.resolve_resume_session_id()`, so compression children become the active tip without rewriting the stable job root.
+3. Replay uses the shared interrupted/dangling-tool cleanup. An unanswered user tail from a crashed cron turn is removed before retry.
+4. The persisted system prompt and sanitized history are restored; the new turn contains only a compact continuation instruction plus new script/upstream data.
+5. The fingerprint covers prompt/skills/script references, model/provider/API mode, effective tool names, and workdir. A mismatch forks a new root and performs a full bootstrap instead of mixing incompatible prefixes.
+6. The active tip is ended with `cron_waiting` between ticks and reopened for the next run. Pause preserves the pointer; switching to fresh clears it; removal prevents future continuation without deleting session history.
+
+Persistent mode is rejected for `no_agent=True`. Per-tick output records input/cache-read/output tokens, model/tool calls, and elapsed time. This exposes whether provider prefix caching is actually being used without assuming a provider-specific cache implementation.
 
 ## Skill-Backed Jobs
 

@@ -155,11 +155,57 @@ def _jobs_lock():
         finally:
             _jobs_lock_state.depth = 0
 
-# Fields on a cron job that must never change after creation. ``id`` is used
-# as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
-# updated lets an unsafe value (``../escape``, absolute path, nested) leak
-# into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+# Fields on a cron job that must never change through public update surfaces.
+# ``id`` is used as a filesystem path component under ``OUTPUT_DIR``. The
+# persistent-session fields are scheduler-managed continuation state; allowing a
+# caller to rewrite them could make one job resume another job's conversation.
+_IMMUTABLE_JOB_FIELDS = frozenset({
+    "id",
+    "session_root_id",
+    "session_runtime_fingerprint",
+})
+_INTERNAL_JOB_FIELDS = frozenset({
+    "session_root_id",
+    "session_runtime_fingerprint",
+})
+
+
+def public_job_view(job: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Return a copy safe for normal API/UI output.
+
+    Persistent roots and contract fingerprints are scheduler bookkeeping. They
+    are intentionally available to internal storage/scheduler code but never
+    exposed as user-facing job fields or writable control-plane identifiers.
+    """
+    if job is None:
+        return None
+    return {key: value for key, value in job.items() if key not in _INTERNAL_JOB_FIELDS}
+
+
+SESSION_MODE_FRESH = "fresh"
+SESSION_MODE_PERSISTENT = "persistent"
+_SESSION_MODES = frozenset({SESSION_MODE_FRESH, SESSION_MODE_PERSISTENT})
+
+
+def normalize_session_mode(value: Any, *, strict: bool = True) -> str:
+    """Return a supported cron conversation mode.
+
+    Missing values are the historical ``fresh`` behavior. Invalid hand-edited
+    legacy values fail open to ``fresh`` on read, while create/update callers
+    fail closed with an actionable validation error.
+    """
+    if value is None:
+        return SESSION_MODE_FRESH
+    if isinstance(value, str):
+        mode = value.strip().lower()
+        if mode in _SESSION_MODES:
+            return mode
+    if strict:
+        raise ValueError(
+            "session_mode must be 'fresh' or 'persistent' "
+            f"(got {value!r})"
+        )
+    return SESSION_MODE_FRESH
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -254,6 +300,17 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
         name = label_source[:50].strip() or "cron job"
     normalized["name"] = name
     normalized["schedule_display"] = _schedule_display_for_job(normalized)
+    session_mode = normalize_session_mode(
+        normalized.get("session_mode"), strict=False
+    )
+    if normalized.get("no_agent"):
+        # Script-only jobs never construct an agent or conversation. Treat any
+        # hand-edited/legacy persistent value as fresh and discard unusable
+        # continuation metadata in the normalized public/runtime view.
+        session_mode = SESSION_MODE_FRESH
+        normalized.pop("session_root_id", None)
+        normalized.pop("session_runtime_fingerprint", None)
+    normalized["session_mode"] = session_mode
 
     state = _coerce_job_text(normalized.get("state")).strip()
     if not state:
@@ -865,6 +922,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    session_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -909,6 +967,9 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        session_mode: ``fresh`` (default) creates an independent conversation
+                per tick. ``persistent`` resumes one durable conversation across
+                ticks and is intended for finite continuable work.
 
     Returns:
         The created job dict
@@ -941,6 +1002,7 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_session_mode = normalize_session_mode(session_mode)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -950,6 +1012,8 @@ def create_job(
             "no_agent=True requires a script — with no agent and no script "
             "there is nothing for the job to run."
         )
+    if normalized_no_agent and normalized_session_mode == SESSION_MODE_PERSISTENT:
+        raise ValueError("session_mode='persistent' cannot be used with no_agent=True")
 
     # Normalize context_from: accept str or list of str, store as list or None
     if isinstance(context_from, str):
@@ -1022,13 +1086,17 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    # Omit the historical default from storage so existing/new fresh jobs keep
+    # the same compact on-disk shape. Read paths normalize a missing key.
+    if normalized_session_mode == SESSION_MODE_PERSISTENT:
+        job["session_mode"] = SESSION_MODE_PERSISTENT
 
     with _jobs_lock():
         jobs = load_jobs()
         jobs.append(job)
         save_jobs(jobs)
 
-    return job
+    return _normalize_job_record(job)
 
 
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:
@@ -1088,6 +1156,7 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
 
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
+    updates = dict(updates or {})
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
     # path component under OUTPUT_DIR — letting an update change it leaks
     # path-escape values into output writes/deletes.
@@ -1096,6 +1165,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         raise ValueError(
             f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}"
         )
+    if "session_mode" in updates:
+        updates["session_mode"] = normalize_session_mode(updates["session_mode"])
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -1123,6 +1194,18 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 normalized_skills = _normalize_skill_list(updated.get("skill"), updated.get("skills"))
                 updated["skills"] = normalized_skills
                 updated["skill"] = normalized_skills[0] if normalized_skills else None
+
+            session_mode = normalize_session_mode(updated.get("session_mode"))
+            if bool(updated.get("no_agent")) and session_mode == SESSION_MODE_PERSISTENT:
+                raise ValueError("session_mode='persistent' cannot be used with no_agent=True")
+            if session_mode == SESSION_MODE_FRESH:
+                # Fresh is the historical default. Remove persistent continuation
+                # state so switching back later cannot revive a stale conversation.
+                updated.pop("session_mode", None)
+                updated.pop("session_root_id", None)
+                updated.pop("session_runtime_fingerprint", None)
+            else:
+                updated["session_mode"] = SESSION_MODE_PERSISTENT
 
             if schedule_changed:
                 updated_schedule = updated["schedule"]
@@ -1155,6 +1238,38 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             jobs[i] = updated
             save_jobs(jobs)
             return _normalize_job_record(jobs[i])
+    return None
+
+
+def set_persistent_session_state(
+    job_id: str,
+    root_session_id: str,
+    runtime_fingerprint: str,
+) -> Optional[Dict[str, Any]]:
+    """Persist scheduler-owned continuation state for a persistent job.
+
+    This deliberately bypasses ``update_job`` because the two fields are
+    immutable through public/API update surfaces. The job lock keeps the write
+    atomic with scheduler, CLI, and tool mutations.
+    """
+    root = str(root_session_id or "").strip()
+    fingerprint = str(runtime_fingerprint or "").strip()
+    if not root or not fingerprint:
+        raise ValueError("persistent session state requires a root id and fingerprint")
+
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job.get("id") != job_id:
+                continue
+            if normalize_session_mode(job.get("session_mode"), strict=False) != SESSION_MODE_PERSISTENT:
+                raise ValueError("persistent session state can only be set on a persistent job")
+            updated = dict(job)
+            updated["session_root_id"] = root
+            updated["session_runtime_fingerprint"] = fingerprint
+            jobs[i] = updated
+            save_jobs(jobs)
+            return _normalize_job_record(updated)
     return None
 
 

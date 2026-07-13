@@ -779,6 +779,7 @@ try:
         pause_job as _cron_pause,
         resume_job as _cron_resume,
         trigger_job as _cron_trigger,
+        public_job_view as _cron_public_view,
     )
     _CRON_AVAILABLE = True
 except ImportError:
@@ -790,6 +791,7 @@ except ImportError:
     _cron_pause = None
     _cron_resume = None
     _cron_trigger = None
+    _cron_public_view = None
 
 
 def _notify_cron_provider_jobs_changed() -> None:
@@ -3515,7 +3517,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _JOB_ID_RE = __import__("re").compile(r"[a-f0-9]{12}")
     # Allowed fields for update — prevents clients injecting arbitrary keys
-    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
+    _UPDATE_ALLOWED_FIELDS = {
+        "name", "schedule", "prompt", "deliver", "skills", "skill",
+        "repeat", "enabled", "session_mode",
+    }
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
 
@@ -3553,7 +3558,7 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             include_disabled = request.query.get("include_disabled", "").lower() in {"true", "1"}
             jobs = _cron_list(include_disabled=include_disabled)
-            return web.json_response({"jobs": jobs})
+            return web.json_response({"jobs": [_cron_public_view(job) for job in jobs]})
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -3573,6 +3578,7 @@ class APIServerAdapter(BasePlatformAdapter):
             deliver = body.get("deliver", "local")
             skills = body.get("skills")
             repeat = body.get("repeat")
+            session_mode = body.get("session_mode")
 
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
@@ -3592,6 +3598,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     return web.json_response({"error": scan_error}, status=400)
             if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
                 return web.json_response({"error": "Repeat must be a positive integer"}, status=400)
+            if session_mode is not None and session_mode not in {"fresh", "persistent"}:
+                return web.json_response(
+                    {"error": "session_mode must be 'fresh' or 'persistent'"},
+                    status=400,
+                )
 
             kwargs = {
                 "prompt": prompt,
@@ -3604,10 +3615,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["skills"] = skills
             if repeat is not None:
                 kwargs["repeat"] = repeat
+            if session_mode is not None:
+                kwargs["session_mode"] = session_mode
 
             job = _cron_create(**kwargs)
             _notify_cron_provider_jobs_changed()
-            return web.json_response({"job": job})
+            return web.json_response({"job": _cron_public_view(job)})
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -3626,7 +3639,7 @@ class APIServerAdapter(BasePlatformAdapter):
             job = _cron_get(job_id)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
-            return web.json_response({"job": job})
+            return web.json_response({"job": _cron_public_view(job)})
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -3660,11 +3673,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 scan_error = _scan_cron_prompt(sanitized["prompt"])
                 if scan_error:
                     return web.json_response({"error": scan_error}, status=400)
+            if "session_mode" in sanitized and sanitized["session_mode"] not in {
+                "fresh", "persistent",
+            }:
+                return web.json_response(
+                    {"error": "session_mode must be 'fresh' or 'persistent'"},
+                    status=400,
+                )
             job = _cron_update(job_id, sanitized)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
-            return web.json_response({"job": job})
+            return web.json_response({"job": _cron_public_view(job)})
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -3704,7 +3724,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
-            return web.json_response({"job": job})
+            return web.json_response({"job": _cron_public_view(job)})
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -3724,7 +3744,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
-            return web.json_response({"job": job})
+            return web.json_response({"job": _cron_public_view(job)})
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -3743,7 +3763,7 @@ class APIServerAdapter(BasePlatformAdapter):
             job = _cron_trigger(job_id)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
-            return web.json_response({"job": job})
+            return web.json_response({"job": _cron_public_view(job)})
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
