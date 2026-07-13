@@ -395,34 +395,46 @@ def test_system_contract_drift_forks_without_reinjecting_old_history(persistent_
     assert "CRON CONTINUATION" not in FakeAgent.calls[-1]["prompt"]
 
 
-def test_skill_content_drift_forks_persistent_root(
+def test_absolute_skill_content_drift_forks_persistent_root(
     persistent_env,
     monkeypatch,
+    tmp_path,
 ):
+    skills_dir = tmp_path / "skills"
+    absolute_skill = skills_dir / "demo-skill"
+    seen_names = []
     skill_body = {"content": "version one"}
-    monkeypatch.setattr(
-        "tools.skills_tool.skill_view",
-        lambda _name: json.dumps({"success": True, "content": skill_body["content"]}),
-    )
+
+    def _view_skill(name):
+        seen_names.append(name)
+        return json.dumps({"success": True, "content": skill_body["content"]})
+
+    monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", skills_dir)
+    monkeypatch.setattr("tools.skills_tool.skill_view", _view_skill)
     monkeypatch.setattr("tools.skill_usage.bump_use", lambda _name: None)
     job = create_job(
         prompt="Continue with the loaded procedure.",
         schedule="every 1m",
         model="test-model",
         provider="openrouter",
-        skills=["demo-skill"],
+        skills=[str(absolute_skill)],
         session_mode="persistent",
     )
 
     assert run_job(job)[0] is True
     original_root = get_job(job["id"])["session_root_id"]
+    assert seen_names
+    assert set(seen_names) == {"demo-skill"}
 
     skill_body["content"] = "version two"
+    seen_names.clear()
     assert run_job(get_job(job["id"]))[0] is True
 
     assert get_job(job["id"])["session_root_id"] != original_root
     assert FakeAgent.calls[-1]["history"] == []
     assert "version two" in FakeAgent.calls[-1]["prompt"]
+    assert seen_names
+    assert set(seen_names) == {"demo-skill"}
 
 
 def test_orphaned_pointer_forks_before_bootstrap(persistent_env):

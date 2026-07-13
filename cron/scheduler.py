@@ -2970,6 +2970,7 @@ def _persistent_skill_contract(job: dict) -> list[dict[str, str]]:
         return contract
 
     from agent.skill_bundles import build_bundle_invocation_message, resolve_bundle_command_key
+    from agent.skill_utils import normalize_skill_lookup_name
     from tools.skills_tool import skill_view
 
     for raw_name in skills:
@@ -2990,7 +2991,7 @@ def _persistent_skill_contract(job: dict) -> list[dict[str, str]]:
                     material = str(bundle_payload[0] or "")
                     state = "bundle"
             else:
-                loaded = json.loads(skill_view(name))
+                loaded = json.loads(skill_view(normalize_skill_lookup_name(name)))
                 if loaded.get("success"):
                     material = str(loaded.get("content") or "")
                     state = "skill"
