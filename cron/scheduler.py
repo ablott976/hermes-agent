@@ -2626,8 +2626,8 @@ def _load_persistent_cron_history(session_db, root_session_id: str):
 
     Returns ``(tip_session_id, history)`` or ``(None, [])`` when the root is
     missing/corrupt. A user-only tail is a crash-resilience write from a turn
-    that never produced an assistant response; cron can safely discard it
-    before adding the replacement continuation turn.
+    that never produced an assistant response; cron soft-deletes that durable
+    tail before adding the replacement continuation turn.
     """
     if not session_db or not root_session_id:
         return None, []
@@ -2640,12 +2640,29 @@ def _load_persistent_cron_history(session_db, root_session_id: str):
 
         history = list(sanitize_replay_history(history))
         while history and history[-1].get("role") == "user":
+            recent_users = session_db.list_recent_user_messages(
+                tip_session_id,
+                limit=1,
+            )
+            if not recent_users or recent_users[0].get("id") is None:
+                raise RuntimeError(
+                    "Could not identify the unanswered persistent cron user tail"
+                )
             logger.warning(
                 "Persistent cron session %s had an unanswered user tail; "
-                "dropping it before resume",
+                "soft-deleting it before resume",
                 tip_session_id,
             )
-            history.pop()
+            rewind = session_db.rewind_to_message(
+                tip_session_id,
+                recent_users[0]["id"],
+            )
+            if int(rewind.get("rewound_count") or 0) < 1:
+                raise RuntimeError(
+                    "Could not soft-delete the unanswered persistent cron user tail"
+                )
+            history = session_db.get_messages_as_conversation(tip_session_id) or []
+            history = list(sanitize_replay_history(history))
         return tip_session_id, history
     except Exception:
         logger.warning(
