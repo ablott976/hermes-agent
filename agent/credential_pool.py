@@ -108,13 +108,14 @@ SUPPORTED_POOL_STRATEGIES = {
 
 # Cooldown before retrying an exhausted credential.
 # Transient 401 auth failures cool down briefly so single-key setups can recover.
-# 429 (rate-limited), 402 (billing/quota), and other failures cool down after 1 hour.
-# Provider-supplied reset_at timestamps may shorten the cooldown, but must not
-# extend it: users can reset provider quotas/limits out-of-band, so a stale
-# reset_at is only advisory and should not freeze a credential for days.
+# 429 (rate-limited), 402 (billing/quota), and other failures use a local TTL
+# when the provider does not supply a reset window. Explicit provider windows
+# are authoritative, but bounded so malformed metadata cannot freeze a
+# credential indefinitely; fresh token sync can still recover it sooner.
 EXHAUSTED_TTL_401_SECONDS = 5 * 60           # 5 minutes
 EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour
 EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
+MAX_PROVIDER_RESET_WINDOW_SECONDS = 31 * 24 * 60 * 60
 
 # Pool key prefix for custom OpenAI-compatible endpoints.
 # Custom endpoints all share provider='custom' but are keyed by their
@@ -360,8 +361,9 @@ def _exhausted_until(entry: PooledCredential) -> Optional[float]:
     ttl_until = None
     if entry.last_status_at:
         ttl_until = entry.last_status_at + _exhausted_ttl(entry.last_error_code)
-    if reset_at is not None and ttl_until is not None:
-        return min(reset_at, ttl_until)
+    if reset_at is not None and entry.last_status_at is not None:
+        reset_cap = entry.last_status_at + MAX_PROVIDER_RESET_WINDOW_SECONDS
+        return min(reset_at, reset_cap)
     if ttl_until is not None:
         return ttl_until
     if reset_at is not None:
