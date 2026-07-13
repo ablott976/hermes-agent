@@ -160,6 +160,8 @@ def cron_list(show_all: bool = False):
             print(f"    Script:    {script}")
         if job.get("no_agent"):
             print(f"    Mode:      {color('no-agent', Colors.DIM)} (script stdout delivered directly)")
+        elif job.get("session_mode") == "persistent":
+            print(f"    Mode:      {color('persistent', Colors.CYAN)} (continues across runs)")
         workdir = job.get("workdir")
         if workdir:
             print(f"    Workdir:   {workdir}")
@@ -310,6 +312,7 @@ def cron_create(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", False) or None,
+        session_mode=getattr(args, "session_mode", "fresh"),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -324,6 +327,8 @@ def cron_create(args):
         print(f"  Script: {job_data['script']}")
     if job_data.get("no_agent"):
         print("  Mode: no-agent (script stdout delivered directly)")
+    elif job_data.get("session_mode") == "persistent":
+        print("  Mode: persistent (continues across runs)")
     if job_data.get("workdir"):
         print(f"  Workdir: {job_data['workdir']}")
     print(f"  Next run: {result['next_run_at']}")
@@ -373,6 +378,7 @@ def cron_edit(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", None),
+        session_mode=getattr(args, "session_mode", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -390,6 +396,8 @@ def cron_edit(args):
         print(f"  Script: {updated['script']}")
     if updated.get("no_agent"):
         print("  Mode: no-agent (script stdout delivered directly)")
+    elif updated.get("session_mode") == "persistent":
+        print("  Mode: persistent (continues across runs)")
     if updated.get("workdir"):
         print(f"  Workdir: {updated['workdir']}")
     return 0

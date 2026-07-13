@@ -105,8 +105,10 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
         original_user_message="do it",
         _should_review_memory=False,
         _turn_exit_reason="fallback_prior_turn_content",
+        _turn_tool_call_count=1,
     )
 
     assert result["messages"][-1] == {"role": "assistant", "content": "Done."}
+    assert result["turn_tool_calls"] == 1
     assert agent.persisted_messages is not None
     assert agent.persisted_messages[-1] == {"role": "assistant", "content": "Done."}

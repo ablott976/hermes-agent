@@ -4,6 +4,7 @@ import json
 import pytest
 
 from tools.cronjob_tools import (
+    CRONJOB_SCHEMA,
     _scan_cron_prompt,
     check_cronjob_requirements,
     cronjob,
@@ -263,6 +264,34 @@ class TestUnifiedCronjobTool:
         assert listing["count"] == 1
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
+        assert listing["jobs"][0]["session_mode"] == "fresh"
+
+    def test_create_and_update_persistent_session_mode(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Continue the implementation",
+                schedule="every 1m",
+                session_mode="persistent",
+            )
+        )
+        assert created["success"] is True
+        assert created["job"]["session_mode"] == "persistent"
+
+        updated = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                session_mode="fresh",
+            )
+        )
+        assert updated["success"] is True
+        assert updated["job"]["session_mode"] == "fresh"
+
+    def test_schema_advertises_persistent_session_mode(self):
+        props = CRONJOB_SCHEMA["parameters"]["properties"]
+        assert props["session_mode"]["enum"] == ["fresh", "persistent"]
+        assert "attach_to_session" in props["session_mode"]["description"]
 
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs

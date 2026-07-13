@@ -2097,6 +2097,8 @@ export interface CronJobRepeat {
   completed?: number;
 }
 
+export type CronSessionMode = "fresh" | "persistent";
+
 export interface CronJobMutation {
   name?: string;
   prompt?: string;
@@ -2111,6 +2113,7 @@ export interface CronJobMutation {
   context_from?: string[] | null;
   enabled_toolsets?: string[] | null;
   workdir?: string | null;
+  session_mode?: CronSessionMode;
 }
 
 export interface CronJob {
@@ -2136,6 +2139,7 @@ export interface CronJob {
   context_from?: string[] | string | null;
   enabled_toolsets?: string[] | null;
   workdir?: string | null;
+  session_mode?: CronSessionMode | null;
   last_run_at?: string | null;
   next_run_at?: string | null;
   last_status?: string | null;
