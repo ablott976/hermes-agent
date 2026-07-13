@@ -483,7 +483,7 @@ def test_compression_tip_is_resolved_while_job_keeps_stable_root(persistent_env)
     assert persistent_env.reopened[-1] == child
 
 
-def test_replay_cleanup_drops_interrupted_turn_but_preserves_prior_context():
+def test_replay_cleanup_marks_interrupted_side_effect_unknown_and_preserves_context():
     store = FakeSessionStore()
     store.sessions["root"] = {"id": "root"}
     store.messages["root"] = [
@@ -500,13 +500,24 @@ def test_replay_cleanup_drops_interrupted_turn_but_preserves_prior_context():
     tip, history = _load_persistent_cron_history(store, "root")
 
     assert tip == "root"
-    assert history == [
+    assert history[:4] == [
         {"role": "user", "content": "bootstrap"},
         {"role": "assistant", "content": "prior milestone"},
+        {"role": "user", "content": "continue"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "call-1", "function": {"name": "terminal"}}],
+        },
     ]
+    recovered = history[-1]
+    assert recovered["role"] == "tool"
+    assert recovered["tool_call_id"] == "call-1"
+    assert recovered["effect_disposition"] == "unknown"
+    assert "effect is UNKNOWN" in recovered["content"]
 
 
-def test_real_session_db_drops_interrupted_tool_tail_after_reopen(tmp_path):
+def test_real_session_db_marks_interrupted_side_effect_unknown_after_reopen(tmp_path):
     db_path = tmp_path / "state.db"
     db = RealSessionDB(db_path)
     db.create_session("root", "cron", system_prompt="stable")
@@ -527,10 +538,17 @@ def test_real_session_db_drops_interrupted_tool_tail_after_reopen(tmp_path):
         reopened.close()
 
     assert tip == "root"
-    assert [(item["role"], item["content"]) for item in history] == [
+    assert [(item["role"], item["content"]) for item in history[:4]] == [
         ("user", "bootstrap"),
         ("assistant", "prior milestone"),
+        ("user", "continue"),
+        ("assistant", None),
     ]
+    recovered = history[-1]
+    assert recovered["role"] == "tool"
+    assert recovered["tool_call_id"] == "call-1"
+    assert recovered["effect_disposition"] == "unknown"
+    assert "effect is UNKNOWN" in recovered["content"]
 
 
 def test_real_session_db_soft_deletes_failed_user_tail_before_retry(tmp_path):
