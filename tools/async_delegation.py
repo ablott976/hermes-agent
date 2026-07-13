@@ -915,7 +915,11 @@ def _reset_for_tests() -> None:
     global _executor, _executor_max_workers
     with _executor_lock:
         if _executor is not None:
-            _executor.shutdown(wait=False)
+            # Test isolation requires every previously submitted worker to stop
+            # before records and completion queues are cleared.  ``wait=False``
+            # allowed a prior test's worker to publish into the next test's
+            # queue after teardown, producing order-dependent completions.
+            _executor.shutdown(wait=True)
         _executor = None
         _executor_max_workers = 0
     with _records_lock:
