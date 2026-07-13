@@ -38,6 +38,25 @@ class FakeSessionStore:
     def get_messages_as_conversation(self, session_id: str):
         return [dict(message) for message in self.messages.get(session_id, [])]
 
+    def list_recent_user_messages(self, session_id: str, limit: int = 20):
+        rows = self.messages.get(session_id, [])
+        return [
+            {"id": index + 1, "preview": str(message.get("content") or "")[:80]}
+            for index, message in reversed(list(enumerate(rows)))
+            if message.get("role") == "user"
+        ][:limit]
+
+    def rewind_to_message(self, session_id: str, target_message_id: int):
+        rows = self.messages.get(session_id, [])
+        target_index = target_message_id - 1
+        if target_index < 0 or target_index >= len(rows):
+            raise ValueError("message not found")
+        if rows[target_index].get("role") != "user":
+            raise ValueError("rewind target must be a user message")
+        rewound_count = len(rows) - target_index
+        del rows[target_index:]
+        return {"rewound_count": rewound_count}
+
     def reopen_session(self, session_id: str):
         self.reopened.append(session_id)
         if session_id in self.sessions:
@@ -512,6 +531,42 @@ def test_real_session_db_drops_interrupted_tool_tail_after_reopen(tmp_path):
         ("user", "bootstrap"),
         ("assistant", "prior milestone"),
     ]
+
+
+def test_real_session_db_soft_deletes_failed_user_tail_before_retry(tmp_path):
+    db = RealSessionDB(tmp_path / "state.db")
+    try:
+        db.create_session("root", "cron", system_prompt="stable")
+        db.append_message("root", "user", "bootstrap")
+        db.append_message("root", "assistant", "prior milestone")
+        failed_message_id = db.append_message("root", "user", "failed continuation")
+
+        tip, history = _load_persistent_cron_history(db, "root")
+
+        assert tip == "root"
+        assert [(item["role"], item["content"]) for item in history] == [
+            ("user", "bootstrap"),
+            ("assistant", "prior milestone"),
+        ]
+        failed_row = next(
+            row
+            for row in db.get_messages("root", include_inactive=True)
+            if row["id"] == failed_message_id
+        )
+        assert failed_row["active"] == 0
+
+        db.append_message("root", "user", "replacement continuation")
+        db.append_message("root", "assistant", "replacement complete")
+        _, replay = _load_persistent_cron_history(db, "root")
+
+        assert [(item["role"], item["content"]) for item in replay] == [
+            ("user", "bootstrap"),
+            ("assistant", "prior milestone"),
+            ("user", "replacement continuation"),
+            ("assistant", "replacement complete"),
+        ]
+    finally:
+        db.close()
 
 
 def test_real_session_db_resolves_compression_tip(tmp_path):
