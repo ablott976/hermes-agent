@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, NoReturn
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlencode, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 from uuid import uuid4
 
 from hermes_cli.profiles import (
@@ -5725,6 +5725,21 @@ def _validate_web_fetch_url(url: str, policy: WebFetchPolicy) -> tuple[str, str]
     return text, hostname.lower().rstrip(".")
 
 
+class _PolicyValidatedWebFetchRedirectHandler(HTTPRedirectHandler):
+    """Apply the workspace URL policy before urllib follows each redirect."""
+
+    def __init__(self, policy: WebFetchPolicy) -> None:
+        super().__init__()
+        self._policy = policy
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is None:
+            return None
+        _validate_web_fetch_url(redirected.full_url, self._policy)
+        return redirected
+
+
 def fetch_workspace_url(
     workspace_id: str,
     url: str,
@@ -5748,8 +5763,11 @@ def fetch_workspace_url(
         headers={"Accept": "text/plain, text/html, application/json;q=0.8", "User-Agent": "hermes-profile-router-no-model/1"},
         method="GET",
     )
+    opener = build_opener(
+        _PolicyValidatedWebFetchRedirectHandler(route_policy.web_fetch_policy)
+    )
     try:
-        with urlopen(request, timeout=MAX_WEB_FETCH_TIMEOUT_SECONDS) as response:
+        with opener.open(request, timeout=MAX_WEB_FETCH_TIMEOUT_SECONDS) as response:
             raw = response.read(route_policy.web_fetch_policy.max_bytes + 1)
             status = int(getattr(response, "status", 200))
             content_type = str(response.headers.get("content-type", ""))[:160]

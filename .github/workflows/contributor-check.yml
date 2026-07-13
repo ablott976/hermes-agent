@@ -15,9 +15,13 @@ jobs:
           fetch-depth: 0  # Full history needed for git log
 
       - name: Check for unmapped contributor emails
+        env:
+          BASE_REF_NAME: ${{ github.base_ref || 'main' }}
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          # Compare with the actual PR base; pushes to main use the fallback.
+          git fetch --no-tags origin \
+            "+refs/heads/${BASE_REF_NAME}:refs/remotes/origin/${BASE_REF_NAME}"
+          MERGE_BASE=$(git merge-base "origin/${BASE_REF_NAME}" HEAD)
 
           # Find any new author emails in this PR's commits
           NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)

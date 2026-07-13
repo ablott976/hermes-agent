@@ -3444,18 +3444,129 @@ def test_production_server_and_web_wrappers_are_policy_gated_and_no_model(
         def read(self, _limit):
             return b"TOKEN=*** public-ok"
 
+    class FakeOpener:
+        def open(self, *_args, **_kwargs):
+            return FakeResponse()
+
     monkeypatch.setattr(
         mcp_profile_router.socket,
         "getaddrinfo",
         lambda *_args, **_kwargs: [(mcp_profile_router.socket.AF_INET, mcp_profile_router.socket.SOCK_STREAM, 0, "", ("93.184.216.34", 443))],
     )
-    monkeypatch.setattr(mcp_profile_router, "urlopen", lambda *_args, **_kwargs: FakeResponse())
+    redirect_handlers = []
+
+    def fake_build_opener(*handlers):
+        redirect_handlers.extend(handlers)
+        return FakeOpener()
+
+    monkeypatch.setattr(mcp_profile_router, "build_opener", fake_build_opener)
     fetched = json.loads(workspace_web_fetch(workspace_id, "https://example.com/status?secret=hidden", context_token=token))
     assert fetched["ok"] is True
     assert fetched["web_fetch"]["fetch"]["hostname"] == "example.com"
+    assert any(
+        isinstance(handler, mcp_profile_router._PolicyValidatedWebFetchRedirectHandler)
+        for handler in redirect_handlers
+    )
     dumped_fetch = json.dumps(fetched)
     assert "secret=hidden" not in dumped_fetch
     assert fetched["web_fetch"]["audit"]["llm_calls"] == 0
+
+    class RedirectingOpener:
+        def __init__(self, handlers):
+            self.redirect_handler = next(
+                handler
+                for handler in handlers
+                if isinstance(
+                    handler,
+                    mcp_profile_router._PolicyValidatedWebFetchRedirectHandler,
+                )
+            )
+
+        def open(self, request, **_kwargs):
+            self.redirect_handler.redirect_request(
+                request,
+                MagicMock(),
+                302,
+                "Found",
+                MagicMock(),
+                "https://127.0.0.1/latest/meta-data",
+            )
+            raise AssertionError("private redirect must be rejected before opening")
+
+    monkeypatch.setattr(
+        mcp_profile_router,
+        "build_opener",
+        lambda *handlers: RedirectingOpener(handlers),
+    )
+    blocked_redirect = json.loads(
+        workspace_web_fetch(
+            workspace_id,
+            "https://example.com/redirect",
+            context_token=token,
+        )
+    )
+    assert blocked_redirect["ok"] is False
+    assert blocked_redirect["error"]["code"] == "web_fetch_private_network_denied"
+
+
+def test_web_fetch_redirects_are_revalidated_before_following(monkeypatch):
+    policy = mcp_profile_router.WebFetchPolicy(
+        enabled=True,
+        allowed_domains=("example.com",),
+    )
+    handler = mcp_profile_router._PolicyValidatedWebFetchRedirectHandler(policy)
+    private_handler = mcp_profile_router._PolicyValidatedWebFetchRedirectHandler(
+        mcp_profile_router.WebFetchPolicy(enabled=True, allowed_domains=("*",))
+    )
+    request = mcp_profile_router.Request("https://example.com/start", method="GET")
+    response = MagicMock()
+    response_headers = MagicMock()
+
+    with pytest.raises(ProfileRouterError) as private_error:
+        private_handler.redirect_request(
+            request,
+            response,
+            302,
+            "Found",
+            response_headers,
+            "https://127.0.0.1/latest/meta-data",
+        )
+    assert private_error.value.code == "web_fetch_private_network_denied"
+
+    with pytest.raises(ProfileRouterError) as domain_error:
+        handler.redirect_request(
+            request,
+            response,
+            302,
+            "Found",
+            response_headers,
+            "https://attacker.invalid/redirect",
+        )
+    assert domain_error.value.code == "web_fetch_domain_not_allowed"
+
+    monkeypatch.setattr(
+        mcp_profile_router.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (
+                mcp_profile_router.socket.AF_INET,
+                mcp_profile_router.socket.SOCK_STREAM,
+                0,
+                "",
+                ("93.184.216.34", 443),
+            )
+        ],
+    )
+    redirected = handler.redirect_request(
+        request,
+        response,
+        302,
+        "Found",
+        response_headers,
+        "https://api.example.com/next",
+    )
+    assert redirected is not None
+    assert redirected.full_url == "https://api.example.com/next"
 
 
 def test_file_write_is_denied_without_policy_and_for_secret_or_symlink_paths(
