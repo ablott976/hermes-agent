@@ -604,6 +604,7 @@ def run_conversation(
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
+    turn_tool_call_count = 0
     final_response = None
     interrupted = False
     failed = False
@@ -4322,6 +4323,10 @@ def run_conversation(
             except Exception:
                 pass
 
+            turn_tool_call_count += len(
+                getattr(assistant_message, "tool_calls", None) or []
+            )
+
             # Handle assistant response
             if assistant_message.content and not agent.quiet_mode:
                 if agent.verbose_logging:
@@ -5348,6 +5353,7 @@ def run_conversation(
         _should_review_memory=_should_review_memory,
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
+        _turn_tool_call_count=turn_tool_call_count,
     )
 
 

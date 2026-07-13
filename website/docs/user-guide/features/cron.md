@@ -16,7 +16,8 @@ Cron jobs can:
 - pause, resume, edit, trigger, and remove jobs
 - attach zero, one, or multiple skills to a job
 - deliver results back to the origin chat, local files, or configured platform targets
-- run in fresh agent sessions with the normal static tool list
+- run in fresh agent sessions with the normal static tool list (default)
+- optionally continue one durable agent conversation across runs for finite, multi-stage work
 - run in **no-agent mode** — a script on a schedule, its stdout delivered verbatim, zero LLM involvement (see the [no-agent mode](#no-agent-mode-script-only-jobs) section below)
 
 All of this is available to Hermes itself through the `cronjob` tool, so you can create, pause, edit, and remove jobs by asking in plain language — no CLI required.
@@ -60,6 +61,47 @@ Every morning at 9am, check Hacker News for AI news and send me a summary on Tel
 ```
 
 Hermes will use the unified `cronjob` tool internally.
+
+## Conversation modes
+
+Cron jobs use `fresh` mode by default, so every run is independent and existing jobs keep their historical behavior. Choose `persistent` only when one finite task should advance across several ticks.
+
+| Mode | Behavior | Best for |
+|------|----------|----------|
+| `fresh` | Starts an independent conversation on every run | monitors, alerts, digests, periodic reports |
+| `persistent` | Resumes one durable conversation, including compressed history | finite development, migration, or research work completed in stages |
+
+```bash
+/cron add "every 1m" "Continue the implementation plan and complete the next verified milestone." \
+  --session-mode persistent
+```
+
+```bash
+hermes cron create "every 1m" \
+  "Continue the implementation plan and complete the next verified milestone." \
+  --workdir /home/me/projects/acme \
+  --session-mode persistent \
+  --name "Finish migration"
+```
+
+```python
+cronjob(
+    action="create",
+    schedule="every 1m",
+    prompt="Continue the implementation plan and complete the next verified milestone.",
+    workdir="/home/me/projects/acme",
+    session_mode="persistent",
+    name="Finish migration",
+)
+```
+
+A persistent job loads its full prompt and skills on the first run. Later runs add a compact continuation turn plus any new script or upstream-job data, which keeps the stable conversation prefix available for provider prompt caching. Each saved run includes input, cache-read and output token counts, model/tool call counts, and elapsed time.
+
+Pause preserves the conversation. Switching back to `fresh` starts independent runs and clears the job's continuation pointer. Removing the job stops future continuation; session history remains available through normal session history tools.
+
+:::warning
+Use persistent mode for finite work with an explicit completion or pause condition. Do not use it for endless monitors or script-only (`no_agent`) jobs. `session_mode` controls the cron agent's internal conversation; it is separate from `attach_to_session`, which controls whether a person can reply to delivered output.
+:::
 
 ## Skill-backed cron jobs
 
@@ -200,7 +242,7 @@ What they do:
 
 ## How it works
 
-**Cron execution is handled by the gateway daemon.** The gateway ticks the scheduler every 60 seconds, running any due jobs in isolated agent sessions.
+**Cron execution is handled by the gateway daemon.** The gateway ticks the scheduler every 60 seconds, running due jobs in independent fresh sessions by default or resuming the durable conversation selected by a persistent job.
 
 ```bash
 hermes gateway install     # Install as a user service
@@ -217,11 +259,12 @@ On each tick Hermes:
 
 1. loads jobs from `~/.hermes/cron/jobs.json`
 2. checks `next_run_at` against the current time
-3. starts a fresh `AIAgent` session for each due job
-4. optionally injects one or more attached skills into that fresh session
-5. runs the prompt to completion
-6. delivers the final response
-7. updates run metadata and the next scheduled time
+3. creates a new in-memory `AIAgent` for the tick
+4. starts a fresh conversation, or resolves and safely replays the active persistent session tip
+5. injects the full prompt/skills for a fresh bootstrap or a compact continuation turn for a valid persistent resume
+6. runs the prompt to completion
+7. delivers the final response
+8. updates run metadata and the next scheduled time
 
 A file lock at `~/.hermes/cron/.tick.lock` prevents overlapping scheduler ticks from double-running the same job batch.
 
