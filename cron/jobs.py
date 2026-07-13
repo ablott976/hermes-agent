@@ -1087,6 +1087,35 @@ def _normalized_inference_axes(job: Dict[str, Any]) -> Tuple[Optional[str], Opti
     )
 
 
+def _normalize_progress(progress: Any) -> Optional[Dict[str, Any]]:
+    """Normalize optional per-job cron progress overrides.
+
+    Stored shape mirrors ``cron.progress`` config but only keeps known fields:
+    ``enabled``, ``initial_delay_seconds``, ``interval_seconds``,
+    ``edit_in_place``, and ``state_path``. ``None`` / empty dict clears the
+    override. A bare bool or string is shorthand for ``{"enabled": value}``.
+    """
+    if progress is None:
+        return None
+    if isinstance(progress, bool):
+        return {"enabled": progress}
+    if isinstance(progress, str):
+        text = progress.strip()
+        return {"enabled": text} if text else None
+    if not isinstance(progress, dict):
+        raise ValueError("Cron progress override must be a bool, string, or object")
+
+    allowed = {
+        "enabled",
+        "initial_delay_seconds",
+        "interval_seconds",
+        "edit_in_place",
+        "state_path",
+    }
+    normalized = {k: v for k, v in progress.items() if k in allowed and v is not None}
+    return normalized or None
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1106,6 +1135,7 @@ def create_job(
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
     session_mode: Optional[str] = None,
+    progress: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1153,6 +1183,9 @@ def create_job(
         session_mode: ``fresh`` (default) creates an independent conversation
                 per tick. ``persistent`` resumes one durable conversation across
                 ticks and is intended for finite continuable work.
+        progress: Optional per-job progress override. Mirrors ``cron.progress``
+                config; bool/string is shorthand for the ``enabled`` field.
+                None means inherit global config.
 
     Returns:
         The created job dict
@@ -1186,6 +1219,7 @@ def create_job(
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_session_mode = normalize_session_mode(session_mode)
+    normalized_progress = _normalize_progress(progress)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1277,6 +1311,7 @@ def create_job(
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
+        "progress": normalized_progress,
     }
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
@@ -1381,6 +1416,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["workdir"] = _normalize_workdir(_wd)
 
             previous_inference_axes = _normalized_inference_axes(job)
+            if "progress" in updates:
+                updates["progress"] = _normalize_progress(updates["progress"])
             updated = _apply_skill_fields({**job, **updates})
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
