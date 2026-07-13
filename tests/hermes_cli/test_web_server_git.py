@@ -31,6 +31,12 @@ def _git(repo: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
 
 
+def _git_out(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
 @pytest.fixture
 def repo(tmp_path):
     root = tmp_path / "repo"
@@ -152,6 +158,44 @@ def test_worktree_add_initializes_plain_folder(client, tmp_path):
     assert status["branch"]
     # Existing files are not silently committed by repo initialization.
     assert any(file["path"] == "notes.txt" and file["untracked"] for file in status["files"])
+
+
+def test_worktree_add_resolves_origin_head_before_fetch(client, tmp_path):
+    remote = tmp_path / "remote.git"
+    seed = tmp_path / "seed"
+    checkout = tmp_path / "checkout"
+    seed.mkdir()
+
+    _git(tmp_path, "init", "--bare", str(remote))
+    _git(seed, "init", "-q")
+    _git(seed, "config", "user.email", "t@example.com")
+    _git(seed, "config", "user.name", "Test")
+    _git(seed, "branch", "-M", "main")
+    (seed / "version.txt").write_text("one\n")
+    _git(seed, "add", "version.txt")
+    _git(seed, "commit", "-qm", "initial")
+    _git(seed, "remote", "add", "origin", str(remote))
+    _git(seed, "push", "origin", "main")
+    _git(remote, "symbolic-ref", "HEAD", "refs/heads/main")
+    _git(tmp_path, "clone", str(remote), str(checkout))
+
+    (seed / "version.txt").write_text("two\n")
+    _git(seed, "commit", "-am", "latest")
+    _git(seed, "push", "origin", "main")
+    latest = _git_out(seed, "rev-parse", "HEAD")
+
+    added = client.post(
+        "/api/git/worktree/add",
+        json={
+            "path": str(checkout),
+            "base": "origin/HEAD",
+            "branch": "feature/from-default",
+            "name": "from-default",
+        },
+    ).json()
+
+    assert _git_out(Path(added["path"]), "rev-parse", "HEAD") == latest
+    assert _git_out(checkout, "rev-parse", "origin/main") == latest
 
 
 def test_commit_context_includes_diff_and_untracked(client, repo):
