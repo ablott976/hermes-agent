@@ -2445,15 +2445,15 @@ def test_terminal_private_runner_executes_allowlisted_commands_but_not_public(
     monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
     monkeypatch.setattr(mcp_serve, "FastMCP", _FakeFastMCP)
     server = mcp_serve.create_profile_router_mcp_server()
-    assert "terminal_run" in server._tool_manager._tools
-    assert "file_patch" in server._tool_manager._tools
-    assert "patch_apply" in server._tool_manager._tools
-    assert "file_write" in server._tool_manager._tools
-    assert "file_move" in server._tool_manager._tools
-    assert "file_delete" in server._tool_manager._tools
-    assert "directory_create" in server._tool_manager._tools
-    assert "workspace_status_probe" in server._tool_manager._tools
-    assert "workspace_scratch_smoke" in server._tool_manager._tools
+    assert "terminal_run" not in server._tool_manager._tools
+    assert "file_patch" not in server._tool_manager._tools
+    assert "patch_apply" not in server._tool_manager._tools
+    assert "file_write" not in server._tool_manager._tools
+    assert "file_move" not in server._tool_manager._tools
+    assert "file_delete" not in server._tool_manager._tools
+    assert "directory_create" not in server._tool_manager._tools
+    assert "workspace_status_probe" not in server._tool_manager._tools
+    assert "workspace_scratch_smoke" not in server._tool_manager._tools
     assert "workspace_diff" in server._tool_manager._tools
     dumped = json.dumps(direct)
     assert "pwd" not in dumped
@@ -2611,13 +2611,13 @@ def test_terminal_private_runner_shapes_failure_and_timeout_without_leaking_valu
     monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
     monkeypatch.setattr(mcp_serve, "FastMCP", _FakeFastMCP)
     server = mcp_serve.create_profile_router_mcp_server()
-    assert "terminal_run" in server._tool_manager._tools
-    assert "file_patch" in server._tool_manager._tools
-    assert "patch_apply" in server._tool_manager._tools
-    assert "file_write" in server._tool_manager._tools
-    assert "file_move" in server._tool_manager._tools
-    assert "file_delete" in server._tool_manager._tools
-    assert "directory_create" in server._tool_manager._tools
+    assert "terminal_run" not in server._tool_manager._tools
+    assert "file_patch" not in server._tool_manager._tools
+    assert "patch_apply" not in server._tool_manager._tools
+    assert "file_write" not in server._tool_manager._tools
+    assert "file_move" not in server._tool_manager._tools
+    assert "file_delete" not in server._tool_manager._tools
+    assert "directory_create" not in server._tool_manager._tools
 
 
 def test_process_tools_are_context_gated_and_tracked_only(hermes_home, tmp_path, monkeypatch):
@@ -3169,8 +3169,8 @@ def test_cron_tools_are_context_gated_script_only_and_no_model(hermes_home, tmp_
     monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
     monkeypatch.setattr(mcp_serve, "FastMCP", _FakeFastMCP)
     server = mcp_serve.create_profile_router_mcp_server()
-    assert "cron_list" in server._tool_manager._tools
-    assert "cron_create_script_only" in server._tool_manager._tools
+    assert "cron_list" not in server._tool_manager._tools
+    assert "cron_create_script_only" not in server._tool_manager._tools
 
 
 def test_messaging_tools_are_context_gated_allowlisted_dry_run_only(hermes_home, tmp_path, monkeypatch):
@@ -3267,8 +3267,8 @@ def test_messaging_tools_are_context_gated_allowlisted_dry_run_only(hermes_home,
     monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
     monkeypatch.setattr(mcp_serve, "FastMCP", _FakeFastMCP)
     server = mcp_serve.create_profile_router_mcp_server()
-    assert "message_send" in server._tool_manager._tools
-    assert "telegram_send" in server._tool_manager._tools
+    assert "message_send" not in server._tool_manager._tools
+    assert "telegram_send" not in server._tool_manager._tools
 
 
 def test_messaging_real_send_requires_delivery_policy_and_redacts_payload(hermes_home, tmp_path):
@@ -4736,7 +4736,7 @@ def test_phase8_openviking_read_validates_uri_and_returns_bounded_redacted_conte
     assert len(calls) == call_count
 
 
-def test_profile_router_mcp_factory_exposes_only_no_model_profile_tools(
+def test_profile_router_stdio_factory_exposes_only_read_only_default_tools(
     hermes_home,
     monkeypatch,
 ):
@@ -4775,40 +4775,41 @@ def test_profile_router_mcp_factory_exposes_only_no_model_profile_tools(
     }
 
     private_action_tools = {"file_patch", "patch_apply", "file_write", "workspace_status_probe", "workspace_scratch_smoke", "file_move", "file_delete", "directory_create", "terminal_run", "workspace_python_run", "process_start", "process_list", "process_poll", "process_log", "process_kill", "git_status", "git_diff", "git_log", "git_branch", "git_add", "git_commit", "git_push", "git_checkout", "git_restore", "git_rebase", "git_merge", "github_pr_status", "github_pr_create", "github_pr_update", "github_pr_ready", "github_pr_merge", "github_issue_view", "github_issue_comment", "cron_list", "cron_pause", "cron_resume", "cron_run", "cron_create_script_only", "message_send", "telegram_send", "workspace_production_action_list", "workspace_production_action_status", "workspace_production_action_run", "server_alias_list", "server_status_check", "server_service_logs", "server_docker_ps", "server_docker_logs", "server_port_check", "server_command_run", "server_shell_run", "workspace_web_fetch", "profile_skill_create", "profile_skill_patch", "profile_skill_edit", "profile_skill_write_file", "profile_skill_remove_file", "profile_skill_delete", "profile_memory_add", "profile_memory_replace", "profile_memory_remove", "profile_memory_list"}
-    assert set(tools) == expected_public_tools | private_action_tools
+    assert set(tools) == expected_public_tools
     assert expected_public_tools == metadata_public_tools
+    assert not (set(tools) & private_action_tools)
     assert not (set(tools) & FORBIDDEN_MODEL_LOOP_TOOL_NAMES)
     assert "messages_send" not in tools
     assert "conversations_list" not in tools
-    assert "message_send" in tools
-    assert "telegram_send" in tools
-    assert "terminal_run" in tools
+    assert "message_send" not in tools
+    assert "telegram_send" not in tools
+    assert "terminal_run" not in tools
     assert "workspace_diff" in tools
     assert "workspace_file_search" in tools
     assert "workspace_file_stat" in tools
     assert "file_read" not in tools
     assert "file_search" not in tools
-    assert "file_patch" in tools
-    assert "patch_apply" in tools
-    assert "file_write" in tools
-    assert "workspace_status_probe" in tools
-    assert "workspace_scratch_smoke" in tools
-    assert "file_move" in tools
-    assert "file_delete" in tools
-    assert "directory_create" in tools
+    assert "file_patch" not in tools
+    assert "patch_apply" not in tools
+    assert "file_write" not in tools
+    assert "workspace_status_probe" not in tools
+    assert "workspace_scratch_smoke" not in tools
+    assert "file_move" not in tools
+    assert "file_delete" not in tools
+    assert "directory_create" not in tools
     assert "workspace_file_stat" in tools
     assert "skills_list" in tools
     assert "skill_view" in tools
     assert "session_search" in tools
     assert "viking_search" in tools
     assert "viking_read" in tools
-    assert "git_status" in tools
-    assert "git_diff" in tools
-    assert "git_log" in tools
-    assert "git_branch" in tools
-    assert "cron_list" in tools
-    assert "cron_create_script_only" in tools
-    assert "cron_run" in tools
+    assert "git_status" not in tools
+    assert "git_diff" not in tools
+    assert "git_log" not in tools
+    assert "git_branch" not in tools
+    assert "cron_list" not in tools
+    assert "cron_create_script_only" not in tools
+    assert "cron_run" not in tools
 
     listed = json.loads(tools["profiles_list"].fn())
     assert listed["ok"] is True
