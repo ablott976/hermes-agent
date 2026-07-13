@@ -598,6 +598,13 @@ def worktree_add(cwd: str, options: dict) -> dict:
     args = ["worktree", "add", "-b", branch, target]
     if options.get("base"):
         base = str(options["base"])
+        if base == "origin/HEAD":
+            remote_default = _git_out(
+                root,
+                ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+            ).strip()
+            if remote_default:
+                base = remote_default
         # Remote-tracking branches may be stale or missing; fetch just that
         # branch so the local ref is up to date before branching. Ignore fetch
         # failures (offline / no remote) — git will use whatever local ref

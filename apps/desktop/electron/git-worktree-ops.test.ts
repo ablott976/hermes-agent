@@ -261,3 +261,41 @@ test('addWorktree: base param branches off a specified local branch', async () =
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('addWorktree: origin/HEAD resolves and fetches the concrete default branch', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-base-head-'))
+  const remote = path.join(root, 'remote.git')
+  const seed = path.join(root, 'seed')
+  const checkout = path.join(root, 'checkout')
+  const run = (cwd, ...args) => execFileSync('git', args, { cwd }).toString().trim()
+
+  try {
+    fs.mkdirSync(seed)
+    run(root, 'init', '--bare', remote)
+    await ensureGitRepo('git', seed)
+    run(seed, 'config', 'user.email', 't@example.com')
+    run(seed, 'config', 'user.name', 'Test')
+    run(seed, 'branch', '-M', 'main')
+    run(seed, 'remote', 'add', 'origin', remote)
+    run(seed, 'push', 'origin', 'main')
+    run(remote, 'symbolic-ref', 'HEAD', 'refs/heads/main')
+    run(root, 'clone', remote, checkout)
+
+    fs.writeFileSync(path.join(seed, 'latest.txt'), 'latest\n')
+    run(seed, 'add', 'latest.txt')
+    run(seed, 'commit', '-m', 'latest')
+    run(seed, 'push', 'origin', 'main')
+    const latest = run(seed, 'rev-parse', 'HEAD')
+
+    const result = await addWorktree(
+      checkout,
+      { base: 'origin/HEAD', branch: 'new-from-default', name: 'new-from-default' },
+      'git'
+    )
+
+    assert.equal(run(result.path, 'rev-parse', 'HEAD'), latest)
+    assert.equal(run(checkout, 'rev-parse', 'origin/main'), latest)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
