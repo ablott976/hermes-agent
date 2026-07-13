@@ -1203,6 +1203,7 @@ class CLICommandsMixin:
                 "all": False,
                 "prompt": None,
                 "schedule": None,
+                "session_mode": None,
                 "positionals": [],
             }
             i = 0
@@ -1242,6 +1243,13 @@ class CLICommandsMixin:
                 elif token == "--schedule" and i + 1 < len(tokens):
                     opts["schedule"] = tokens[i + 1]
                     i += 2
+                elif token == "--session-mode" and i + 1 < len(tokens):
+                    mode = tokens[i + 1].strip().lower()
+                    if mode not in {"fresh", "persistent"}:
+                        print("(._.) --session-mode must be fresh or persistent")
+                        return None
+                    opts["session_mode"] = mode
+                    i += 2
                 else:
                     opts["positionals"].append(token)
                     i += 1
@@ -1258,6 +1266,7 @@ class CLICommandsMixin:
             print("  Commands:")
             print("    /cron list")
             print('    /cron add "every 2h" "Check server status" [--skill blogwatcher]')
+            print('    /cron add "every 1m" "Continue the plan" --session-mode persistent')
             print('    /cron edit <job_id> --schedule "every 4h" --prompt "New task"')
             print("    /cron edit <job_id> --skill blogwatcher --skill maps")
             print("    /cron edit <job_id> --remove-skill blogwatcher")
@@ -1277,6 +1286,8 @@ class CLICommandsMixin:
                     print(f"    {job['job_id'][:12]:<12} | {job['schedule']:<15} | {repeat_str:<8}")
                     if job.get("skills"):
                         print(f"      Skills: {', '.join(job['skills'])}")
+                    if job.get("session_mode") == "persistent":
+                        print("      Conversation: continues across runs")
                     print(f"      {job.get('prompt_preview', '')}")
                     if job.get("next_run_at"):
                         print(f"      Next: {job['next_run_at']}")
@@ -1309,6 +1320,8 @@ class CLICommandsMixin:
                 print(f"  Next run: {job.get('next_run_at', 'N/A')}")
                 if job.get("skills"):
                     print(f"  Skills: {', '.join(job['skills'])}")
+                if job.get("session_mode") == "persistent":
+                    print("  Conversation: continues across runs")
                 print(f"  Prompt: {job.get('prompt_preview', '')}")
                 if job.get("last_run_at"):
                     print(f"  Last run: {job['last_run_at']} ({job.get('last_status', '?')})")
@@ -1334,6 +1347,7 @@ class CLICommandsMixin:
                 deliver=opts["deliver"],
                 repeat=opts["repeat"],
                 skills=skills or None,
+                session_mode=opts["session_mode"],
             )
             if result.get("success"):
                 print(f"(^_^)b Created job: {result['job_id']}")
@@ -1380,6 +1394,7 @@ class CLICommandsMixin:
                 deliver=opts["deliver"],
                 repeat=opts["repeat"],
                 skills=final_skills,
+                session_mode=opts["session_mode"],
             )
             if result.get("success"):
                 job = result["job"]

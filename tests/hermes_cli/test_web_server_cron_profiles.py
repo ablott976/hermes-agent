@@ -1,5 +1,7 @@
 """Regression tests for dashboard cron job profile routing."""
 
+import json
+
 import pytest
 from fastapi import HTTPException
 
@@ -79,6 +81,33 @@ async def test_list_cron_jobs_all_includes_default_and_named_profiles(isolated_p
     assert by_id[worker_job["id"]]["profile"] == "worker_alpha"
     assert by_id[worker_job["id"]]["is_default_profile"] is False
     assert by_id[worker_job["id"]]["hermes_home"] == str(isolated_profiles["worker_alpha"])
+
+
+@pytest.mark.asyncio
+async def test_dashboard_jobs_hide_persistent_scheduler_metadata(isolated_profiles):
+    from hermes_cli import web_server
+
+    job = web_server._call_cron_for_profile(
+        "worker_alpha",
+        "create_job",
+        prompt="continue work",
+        schedule="every 1m",
+        name="persistent-work",
+        session_mode="persistent",
+    )
+    web_server._call_cron_for_profile(
+        "worker_alpha",
+        "set_persistent_session_state",
+        job["id"],
+        "cron_root",
+        "fingerprint",
+    )
+
+    listed = await web_server.list_cron_jobs(profile="worker_alpha")
+
+    assert listed[0]["session_mode"] == "persistent"
+    assert "session_root_id" not in listed[0]
+    assert "session_runtime_fingerprint" not in listed[0]
 
 
 @pytest.mark.asyncio
@@ -172,6 +201,14 @@ async def test_update_cron_job_normalizes_dashboard_core_fields(isolated_profile
         prompt="managed by named profile",
         schedule="every 1h",
         name="normalizes-dashboard-fields",
+        session_mode="persistent",
+    )
+    web_server._call_cron_for_profile(
+        "worker_alpha",
+        "set_persistent_session_state",
+        job["id"],
+        "cron_root",
+        "fingerprint",
     )
 
     updated = await web_server.update_cron_job(
@@ -182,6 +219,7 @@ async def test_update_cron_job_normalizes_dashboard_core_fields(isolated_profile
                 "script": str(scripts_dir / "collect.py"),
                 "context_from": "",
                 "no_agent": True,
+                "session_mode": "fresh",
             }
         ),
         profile="worker_alpha",
@@ -191,6 +229,15 @@ async def test_update_cron_job_normalizes_dashboard_core_fields(isolated_profile
     assert updated["script"] == "collect.py"
     assert updated["context_from"] is None
     assert updated["no_agent"] is True
+    assert updated["session_mode"] == "fresh"
+    raw_jobs = json.loads(
+        (isolated_profiles["worker_alpha"] / "cron" / "jobs.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    stored = next(item for item in raw_jobs["jobs"] if item["id"] == job["id"])
+    assert "session_root_id" not in stored
+    assert "session_runtime_fingerprint" not in stored
 
 
 @pytest.mark.asyncio
