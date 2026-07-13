@@ -1,3 +1,4 @@
+import inspect
 import queue
 from unittest.mock import patch
 
@@ -71,6 +72,37 @@ def test_moa_non_preset_is_one_shot_prompt():
     assert cli.provider == "moa"
     assert cli.model == "default"
     assert cli._pending_moa_restore_model["provider"] != "moa"
+
+
+def test_moa_one_shot_restores_route_and_cleanup_runs_from_finally():
+    cli = _make_cli()
+    original_route = {
+        "requested_provider": cli.requested_provider,
+        "provider": cli.provider,
+        "model": cli.model,
+        "api_key": cli.api_key,
+        "base_url": cli.base_url,
+        "api_mode": cli.api_mode,
+    }
+    with patch("cli._cprint"):
+        cli.process_command("/moa inspect the failure")
+
+    cli.agent = object()
+    cli._restore_model_after_moa_turn()
+
+    for key, value in original_route.items():
+        assert getattr(cli, key) == value
+    assert cli.agent is None
+    assert cli._pending_moa_restore_model is None
+    assert cli._pending_moa_disable_after_turn is False
+
+    chat_source = inspect.getsource(HermesCLI.chat)
+    run_index = chat_source.index("result = self.agent.run_conversation(")
+    except_index = chat_source.index("except Exception as exc:", run_index)
+    finally_index = chat_source.index("finally:", except_index)
+    restore_index = chat_source.index("self._restore_model_after_moa_turn()", finally_index)
+    flush_index = chat_source.index("self._flush_credit_notices()", restore_index)
+    assert run_index < except_index < finally_index < restore_index < flush_index
 
 
 def test_decode_legacy_encoded_moa_turn_still_works():
