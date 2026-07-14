@@ -997,6 +997,7 @@ async def test_run_agent_heartbeat_stops_after_real_agent_replacement(
             if (
                 current_agent is not None
                 and current_agent is not gateway_run._AGENT_PENDING_SENTINEL
+                and adapter.sent
             ):
                 break
             await asyncio.sleep(0.01)
