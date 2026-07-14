@@ -2958,7 +2958,7 @@ def _base_url_contract(value) -> str:
         return "[invalid-url]"
 
 
-def _persistent_skill_contract(job: dict) -> list[dict[str, str]]:
+def _persistent_skill_contract(job: dict) -> list[dict[str, Any]]:
     """Fingerprint configured skill identities without hashing their bodies.
 
     The first tick already persists the loaded skill text in the durable
@@ -2972,7 +2972,7 @@ def _persistent_skill_contract(job: dict) -> list[dict[str, str]]:
     elif isinstance(skills, str):
         skills = [skills]
 
-    contract: list[dict[str, str]] = []
+    contract: list[dict[str, Any]] = []
     if not skills:
         return contract
 
@@ -2986,6 +2986,7 @@ def _persistent_skill_contract(job: dict) -> list[dict[str, str]]:
             continue
         identity = name
         state = "missing"
+        bundle_members: dict[str, list[str]] = {}
         try:
             bundle_key = resolve_bundle_command_key(name.lstrip("/"))
             if bundle_key:
@@ -2997,6 +2998,11 @@ def _persistent_skill_contract(job: dict) -> list[dict[str, str]]:
                 )
                 if bundle_payload:
                     state = "bundle"
+                    _, loaded_names, missing_names = bundle_payload
+                    bundle_members = {
+                        "loaded": [str(member) for member in loaded_names],
+                        "missing": [str(member) for member in missing_names],
+                    }
             else:
                 identity = normalize_skill_lookup_name(name)
                 loaded = json.loads(skill_view(identity))
@@ -3010,7 +3016,7 @@ def _persistent_skill_contract(job: dict) -> list[dict[str, str]]:
                 exc_info=True,
             )
             state = "error"
-        contract.append({"name": identity, "state": state})
+        contract.append({"name": identity, "state": state, **bundle_members})
     return contract
 
 
