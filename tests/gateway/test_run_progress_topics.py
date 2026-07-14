@@ -642,6 +642,22 @@ class SlowInitializingHeartbeatAgent:
         }
 
 
+class LongRunningHeartbeatAgent:
+    """Agent that leaves time to replace its live session slot."""
+
+    def __init__(self, **kwargs):
+        time.sleep(0.05)
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        time.sleep(0.4)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class PreviewedResponseAgent:
     def __init__(self, **kwargs):
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
@@ -762,6 +778,8 @@ async def _run_with_agent(
     chat_type="group",
     thread_id="17585",
     adapter_cls=ProgressCaptureAdapter,
+    run_generation=None,
+    during_run=None,
 ):
     if config_data:
         import yaml
@@ -800,14 +818,24 @@ async def _run_with_agent(
             message_id="queued-1",
         )
 
-    result = await runner._run_agent(
-        message="hello",
-        context_prompt="",
-        history=[],
-        source=source,
-        session_id=session_id,
-        session_key=session_key,
+    if run_generation is not None:
+        runner._session_run_generation[session_key] = run_generation
+        runner._running_agents[session_key] = gateway_run._AGENT_PENDING_SENTINEL
+
+    run_task = asyncio.create_task(
+        runner._run_agent(
+            message="hello",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id=session_id,
+            session_key=session_key,
+            run_generation=run_generation,
+        )
     )
+    if during_run is not None:
+        await during_run(runner, adapter, session_key, run_task)
+    result = await run_task
     return adapter, result
 
 
@@ -888,6 +916,120 @@ async def test_run_agent_heartbeat_survives_slow_agent_initialization(monkeypatc
     assert result["final_response"] == "done"
     assert len(heartbeat_sends) == 1
     assert heartbeat_edits
+    completed_counts = (len(adapter.sent), len(adapter.edits))
+    await asyncio.sleep(0.12)
+    assert (len(adapter.sent), len(adapter.edits)) == completed_counts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["/new", "/stop"])
+async def test_run_agent_heartbeat_stops_after_generation_boundary(
+    monkeypatch, tmp_path, boundary
+):
+    gateway_run = importlib.import_module("gateway.run")
+    original_float_env = gateway_run._float_env
+    monkeypatch.setattr(
+        gateway_run,
+        "_float_env",
+        lambda name, default: (
+            0.05
+            if name == "HERMES_AGENT_NOTIFY_INTERVAL"
+            else original_float_env(name, default)
+        ),
+    )
+
+    async def invalidate_generation(runner, adapter, session_key, run_task):
+        for _ in range(20):
+            if adapter.sent:
+                break
+            await asyncio.sleep(0.01)
+        assert adapter.sent
+        runner._invalidate_session_run_generation(session_key, reason=boundary)
+        invalidated_counts = (len(adapter.sent), len(adapter.edits))
+        await asyncio.sleep(0.12)
+        assert (len(adapter.sent), len(adapter.edits)) == invalidated_counts
+        assert not run_task.done()
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        SlowInitializingHeartbeatAgent,
+        session_id=f"sess-heartbeat-{boundary[1:]}",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "interim_assistant_messages": False,
+                "long_running_notifications": True,
+            }
+        },
+        chat_type="dm",
+        chat_id="5049627574",
+        thread_id="",
+        run_generation=1,
+        during_run=invalidate_generation,
+    )
+
+    assert result["final_response"] == "done"
+    assert len(adapter.sent) == 1
+    assert adapter.edits == []
+
+
+@pytest.mark.asyncio
+async def test_run_agent_heartbeat_stops_after_real_agent_replacement(
+    monkeypatch, tmp_path
+):
+    gateway_run = importlib.import_module("gateway.run")
+    original_float_env = gateway_run._float_env
+    monkeypatch.setattr(
+        gateway_run,
+        "_float_env",
+        lambda name, default: (
+            0.05
+            if name == "HERMES_AGENT_NOTIFY_INTERVAL"
+            else original_float_env(name, default)
+        ),
+    )
+
+    async def replace_agent(runner, adapter, session_key, run_task):
+        current_agent = None
+        for _ in range(100):
+            current_agent = runner._running_agents.get(session_key)
+            if (
+                current_agent is not None
+                and current_agent is not gateway_run._AGENT_PENDING_SENTINEL
+            ):
+                break
+            await asyncio.sleep(0.01)
+        assert current_agent is not None
+        assert current_agent is not gateway_run._AGENT_PENDING_SENTINEL
+        assert adapter.sent
+        runner._running_agents[session_key] = object()
+        replaced_counts = (len(adapter.sent), len(adapter.edits))
+        await asyncio.sleep(0.12)
+        assert (len(adapter.sent), len(adapter.edits)) == replaced_counts
+        assert not run_task.done()
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        LongRunningHeartbeatAgent,
+        session_id="sess-heartbeat-agent-replacement",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "interim_assistant_messages": False,
+                "long_running_notifications": True,
+            }
+        },
+        chat_type="dm",
+        chat_id="5049627574",
+        thread_id="",
+        run_generation=1,
+        during_run=replace_agent,
+    )
+
+    assert result["final_response"] == "done"
+    assert len(adapter.sent) == 1
 
 
 @pytest.mark.asyncio
