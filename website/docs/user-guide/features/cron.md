@@ -97,6 +97,10 @@ cronjob(
 
 A persistent job loads its full prompt and skills on the first run. Later runs add a compact continuation turn plus any new script or upstream-job data, which keeps the stable conversation prefix available for provider prompt caching. Each saved run includes input, cache-read and output token counts, model/tool call counts, and elapsed time.
 
+Loaded skill text is part of that durable conversation snapshot. Editing the skill file while the job is running does not restart the conversation or inject the new body mid-lineage; changing the configured skill identity/list still starts a compatible new root. To deliberately reload an edited skill body, switch the job to `fresh` and then back to `persistent` before resuming.
+
+A finite, project-scoped persistent job also protects itself from completion loops. When `workdir` is set and the job returns the cron silence marker on two consecutive successful ticks **without calling any tools**, Hermes records both runs and pauses the job automatically. A silent tick that used tools does not count, so a job that checked real state is not stopped merely because there was nothing to report. Persistent jobs without `workdir` are not auto-paused by this guard. Explicit resume or trigger clears the silence counter.
+
 Pause preserves the conversation. Switching back to `fresh` starts independent runs and clears the job's continuation pointer. Removing the job stops future continuation; session history remains available through normal session history tools.
 
 :::warning

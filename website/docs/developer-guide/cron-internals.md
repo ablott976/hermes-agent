@@ -79,7 +79,7 @@ Jobs are stored in `~/.hermes/cron/jobs.json` with atomic write semantics (write
 
 Older jobs may have a single `skill` field instead of the `skills` array. The scheduler normalizes this at load time — single `skill` is promoted to `skills: [skill]`.
 
-`session_mode` is also optional on disk. A missing or invalid value normalizes to `fresh`, preserving historical behavior and the compact legacy record shape. `session_root_id` and `session_runtime_fingerprint` are scheduler-owned and cannot be changed through public update surfaces.
+`session_mode` is also optional on disk. A missing or invalid value normalizes to `fresh`, preserving historical behavior and the compact legacy record shape. `session_root_id`, `session_runtime_fingerprint`, and `persistent_silent_ticks` are scheduler-owned and cannot be changed through public update surfaces.
 
 ## Scheduler Runtime
 
@@ -193,10 +193,11 @@ agent↔Nous wire contract lives in `docs/chronos-managed-cron-contract.md`.
 2. Later ticks resolve the root through `SessionDB.resolve_resume_session_id()`, so compression children become the active tip without rewriting the stable job root.
 3. Replay uses the shared interrupted/dangling-tool cleanup. An unanswered user tail from a crashed cron turn is removed before retry.
 4. The persisted system prompt and sanitized history are restored; the new turn contains only a compact continuation instruction plus new script/upstream data.
-5. The fingerprint covers prompt/skills/script references, model/provider/API mode, effective tool names, and workdir. A mismatch forks a new root and performs a full bootstrap instead of mixing incompatible prefixes.
+5. The fingerprint covers the prompt, configured skill identities and availability, script/context references, model/provider/API mode, effective tool schemas, system/context contract, and workdir. The loaded skill body stays frozen in the durable conversation, so curator edits do not fork or rewrite a live lineage; changing a configured skill identity/list or any other contract axis still forks a new root and performs a full bootstrap.
 6. The active tip is ended with `cron_waiting` between ticks and reopened for the next run. Pause preserves the pointer; switching to fresh clears it; removal prevents future continuation without deleting session history.
+7. `run_one_job()` passes per-turn tool-call metadata into the atomic run marker. For workspace-scoped persistent jobs (`workdir` set), two consecutive successful silence-marker responses with zero tool calls increment `persistent_silent_ticks`, record both runs, and pause the finite job. Persistent jobs without `workdir`, fresh jobs, and `no_agent` jobs ignore this guard. Useful output, a tool-using silent tick, failure, interruption, a new root, explicit resume/trigger, or a mode change clears the counter. Interrupted ticks clear it through a separate locked mutation without being counted as completed.
 
-Persistent mode is rejected for `no_agent=True`. Per-tick output records input/cache-read/output tokens, model/tool calls, and elapsed time. This exposes whether provider prefix caching is actually being used without assuming a provider-specific cache implementation.
+Persistent mode is rejected for `no_agent=True`. The silence counter is internal and immutable through public surfaces. Per-tick output records input/cache-read/output tokens, model/tool calls, and elapsed time. This exposes whether provider prefix caching is actually being used without assuming a provider-specific cache implementation.
 
 ## Skill-Backed Jobs
 

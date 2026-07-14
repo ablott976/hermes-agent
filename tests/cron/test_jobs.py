@@ -16,6 +16,7 @@ from cron.jobs import (
     update_job,
     pause_job,
     resume_job,
+    trigger_job,
     remove_job,
     mark_job_run,
     advance_next_run,
@@ -25,6 +26,7 @@ from cron.jobs import (
     save_job_output,
     set_persistent_session_state,
     public_job_view,
+    reset_persistent_silence_state,
 )
 
 
@@ -306,7 +308,9 @@ class TestJobCRUD:
 
         public = public_job_view(internal)
 
+        assert public is not None
         assert public["session_mode"] == "persistent"
+        assert "persistent_silent_ticks" not in public
         assert "session_root_id" not in public
         assert "session_runtime_fingerprint" not in public
         assert get_job(job["id"])["session_root_id"] == "cron_root"
@@ -498,14 +502,20 @@ class TestUpdateJob:
             prompt="Continue",
             schedule="every 1m",
             session_mode="persistent",
+            workdir=str(tmp_cron_dir),
         )
         set_persistent_session_state(job["id"], "cron_root", "abc123")
+        mark_job_run(job["id"], success=True, persistent_no_progress=True)
+        silent = get_job(job["id"])
+        assert silent is not None
+        assert silent["persistent_silent_ticks"] == 1
 
         updated = update_job(job["id"], {"session_mode": "fresh"})
 
         assert updated["session_mode"] == "fresh"
         stored = load_jobs()[0]
         assert "session_mode" not in stored
+        assert "persistent_silent_ticks" not in stored
         assert "session_root_id" not in stored
         assert "session_runtime_fingerprint" not in stored
 
@@ -548,6 +558,24 @@ class TestPauseResumeJob:
         assert resumed["state"] == "scheduled"
         assert resumed["paused_at"] is None
         assert resumed["paused_reason"] is None
+
+    def test_trigger_resets_persistent_silence_counter(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Continue finite work",
+            schedule="every 1m",
+            session_mode="persistent",
+            workdir=str(tmp_cron_dir),
+        )
+        mark_job_run(job["id"], success=True, persistent_no_progress=True)
+        before_trigger = get_job(job["id"])
+        assert before_trigger is not None
+        assert before_trigger["persistent_silent_ticks"] == 1
+
+        triggered = trigger_job(job["id"])
+
+        assert triggered is not None
+        assert triggered["enabled"] is True
+        assert "persistent_silent_ticks" not in triggered
 
     def test_resume_rejects_past_oneshot(self, tmp_cron_dir, monkeypatch):
         """Resuming a paused one-shot whose time is now in the past must raise
@@ -667,6 +695,139 @@ class TestResolveJobRef:
 
 
 class TestMarkJobRun:
+    def test_persistent_no_progress_autopauses_after_two_runs(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Continue finite work",
+            schedule="every 1m",
+            session_mode="persistent",
+            workdir=str(tmp_cron_dir),
+        )
+        set_persistent_session_state(job["id"], "root", "fingerprint-v3")
+
+        mark_job_run(job["id"], success=True, persistent_no_progress=True)
+        first = get_job(job["id"])
+        assert first is not None
+        assert first["enabled"] is True
+        assert first["state"] == "scheduled"
+        assert first["persistent_silent_ticks"] == 1
+        assert first["repeat"]["completed"] == 1
+
+        mark_job_run(job["id"], success=True, persistent_no_progress=True)
+        paused = get_job(job["id"])
+        assert paused is not None
+        assert paused["enabled"] is False
+        assert paused["state"] == "paused"
+        assert paused["next_run_at"] is None
+        assert paused["persistent_silent_ticks"] == 2
+        assert paused["repeat"]["completed"] == 2
+        assert paused["last_status"] == "ok"
+        assert "no reported progress" in paused["paused_reason"]
+        public = public_job_view(paused)
+        assert public is not None
+        assert "persistent_silent_ticks" not in public
+        with pytest.raises(ValueError, match="persistent_silent_ticks"):
+            update_job(job["id"], {"persistent_silent_ticks": 0})
+
+        resumed = resume_job(job["id"])
+        assert resumed is not None
+        assert resumed["enabled"] is True
+        assert "persistent_silent_ticks" not in resumed
+        assert resumed["session_root_id"] == "root"
+
+    def test_useful_or_failed_tick_resets_persistent_no_progress(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Continue finite work",
+            schedule="every 1m",
+            session_mode="persistent",
+            workdir=str(tmp_cron_dir),
+        )
+
+        mark_job_run(job["id"], success=True, persistent_no_progress=True)
+        first_silent = get_job(job["id"])
+        assert first_silent is not None
+        assert first_silent["persistent_silent_ticks"] == 1
+
+        mark_job_run(job["id"], success=True, persistent_no_progress=False)
+        useful = get_job(job["id"])
+        assert useful is not None
+        assert "persistent_silent_ticks" not in useful
+
+        mark_job_run(job["id"], success=True, persistent_no_progress=True)
+        mark_job_run(job["id"], success=False, error="provider failed")
+        failed = get_job(job["id"])
+        assert failed is not None
+        assert failed["enabled"] is True
+        assert "persistent_silent_ticks" not in failed
+
+    def test_interruption_reset_does_not_mark_another_completed_run(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Continue finite work",
+            schedule="every 1m",
+            session_mode="persistent",
+            workdir=str(tmp_cron_dir),
+        )
+        mark_job_run(job["id"], success=True, persistent_no_progress=True)
+        before = get_job(job["id"])
+        assert before is not None
+
+        assert reset_persistent_silence_state(job["id"]) is True
+
+        after = get_job(job["id"])
+        assert after is not None
+        assert "persistent_silent_ticks" not in after
+        assert after["repeat"]["completed"] == before["repeat"]["completed"]
+        assert after["last_run_at"] == before["last_run_at"]
+        assert after["last_status"] == before["last_status"]
+        assert reset_persistent_silence_state(job["id"]) is False
+
+    def test_new_persistent_root_resets_no_progress_counter(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Continue finite work",
+            schedule="every 1m",
+            session_mode="persistent",
+            workdir=str(tmp_cron_dir),
+        )
+        set_persistent_session_state(job["id"], "root-1", "fingerprint-1")
+        mark_job_run(job["id"], success=True, persistent_no_progress=True)
+
+        replaced = set_persistent_session_state(
+            job["id"],
+            "root-2",
+            "fingerprint-2",
+        )
+
+        assert replaced is not None
+        assert replaced["session_root_id"] == "root-2"
+        assert "persistent_silent_ticks" not in replaced
+
+    def test_unscoped_persistent_monitor_never_autopauses(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Monitor indefinitely",
+            schedule="every 1m",
+            session_mode="persistent",
+        )
+
+        mark_job_run(job["id"], success=True, persistent_no_progress=True)
+        mark_job_run(job["id"], success=True, persistent_no_progress=True)
+
+        stored = get_job(job["id"])
+        assert stored is not None
+        assert stored["enabled"] is True
+        assert stored["state"] == "scheduled"
+        assert "persistent_silent_ticks" not in stored
+
+    def test_fresh_job_never_autopauses_from_persistent_signal(self, tmp_cron_dir):
+        job = create_job(prompt="Monitor", schedule="every 1m")
+
+        mark_job_run(job["id"], success=True, persistent_no_progress=True)
+        mark_job_run(job["id"], success=True, persistent_no_progress=True)
+
+        stored = get_job(job["id"])
+        assert stored is not None
+        assert stored["enabled"] is True
+        assert stored["state"] == "scheduled"
+        assert "persistent_silent_ticks" not in stored
+
     def test_increments_completed(self, tmp_cron_dir):
         job = create_job(prompt="Test", schedule="every 1h")
         mark_job_run(job["id"], success=True)

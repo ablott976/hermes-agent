@@ -320,13 +320,17 @@ def _jobs_lock():
 # caller to rewrite them could make one job resume another job's conversation.
 _IMMUTABLE_JOB_FIELDS = frozenset({
     "id",
+    "persistent_silent_ticks",
     "session_root_id",
     "session_runtime_fingerprint",
 })
 _INTERNAL_JOB_FIELDS = frozenset({
+    "persistent_silent_ticks",
     "session_root_id",
     "session_runtime_fingerprint",
 })
+
+_PERSISTENT_SILENT_PAUSE_THRESHOLD = 2
 
 
 def public_job_view(job: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -467,6 +471,7 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
         # hand-edited/legacy persistent value as fresh and discard unusable
         # continuation metadata in the normalized public/runtime view.
         session_mode = SESSION_MODE_FRESH
+        normalized.pop("persistent_silent_ticks", None)
         normalized.pop("session_root_id", None)
         normalized.pop("session_runtime_fingerprint", None)
     normalized["session_mode"] = session_mode
@@ -1436,10 +1441,19 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 # Fresh is the historical default. Remove persistent continuation
                 # state so switching back later cannot revive a stale conversation.
                 updated.pop("session_mode", None)
+                updated.pop("persistent_silent_ticks", None)
                 updated.pop("session_root_id", None)
                 updated.pop("session_runtime_fingerprint", None)
             else:
                 updated["session_mode"] = SESSION_MODE_PERSISTENT
+                # Explicit activation covers resume_job(), trigger_job(), and
+                # switching into persistent mode. A manual restart must get a
+                # fresh no-progress budget even when the durable root remains.
+                if (
+                    "session_mode" in updates
+                    or ("enabled" in updates and bool(updates.get("enabled")))
+                ):
+                    updated.pop("persistent_silent_ticks", None)
 
             if schedule_changed:
                 updated_schedule = updated["schedule"]
@@ -1528,12 +1542,35 @@ def set_persistent_session_state(
             if normalize_session_mode(job.get("session_mode"), strict=False) != SESSION_MODE_PERSISTENT:
                 raise ValueError("persistent session state can only be set on a persistent job")
             updated = dict(job)
+            if updated.get("session_root_id") != root:
+                updated.pop("persistent_silent_ticks", None)
             updated["session_root_id"] = root
             updated["session_runtime_fingerprint"] = fingerprint
             jobs[i] = updated
             save_jobs(jobs)
             return _normalize_job_record(updated)
     return None
+
+
+def reset_persistent_silence_state(job_id: str) -> bool:
+    """Clear scheduler-owned no-progress state without marking a run complete.
+
+    Gateway shutdowns deliberately skip normal run accounting because the
+    interrupted tick has an unknown outcome. They must still break a sequence
+    of consecutive silent ticks so a later silence cannot trigger a false
+    autopause.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            if "persistent_silent_ticks" not in job:
+                return False
+            job.pop("persistent_silent_ticks", None)
+            save_jobs(jobs)
+            return True
+    return False
 
 
 def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -1617,16 +1654,28 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
-def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+def mark_job_run(
+    job_id: str,
+    success: bool,
+    error: Optional[str] = None,
+    delivery_error: Optional[str] = None,
+    *,
+    persistent_no_progress: bool = False,
+):
     """
     Mark a job as having been run.
-    
+
     Updates last_run_at, last_status, increments completed count,
     computes next_run_at, and auto-deletes if repeat limit reached.
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
+
+    ``persistent_no_progress`` is scheduler-owned and means a successful,
+    workspace-scoped persistent agent tick returned the cron silence marker
+    without calling a tool. Two consecutive occurrences pause that finite job
+    atomically with the normal run accounting. Fresh, unscoped, and no-agent
+    jobs ignore the flag.
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -1646,6 +1695,26 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 # is claimable again. No-op if the job never carried a claim.
                 if job.get("run_claim") is not None:
                     job["run_claim"] = None
+
+                workspace_scoped_persistent = (
+                    normalize_session_mode(job.get("session_mode"), strict=False)
+                    == SESSION_MODE_PERSISTENT
+                    and not bool(job.get("no_agent"))
+                    and bool(str(job.get("workdir") or "").strip())
+                )
+                if workspace_scoped_persistent and success and persistent_no_progress:
+                    try:
+                        prior_silent_ticks = max(
+                            0,
+                            int(job.get("persistent_silent_ticks") or 0),
+                        )
+                    except (TypeError, ValueError):
+                        prior_silent_ticks = 0
+                    silent_ticks = prior_silent_ticks + 1
+                    job["persistent_silent_ticks"] = silent_ticks
+                else:
+                    silent_ticks = 0
+                    job.pop("persistent_silent_ticks", None)
                 
                 # Increment completed count.  Finite one-shot jobs are
                 # pre-claimed by claim_dispatch() BEFORE the side effect runs
@@ -1673,6 +1742,24 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         jobs.pop(i)
                         save_jobs(jobs)
                         return
+
+                if silent_ticks >= _PERSISTENT_SILENT_PAUSE_THRESHOLD:
+                    job["enabled"] = False
+                    job["state"] = "paused"
+                    job["paused_at"] = now
+                    job["paused_reason"] = (
+                        "Paused automatically after two consecutive runs with no reported progress."
+                    )
+                    job["next_run_at"] = None
+                    save_jobs(jobs)
+                    logger.info(
+                        "Job '%s' (%s) auto-paused after %d consecutive "
+                        "persistent silence ticks without tool calls",
+                        job.get("name", job_id),
+                        job_id,
+                        silent_ticks,
+                    )
+                    return
                 
                 # Compute next run
                 job["next_run_at"] = compute_next_run(job["schedule"], now)

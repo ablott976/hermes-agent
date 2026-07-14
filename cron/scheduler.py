@@ -250,6 +250,7 @@ from cron.jobs import (
     heartbeat_run_claim,
     mark_job_run,
     normalize_session_mode,
+    reset_persistent_silence_state,
     save_job_output,
     set_persistent_session_state,
 )
@@ -2958,7 +2959,13 @@ def _base_url_contract(value) -> str:
 
 
 def _persistent_skill_contract(job: dict) -> list[dict[str, str]]:
-    """Fingerprint configured skill/bundle content without injecting it again."""
+    """Fingerprint configured skill identities without hashing their bodies.
+
+    The first tick already persists the loaded skill text in the durable
+    conversation. Later on-disk edits (including curator maintenance) must not
+    invalidate that immutable history and force a full bootstrap. Identity/list
+    or availability changes still fork safely.
+    """
     skills = job.get("skills")
     if skills is None:
         skills = [job.get("skill")] if job.get("skill") else []
@@ -2977,23 +2984,23 @@ def _persistent_skill_contract(job: dict) -> list[dict[str, str]]:
         name = str(raw_name or "").strip()
         if not name:
             continue
-        material = ""
+        identity = name
         state = "missing"
         try:
             bundle_key = resolve_bundle_command_key(name.lstrip("/"))
             if bundle_key:
+                identity = f"bundle:{bundle_key}"
                 bundle_payload = build_bundle_invocation_message(
                     bundle_key,
                     user_instruction="",
                     task_id=str(job.get("id") or "") or None,
                 )
                 if bundle_payload:
-                    material = str(bundle_payload[0] or "")
                     state = "bundle"
             else:
-                loaded = json.loads(skill_view(normalize_skill_lookup_name(name)))
+                identity = normalize_skill_lookup_name(name)
+                loaded = json.loads(skill_view(identity))
                 if loaded.get("success"):
-                    material = str(loaded.get("content") or "")
                     state = "skill"
         except Exception:
             logger.warning(
@@ -3003,13 +3010,7 @@ def _persistent_skill_contract(job: dict) -> list[dict[str, str]]:
                 exc_info=True,
             )
             state = "error"
-        contract.append(
-            {
-                "name": name,
-                "state": state,
-                "digest": _canonical_digest(material),
-            }
-        )
+        contract.append({"name": identity, "state": state})
     return contract
 
 
@@ -3018,8 +3019,10 @@ def _persistent_runtime_fingerprint(job: dict, agent, workdir: Optional[str]) ->
 
     Runtime script/upstream output is intentionally excluded: it is new turn
     data, not part of the cached conversation contract. Stable/context system
-    prompt layers, configured skill bodies, and full tool schemas are represented
-    only by digests so changes fork the lineage without exposing their content.
+    prompt layers and full tool schemas are represented only by digests so
+    changes fork the lineage without exposing their content. Configured skills
+    use stable identities because their loaded bodies are already frozen in the
+    durable history; editing a skill on disk does not rewrite that history.
     The volatile system-prompt layer (date/session metadata) is omitted because
     it is intentionally frozen for the lifetime of an existing conversation.
     """
@@ -3046,7 +3049,7 @@ def _persistent_runtime_fingerprint(job: dict, agent, workdir: Optional[str]) ->
             system_parts = {"state": "error"}
 
     payload = {
-        "version": 2,
+        "version": 3,
         "prompt": str(job.get("prompt") or ""),
         "skills": _persistent_skill_contract(job),
         "script": str(job.get("script") or ""),
@@ -3203,6 +3206,7 @@ def run_job(
     adapters=None,
     loop=None,
     defer_agent_teardown: Optional[list] = None,
+    run_metadata: Optional[dict] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -3215,7 +3219,9 @@ def run_job(
     This closes the ordering window in #58720 where delivery ran against a
     torn-down async client (defense-in-depth alongside the interpreter-shutdown
     guard). When ``None`` (the default) teardown happens inline as before, so
-    every existing caller is unchanged.
+    every existing caller is unchanged. ``run_metadata`` is an optional
+    caller-owned dict used only for scheduler control signals that do not
+    belong in the public return tuple.
 
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
@@ -3371,6 +3377,9 @@ def run_job(
 
     _session_mode = normalize_session_mode(job.get("session_mode"), strict=False)
     _persistent_job = _session_mode == SESSION_MODE_PERSISTENT
+    if run_metadata is not None:
+        run_metadata.clear()
+        run_metadata.update({"persistent": _persistent_job, "agent_ran": False})
     _persistent_root = str(job.get("session_root_id") or "").strip()
     _stored_runtime_fingerprint = str(
         job.get("session_runtime_fingerprint") or ""
@@ -4199,6 +4208,8 @@ def run_job(
                 tool_calls,
                 elapsed_seconds,
             )
+            if run_metadata is not None:
+                run_metadata.update({"agent_ran": True, "tool_calls": tool_calls})
 
         output = f"""# Cron Job: {job_name}
 
@@ -4394,8 +4405,11 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # below once delivery is done. Defense-in-depth alongside the
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
+        _run_metadata: dict[str, Any] = {}
         try:
             _run_job_kwargs: dict[str, Any] = {"defer_agent_teardown": _deferred_agents}
+            if normalize_session_mode(job.get("session_mode"), strict=False) == SESSION_MODE_PERSISTENT:
+                _run_job_kwargs["run_metadata"] = _run_metadata
             if adapters is not None or loop is not None:
                 _run_job_kwargs.update({"adapters": adapters, "loop": loop})
             success, output, final_response, error = run_job(job, **_run_job_kwargs)
@@ -4451,7 +4465,12 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             # a real report that merely quoted "[SILENT]" mid-sentence (#51438,
             # #46917).  Keeps the intentional bracketed-prefix / trailing-line
             # tolerance the cron contract relies on.
-            if should_deliver and success and _is_cron_silence_response(deliver_content):
+            is_silence_response = bool(
+                should_deliver
+                and success
+                and _is_cron_silence_response(deliver_content)
+            )
+            if is_silence_response:
                 logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                 should_deliver = False
 
@@ -4475,14 +4494,29 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-        if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        if _consume_interrupted_flag(job["id"]):
+            reset_persistent_silence_state(job["id"])
+        else:
+            _mark_kwargs: dict[str, Any] = {"delivery_error": delivery_error}
+            if normalize_session_mode(job.get("session_mode"), strict=False) == SESSION_MODE_PERSISTENT:
+                _mark_kwargs["persistent_no_progress"] = bool(
+                    success
+                    and is_silence_response
+                    and _run_metadata.get("agent_ran") is True
+                    and int(_run_metadata.get("tool_calls") or 0) == 0
+                )
+            mark_job_run(job["id"], success, error, **_mark_kwargs)
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
-        if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], False, str(e))
+        if _consume_interrupted_flag(job["id"]):
+            reset_persistent_silence_state(job["id"])
+        else:
+            _mark_kwargs = {}
+            if normalize_session_mode(job.get("session_mode"), strict=False) == SESSION_MODE_PERSISTENT:
+                _mark_kwargs["persistent_no_progress"] = False
+            mark_job_run(job["id"], False, str(e), **_mark_kwargs)
         return False
 
 
