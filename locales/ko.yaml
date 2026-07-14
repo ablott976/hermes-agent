@@ -27,6 +27,12 @@ gateway:
   config_read_failed: "⚠️ config.yaml을 읽을 수 없습니다: {error}"
   config_save_failed: "⚠️ 설정을 저장할 수 없습니다: {error}"
 
+  progress:
+    active:          "⏳ 계속 작업 중입니다. 작업을 이어가고 있습니다. 총 소요 시간: {minutes}분."
+    checking:        "⏳ 계속 작업 중입니다. 다음 확인을 실행하고 있습니다. 총 소요 시간: {minutes}분."
+    check_completed: "⏳ 계속 작업 중입니다. 확인 하나를 완료하고 다음 단계로 진행하고 있습니다. 총 소요 시간: {minutes}분."
+    waiting_model:   "⏳ 계속 작업 중입니다. 모델의 응답을 기다리고 있습니다. 총 소요 시간: {minutes}분."
+
   model:
     error_prefix:           "오류: {error}"
     switched:               "모델이 `{model}`(으)로 전환되었습니다"

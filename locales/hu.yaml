@@ -27,6 +27,12 @@ gateway:
   config_read_failed: "⚠️ Nem sikerült olvasni a config.yaml fájlt: {error}"
   config_save_failed: "⚠️ Nem sikerült menteni a konfigurációt: {error}"
 
+  progress:
+    active:          "⏳ Tovább dolgozom a feladaton. Teljes idő: {minutes} perc."
+    checking:        "⏳ Tovább dolgozom, és elvégzem a következő ellenőrzést. Teljes idő: {minutes} perc."
+    check_completed: "⏳ Tovább dolgozom. Befejeztem egy ellenőrzést, és folytatom a következő lépéssel. Teljes idő: {minutes} perc."
+    waiting_model:   "⏳ Tovább dolgozom, és várom a modell válaszát. Teljes idő: {minutes} perc."
+
   model:
     error_prefix:           "Hiba: {error}"
     switched:               "Modell átváltva: `{model}`"

@@ -27,6 +27,12 @@ gateway:
   config_read_failed: "⚠️ config.yaml を読み込めませんでした: {error}"
   config_save_failed: "⚠️ 設定を保存できませんでした: {error}"
 
+  progress:
+    active:          "⏳ 作業を続けています。タスクを進めています。合計時間: {minutes} 分。"
+    checking:        "⏳ 作業を続けています。次の確認を実行しています。合計時間: {minutes} 分。"
+    check_completed: "⏳ 作業を続けています。確認を1つ完了し、次の手順に進んでいます。合計時間: {minutes} 分。"
+    waiting_model:   "⏳ 作業を続けています。モデルの応答を待っています。合計時間: {minutes} 分。"
+
   model:
     error_prefix:           "エラー: {error}"
     switched:               "モデルを `{model}` に切り替えました"

@@ -31,6 +31,12 @@ gateway:
   config_read_failed: "⚠️ Níorbh fhéidir config.yaml a léamh: {error}"
   config_save_failed: "⚠️ Níorbh fhéidir an chumraíocht a shábháil: {error}"
 
+  progress:
+    active:          "⏳ Táim fós ag obair agus ag leanúint leis an tasc. Am iomlán: {minutes} nóim."
+    checking:        "⏳ Táim fós ag obair agus ag déanamh na chéad seiceála eile. Am iomlán: {minutes} nóim."
+    check_completed: "⏳ Táim fós ag obair. Chríochnaigh mé seiceáil agus táim ag leanúint leis an gcéad chéim eile. Am iomlán: {minutes} nóim."
+    waiting_model:   "⏳ Táim fós ag obair agus ag fanacht le freagra na samhla. Am iomlán: {minutes} nóim."
+
   model:
     error_prefix:           "Earráid: {error}"
     switched:               "Athraíodh an tsamhail go `{model}`"

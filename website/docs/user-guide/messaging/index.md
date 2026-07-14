@@ -640,6 +640,21 @@ display:
       long_running_notifications: false
 ```
 
+To receive a fresh fallback message instead of editing one heartbeat forever,
+set `long_running_notifications: separate`:
+
+```yaml
+display:
+  platforms:
+    telegram:
+      long_running_notifications: separate
+```
+
+`separate` sends at most one new message per `agent.gateway_notify_interval`
+after a full interval without visible assistant commentary. Its copy comes from
+a closed, localized status vocabulary and never includes tool names, arguments,
+paths, IDs, results, or hidden reasoning.
+
 ### Progress bubble cleanup (opt-in)
 
 Tool-progress messages, the "still working…" heartbeat, and status-callback bubbles can also be auto-deleted after the final response lands. Enable per-platform via `display.platforms.<platform>.cleanup_progress`:

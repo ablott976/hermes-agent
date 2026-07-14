@@ -658,6 +658,59 @@ class LongRunningHeartbeatAgent:
         }
 
 
+class SeparateHeartbeatAgent:
+    """Agent with technical activity that must never leak into fallback copy."""
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def get_activity_summary(self):
+        return {
+            "api_call_count": 7,
+            "max_iterations": 50,
+            "current_tool": "terminal",
+            "last_activity_desc": "receiving stream response",
+        }
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        time.sleep(0.18)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class CommentaryResetsHeartbeatAgent:
+    """A delivered human update must restart the fallback silence clock."""
+
+    def __init__(self, **kwargs):
+        self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
+        self.tools = []
+
+    def get_activity_summary(self):
+        return {
+            "api_call_count": 2,
+            "max_iterations": 50,
+            "current_tool": None,
+            "last_activity_desc": "receiving stream response",
+        }
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        time.sleep(0.04)
+        assert self.interim_assistant_callback is not None
+        self.interim_assistant_callback(
+            "I finished the first check and I am continuing.",
+            already_streamed=False,
+        )
+        time.sleep(0.04)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class PreviewedResponseAgent:
     def __init__(self, **kwargs):
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
@@ -922,9 +975,111 @@ async def test_run_agent_heartbeat_survives_slow_agent_initialization(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_run_agent_separate_heartbeat_sends_fresh_human_messages(
+    monkeypatch, tmp_path
+):
+    gateway_run = importlib.import_module("gateway.run")
+    original_float_env = gateway_run._float_env
+    monkeypatch.setattr(
+        gateway_run,
+        "_float_env",
+        lambda name, default: (
+            0.05
+            if name == "HERMES_AGENT_NOTIFY_INTERVAL"
+            else original_float_env(name, default)
+        ),
+    )
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        SeparateHeartbeatAgent,
+        session_id="sess-separate-heartbeat",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "interim_assistant_messages": False,
+                "long_running_notifications": "separate",
+            }
+        },
+        adapter_cls=SmallLimitProgressAdapter,
+        chat_type="dm",
+        chat_id="5049627574",
+        thread_id="",
+    )
+
+    heartbeats = [
+        call["content"]
+        for call in adapter.sent
+        if "working" in call["content"].lower()
+        or "trabajando" in call["content"].lower()
+    ]
+    assert result["final_response"] == "done"
+    assert isinstance(adapter, SmallLimitProgressAdapter)
+    assert len(heartbeats) >= 2
+    assert adapter.edits == []
+    assert adapter._next_id == len(adapter.sent)
+    unsafe = "\n".join(heartbeats).lower()
+    assert "terminal" not in unsafe
+    assert "receiving stream response" not in unsafe
+    assert "iteration " not in unsafe
+    completed_counts = (len(adapter.sent), len(adapter.edits))
+    await asyncio.sleep(0.12)
+    assert (len(adapter.sent), len(adapter.edits)) == completed_counts
+
+
+@pytest.mark.asyncio
+async def test_run_agent_separate_heartbeat_waits_after_human_commentary(
+    monkeypatch, tmp_path
+):
+    gateway_run = importlib.import_module("gateway.run")
+    original_float_env = gateway_run._float_env
+    monkeypatch.setattr(
+        gateway_run,
+        "_float_env",
+        lambda name, default: (
+            0.05
+            if name == "HERMES_AGENT_NOTIFY_INTERVAL"
+            else original_float_env(name, default)
+        ),
+    )
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CommentaryResetsHeartbeatAgent,
+        session_id="sess-commentary-resets-separate-heartbeat",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "interim_assistant_messages": True,
+                "long_running_notifications": "separate",
+            }
+        },
+        adapter_cls=SmallLimitProgressAdapter,
+        chat_type="dm",
+        chat_id="5049627574",
+        thread_id="",
+    )
+
+    assert result["final_response"] == "done"
+    assert any(
+        call["content"] == "I finished the first check and I am continuing."
+        for call in adapter.sent
+    )
+    assert not any(
+        "working" in call["content"].lower()
+        or "trabajando" in call["content"].lower()
+        for call in adapter.sent
+    )
+    assert adapter.edits == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("notification_mode", [True, "separate"])
 @pytest.mark.parametrize("boundary", ["/new", "/stop"])
 async def test_run_agent_heartbeat_stops_after_generation_boundary(
-    monkeypatch, tmp_path, boundary
+    monkeypatch, tmp_path, boundary, notification_mode
 ):
     gateway_run = importlib.import_module("gateway.run")
     original_float_env = gateway_run._float_env
@@ -954,12 +1109,12 @@ async def test_run_agent_heartbeat_stops_after_generation_boundary(
         monkeypatch,
         tmp_path,
         SlowInitializingHeartbeatAgent,
-        session_id=f"sess-heartbeat-{boundary[1:]}",
+        session_id=f"sess-heartbeat-{boundary[1:]}-{notification_mode}",
         config_data={
             "display": {
                 "tool_progress": "off",
                 "interim_assistant_messages": False,
-                "long_running_notifications": True,
+                "long_running_notifications": notification_mode,
             }
         },
         chat_type="dm",
@@ -975,8 +1130,9 @@ async def test_run_agent_heartbeat_stops_after_generation_boundary(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("notification_mode", [True, "separate"])
 async def test_run_agent_heartbeat_stops_after_real_agent_replacement(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, notification_mode
 ):
     gateway_run = importlib.import_module("gateway.run")
     original_float_env = gateway_run._float_env
@@ -1014,12 +1170,12 @@ async def test_run_agent_heartbeat_stops_after_real_agent_replacement(
         monkeypatch,
         tmp_path,
         LongRunningHeartbeatAgent,
-        session_id="sess-heartbeat-agent-replacement",
+        session_id=f"sess-heartbeat-agent-replacement-{notification_mode}",
         config_data={
             "display": {
                 "tool_progress": "off",
                 "interim_assistant_messages": False,
-                "long_running_notifications": True,
+                "long_running_notifications": notification_mode,
             }
         },
         chat_type="dm",
@@ -1030,7 +1186,10 @@ async def test_run_agent_heartbeat_stops_after_real_agent_replacement(
     )
 
     assert result["final_response"] == "done"
-    assert len(adapter.sent) == 1
+    if notification_mode is True:
+        assert len(adapter.sent) == 1
+    else:
+        assert adapter.sent
 
 
 @pytest.mark.asyncio
