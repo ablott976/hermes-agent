@@ -3,6 +3,7 @@
 import asyncio
 import importlib
 import sys
+import threading
 import time
 import types
 from types import SimpleNamespace
@@ -661,6 +662,8 @@ class LongRunningHeartbeatAgent:
 class SeparateHeartbeatAgent:
     """Agent with technical activity that must never leak into fallback copy."""
 
+    release = threading.Event()
+
     def __init__(self, **kwargs):
         self.tools = []
 
@@ -673,7 +676,7 @@ class SeparateHeartbeatAgent:
         }
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
-        time.sleep(0.18)
+        assert type(self).release.wait(timeout=5)
         return {
             "final_response": "done",
             "messages": [],
@@ -697,13 +700,13 @@ class CommentaryResetsHeartbeatAgent:
         }
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
-        time.sleep(0.04)
+        time.sleep(0.25)
         assert self.interim_assistant_callback is not None
         self.interim_assistant_callback(
             "I finished the first check and I am continuing.",
             already_streamed=False,
         )
-        time.sleep(0.04)
+        time.sleep(0.85)
         return {
             "final_response": "done",
             "messages": [],
@@ -990,6 +993,25 @@ async def test_run_agent_separate_heartbeat_sends_fresh_human_messages(
         ),
     )
 
+    SeparateHeartbeatAgent.release.clear()
+
+    async def release_after_two_heartbeats(
+        runner, adapter, session_key, run_task
+    ):
+        heartbeats = []
+        for _ in range(500):
+            heartbeats = [
+                call
+                for call in adapter.sent
+                if "working" in call["content"].lower()
+                or "trabajando" in call["content"].lower()
+            ]
+            if len(heartbeats) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        SeparateHeartbeatAgent.release.set()
+        assert len(heartbeats) >= 2
+
     adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
@@ -1006,6 +1028,7 @@ async def test_run_agent_separate_heartbeat_sends_fresh_human_messages(
         chat_type="dm",
         chat_id="5049627574",
         thread_id="",
+        during_run=release_after_two_heartbeats,
     )
 
     heartbeats = [
@@ -1038,7 +1061,7 @@ async def test_run_agent_separate_heartbeat_waits_after_human_commentary(
         gateway_run,
         "_float_env",
         lambda name, default: (
-            0.05
+            1.0
             if name == "HERMES_AGENT_NOTIFY_INTERVAL"
             else original_float_env(name, default)
         ),
