@@ -4683,7 +4683,9 @@ class AIAgent:
         answer.  They are still the model's intended mid-turn progress prose,
         so the gateway may surface them through ``interim_assistant_callback``.
         Only the narrow documented shape is accepted; reasoning/analysis,
-        tool calls, arguments, and unknown block types are ignored.
+        tool calls, arguments, and unknown block types are ignored. The
+        assembled user-visible copy is force-redacted independently from the
+        raw replay/cache items. Redaction failures suppress the update.
         """
         items = assistant_msg.get("codex_message_items")
         if not isinstance(items, list):
@@ -4711,7 +4713,16 @@ class AIAgent:
                 if isinstance(text, str) and text.strip():
                     commentary_parts.append(text.strip())
 
-        return "\n".join(commentary_parts).strip()
+        commentary = "\n".join(commentary_parts).strip()
+        if not commentary:
+            return ""
+        try:
+            return redact_sensitive_text(commentary, force=True)
+        except Exception:
+            # A failing redactor may include its input in the exception. Keep
+            # the warning fixed so neither the visible text nor a traceback is logged.
+            logger.warning("Codex interim commentary redaction failed; suppressing visible update")
+            return ""
 
     def _emit_interim_assistant_message(self, assistant_msg: Dict[str, Any]) -> None:
         """Surface a real mid-turn assistant commentary message to the UI layer."""
