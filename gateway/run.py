@@ -6043,19 +6043,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: Optional[str],
         agent: Any,
         executor_task: Optional[Any],
+        run_generation: Optional[int] = None,
     ) -> bool:
         """Only emit the heartbeat while this task still owns the live run.
 
-        Guards against a stale ``running: delegate_task`` heartbeat outliving the
-        run that started it: stop once the executor finishes, the agent is gone,
-        or the session key has been rebound to a different live agent (e.g. the
-        user sent ``/new`` and a fresh agent took the slot mid-run, #12029).
+        Agent construction can legitimately outlast the first notification
+        interval, and the running-agent slot can be briefly pending or empty
+        during a same-generation handoff.  Executor liveness plus the run
+        generation are authoritative in those windows.  A different real
+        agent still stops the old heartbeat immediately.
         """
-        if agent is None:
-            return False
         if executor_task is not None and executor_task.done():
             return False
-        if session_key and self._running_agents.get(session_key) is not agent:
+        if (
+            session_key
+            and run_generation is not None
+            and not self._is_session_run_current(session_key, run_generation)
+        ):
+            return False
+
+        running_agent = self._running_agents.get(session_key) if session_key else None
+        slot_is_unclaimed = (
+            running_agent is None or running_agent is _AGENT_PENDING_SENTINEL
+        )
+        if agent is None:
+            if executor_task is None:
+                return False
+            if session_key and not slot_is_unclaimed:
+                return False
+            return True
+
+        if session_key and running_agent is not agent:
+            if run_generation is not None and slot_is_unclaimed:
+                return True
             return False
         return True
 
@@ -19557,7 +19577,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except NameError:
                     _exec_ref = None
                 if not self._should_emit_long_running_notification(
-                    session_key, agent_holder[0], _exec_ref
+                    session_key,
+                    agent_holder[0],
+                    _exec_ref,
+                    run_generation=run_generation,
                 ):
                     break
                 _elapsed_mins = int((time.time() - _notify_start) // 60)

@@ -626,6 +626,22 @@ class CommentaryAgent:
         }
 
 
+class SlowInitializingHeartbeatAgent:
+    """Agent whose construction outlasts the first heartbeat interval."""
+
+    def __init__(self, **kwargs):
+        time.sleep(0.2)
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        time.sleep(0.15)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class PreviewedResponseAgent:
     def __init__(self, **kwargs):
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
@@ -826,6 +842,52 @@ async def test_run_agent_rolls_progress_bubble_before_platform_limit(monkeypatch
     assert adapter.oversized_edits == []
     all_bubbles = [call["content"] for call in adapter.sent + adapter.edits]
     assert all(len(text) <= adapter.MAX_MESSAGE_LENGTH for text in all_bubbles)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_heartbeat_survives_slow_agent_initialization(monkeypatch, tmp_path):
+    gateway_run = importlib.import_module("gateway.run")
+    original_float_env = gateway_run._float_env
+    monkeypatch.setattr(
+        gateway_run,
+        "_float_env",
+        lambda name, default: (
+            0.05
+            if name == "HERMES_AGENT_NOTIFY_INTERVAL"
+            else original_float_env(name, default)
+        ),
+    )
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        SlowInitializingHeartbeatAgent,
+        session_id="sess-slow-init-heartbeat",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "interim_assistant_messages": False,
+                "long_running_notifications": True,
+            }
+        },
+        chat_type="dm",
+        chat_id="5049627574",
+        thread_id="",
+    )
+
+    heartbeat_sends = [
+        call["content"]
+        for call in adapter.sent
+        if call["content"].startswith("⏳ Working —")
+    ]
+    heartbeat_edits = [
+        call["content"]
+        for call in adapter.edits
+        if call["content"].startswith("⏳ Working —")
+    ]
+    assert result["final_response"] == "done"
+    assert len(heartbeat_sends) == 1
+    assert heartbeat_edits
 
 
 @pytest.mark.asyncio
