@@ -158,6 +158,29 @@ def _codex_commentary_message_response(text: str):
     )
 
 
+def _codex_commentary_tool_call_response(text: str):
+    return SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="message",
+                phase="commentary",
+                status="completed",
+                content=[SimpleNamespace(type="output_text", text=text)],
+            ),
+            SimpleNamespace(
+                type="function_call",
+                id="fc_1",
+                call_id="call_1",
+                name="terminal",
+                arguments="{}",
+            ),
+        ],
+        usage=SimpleNamespace(input_tokens=12, output_tokens=6, total_tokens=18),
+        status="completed",
+        model="gpt-5-codex",
+    )
+
+
 def _codex_ack_message_response(text: str):
     return SimpleNamespace(
         output=[
@@ -1970,6 +1993,101 @@ def test_interim_commentary_is_not_marked_already_streamed_without_callbacks(mon
     }
 
 
+def test_interim_commentary_uses_codex_commentary_items_when_content_is_empty(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    observed = {}
+    setattr(
+        agent,
+        "interim_assistant_callback",
+        lambda text, *, already_streamed=False: observed.update(
+            {"text": text, "already_streamed": already_streamed}
+        ),
+    )
+
+    agent._emit_interim_assistant_message(
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [
+                        {"type": "output_text", "text": "I finished the first check."},
+                        {"type": "output_text", "text": "Now I am verifying the remaining services."},
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert observed == {
+        "text": "I finished the first check.\nNow I am verifying the remaining services.",
+        "already_streamed": False,
+    }
+
+
+def test_interim_commentary_never_surfaces_codex_analysis_items(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    observed = []
+    setattr(
+        agent,
+        "interim_assistant_callback",
+        lambda text, *, already_streamed=False: observed.append(
+            (text, already_streamed)
+        ),
+    )
+
+    agent._emit_interim_assistant_message(
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "analysis",
+                    "content": [
+                        {"type": "output_text", "text": "private chain of thought"},
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert observed == []
+
+
+def test_interim_commentary_prefers_content_over_structured_codex_copy(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    observed = []
+    setattr(
+        agent,
+        "interim_assistant_callback",
+        lambda text, *, already_streamed=False: observed.append(text),
+    )
+
+    agent._emit_interim_assistant_message(
+        {
+            "role": "assistant",
+            "content": "Visible preamble",
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [
+                        {"type": "output_text", "text": "Duplicate structured preamble"},
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert observed == ["Visible preamble"]
+
+
 def test_interim_commentary_is_not_marked_already_streamed_when_stream_callback_fails(monkeypatch):
     agent = _build_agent(monkeypatch)
     observed = {}
@@ -2128,6 +2246,14 @@ def test_stream_delta_preserves_code_fence_newlines(monkeypatch):
 
 def test_run_conversation_codex_continues_after_commentary_phase_message(monkeypatch):
     agent = _build_agent(monkeypatch)
+    observed_commentary = []
+    setattr(
+        agent,
+        "interim_assistant_callback",
+        lambda text, *, already_streamed=False: observed_commentary.append(
+            (text, already_streamed)
+        ),
+    )
     responses = [
         _codex_commentary_message_response("I'll inspect the repo structure first."),
         _codex_tool_call_response(),
@@ -2151,6 +2277,9 @@ def test_run_conversation_codex_continues_after_commentary_phase_message(monkeyp
 
     assert result["completed"] is True
     assert result["final_response"] == "Architecture summary complete."
+    assert observed_commentary == [
+        ("I'll inspect the repo structure first.", False),
+    ]
     commentary_messages = [
         msg for msg in result["messages"]
         if msg.get("role") == "assistant" and msg.get("finish_reason") == "incomplete"
@@ -2163,6 +2292,57 @@ def test_run_conversation_codex_continues_after_commentary_phase_message(monkeyp
         for item in (msg.get("codex_message_items") or [])
         if item.get("phase") == "commentary"
     )
+    assert any(msg.get("role") == "tool" and msg.get("tool_call_id") == "call_1" for msg in result["messages"])
+
+
+def test_run_conversation_emits_commentary_from_same_codex_tool_call_response(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    observed_commentary = []
+    setattr(
+        agent,
+        "interim_assistant_callback",
+        lambda text, *, already_streamed=False: observed_commentary.append(
+            (text, already_streamed)
+        ),
+    )
+    responses = [
+        _codex_commentary_tool_call_response(
+            "The first read failed safely. I am retrying the same read with corrected parameters."
+        ),
+        _codex_message_response("The live inventory is now verified."),
+    ]
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
+
+    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id, *_args):
+        for call in assistant_message.tool_calls:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": '{"ok":true}',
+                }
+            )
+
+    monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
+
+    result = agent.run_conversation("verify the live inventory")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "The live inventory is now verified."
+    assert observed_commentary == [
+        (
+            "The first read failed safely. I am retrying the same read with corrected parameters.",
+            False,
+        )
+    ]
+    tool_turns = [
+        msg
+        for msg in result["messages"]
+        if msg.get("role") == "assistant" and msg.get("finish_reason") == "tool_calls"
+    ]
+    assert len(tool_turns) == 1
+    assert (tool_turns[0].get("content") or "") == ""
+    assert "retrying" not in result["final_response"]
     assert any(msg.get("role") == "tool" and msg.get("tool_call_id") == "call_1" for msg in result["messages"])
 
 
