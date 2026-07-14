@@ -856,6 +856,58 @@ class TestLongRunningNotificationOwnership:
             "sess", None, executor_task=None
         ) is False
 
+    def test_notification_continues_while_agent_initializes(self):
+        from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
+
+        runner = object.__new__(GatewayRunner)
+        runner._running_agents = {"sess": _AGENT_PENDING_SENTINEL}
+        runner._session_run_generation = {"sess": 3}
+
+        live_task = MagicMock()
+        live_task.done.return_value = False
+
+        assert runner._should_emit_long_running_notification(
+            "sess",
+            None,
+            executor_task=live_task,
+            run_generation=3,
+        ) is True
+
+    def test_notification_stops_after_run_generation_moves(self):
+        from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
+
+        runner = object.__new__(GatewayRunner)
+        runner._running_agents = {"sess": _AGENT_PENDING_SENTINEL}
+        runner._session_run_generation = {"sess": 4}
+
+        live_task = MagicMock()
+        live_task.done.return_value = False
+
+        assert runner._should_emit_long_running_notification(
+            "sess",
+            None,
+            executor_task=live_task,
+            run_generation=3,
+        ) is False
+
+    def test_notification_uses_current_generation_during_slot_handoff(self):
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner._running_agents = {}
+        runner._session_run_generation = {"sess": 3}
+        agent = MagicMock()
+
+        live_task = MagicMock()
+        live_task.done.return_value = False
+
+        assert runner._should_emit_long_running_notification(
+            "sess",
+            agent,
+            executor_task=live_task,
+            run_generation=3,
+        ) is True
+
     def test_notification_continues_for_live_active_run(self):
         from gateway.run import GatewayRunner
 
