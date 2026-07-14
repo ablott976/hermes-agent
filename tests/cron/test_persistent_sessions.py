@@ -17,7 +17,12 @@ from cron.jobs import (
     set_persistent_session_state,
     update_job,
 )
-from cron.scheduler import _base_url_contract, _load_persistent_cron_history, run_job
+from cron.scheduler import (
+    _base_url_contract,
+    _load_persistent_cron_history,
+    run_job,
+    run_one_job,
+)
 from hermes_state import SessionDB as RealSessionDB
 
 
@@ -327,6 +332,39 @@ def test_second_tick_resumes_same_conversation_with_compact_prompt(persistent_en
     assert persistent_env.ended[-1][1] == "cron_waiting"
 
 
+def test_two_zero_tool_silences_autopause_through_shared_run_pipeline(
+    persistent_env,
+    monkeypatch,
+    tmp_path,
+):
+    original_run_conversation = FakeAgent.run_conversation
+
+    def _silent_run(self, *args, **kwargs):
+        result = original_run_conversation(self, *args, **kwargs)
+        result["final_response"] = "[SILENT]"
+        result["turn_tool_calls"] = 0
+        return result
+
+    monkeypatch.setattr(FakeAgent, "run_conversation", _silent_run)
+    created = _create_persistent_job()
+    job = update_job(created["id"], {"workdir": str(tmp_path)})
+    assert job is not None
+
+    assert run_one_job(job) is True
+    after_first = get_job(job["id"])
+    assert after_first is not None
+    assert after_first["enabled"] is True
+    assert after_first["persistent_silent_ticks"] == 1
+
+    assert run_one_job(after_first) is True
+    after_second = get_job(job["id"])
+    assert after_second is not None
+    assert after_second["enabled"] is False
+    assert after_second["state"] == "paused"
+    assert after_second["persistent_silent_ticks"] == 2
+    assert after_second["repeat"]["completed"] == 2
+
+
 def test_persistent_session_survives_sqlite_close_and_reopen(
     persistent_env,
     monkeypatch,
@@ -395,7 +433,7 @@ def test_system_contract_drift_forks_without_reinjecting_old_history(persistent_
     assert "CRON CONTINUATION" not in FakeAgent.calls[-1]["prompt"]
 
 
-def test_absolute_skill_content_drift_forks_persistent_root(
+def test_absolute_skill_body_change_keeps_persistent_root(
     persistent_env,
     monkeypatch,
     tmp_path,
@@ -423,6 +461,7 @@ def test_absolute_skill_content_drift_forks_persistent_root(
 
     assert run_job(job)[0] is True
     original_root = get_job(job["id"])["session_root_id"]
+    assert "version one" in FakeAgent.calls[-1]["prompt"]
     assert seen_names
     assert set(seen_names) == {"demo-skill"}
 
@@ -430,11 +469,75 @@ def test_absolute_skill_content_drift_forks_persistent_root(
     seen_names.clear()
     assert run_job(get_job(job["id"]))[0] is True
 
-    assert get_job(job["id"])["session_root_id"] != original_root
-    assert FakeAgent.calls[-1]["history"] == []
-    assert "version two" in FakeAgent.calls[-1]["prompt"]
+    assert get_job(job["id"])["session_root_id"] == original_root
+    resumed = FakeAgent.calls[-1]
+    assert resumed["session_id"] == original_root
+    assert "CRON CONTINUATION" in resumed["prompt"]
+    assert "version two" not in resumed["prompt"]
+    assert "version one" in resumed["history"][0]["content"]
     assert seen_names
     assert set(seen_names) == {"demo-skill"}
+
+
+def test_configured_skill_identity_change_forks_persistent_root(
+    persistent_env,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "tools.skills_tool.skill_view",
+        lambda name: json.dumps({"success": True, "content": f"body for {name}"}),
+    )
+    monkeypatch.setattr("tools.skill_usage.bump_use", lambda _name: None)
+    job = create_job(
+        prompt="Continue with the loaded procedure.",
+        schedule="every 1m",
+        model="test-model",
+        provider="openrouter",
+        skills=["demo-skill"],
+        session_mode="persistent",
+    )
+
+    assert run_job(job)[0] is True
+    original_root = get_job(job["id"])["session_root_id"]
+
+    update_job(job["id"], {"skills": ["replacement-skill"]})
+    assert run_job(get_job(job["id"]))[0] is True
+
+    assert get_job(job["id"])["session_root_id"] != original_root
+    assert FakeAgent.calls[-1]["history"] == []
+    assert "body for replacement-skill" in FakeAgent.calls[-1]["prompt"]
+
+
+def test_configured_skill_availability_change_forks_persistent_root(
+    persistent_env,
+    monkeypatch,
+):
+    available = {"value": False}
+
+    def _view_skill(_name):
+        if available["value"]:
+            return json.dumps({"success": True, "content": "now available"})
+        return json.dumps({"success": False, "error": "missing"})
+
+    monkeypatch.setattr("tools.skills_tool.skill_view", _view_skill)
+    monkeypatch.setattr("tools.skill_usage.bump_use", lambda _name: None)
+    job = create_job(
+        prompt="Continue with the loaded procedure.",
+        schedule="every 1m",
+        model="test-model",
+        provider="openrouter",
+        skills=["demo-skill"],
+        session_mode="persistent",
+    )
+
+    assert run_job(job)[0] is True
+    original_root = get_job(job["id"])["session_root_id"]
+
+    available["value"] = True
+    assert run_job(get_job(job["id"]))[0] is True
+
+    assert get_job(job["id"])["session_root_id"] != original_root
+    assert "now available" in FakeAgent.calls[-1]["prompt"]
 
 
 def test_orphaned_pointer_forks_before_bootstrap(persistent_env):

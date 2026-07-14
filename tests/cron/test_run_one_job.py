@@ -78,6 +78,91 @@ def test_run_one_job_silent_skips_delivery(monkeypatch):
     assert "deliver" not in kinds
 
 
+def test_persistent_silence_only_counts_when_agent_called_no_tools(monkeypatch):
+    marked = []
+
+    def fake_run_job(job, *, defer_agent_teardown=None, run_metadata=None):
+        assert run_metadata is not None
+        run_metadata.update({"persistent": True, "agent_ran": True, "tool_calls": 0})
+        return True, "output", "[SILENT]", None
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "save_job_output", lambda _jid, _out: "/tmp/out")
+    monkeypatch.setattr(s, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda jid, ok, err=None, **kwargs: marked.append((jid, ok, kwargs)),
+    )
+
+    assert s.run_one_job(
+        {"id": "persistent-silent", "name": "t", "session_mode": "persistent"}
+    ) is True
+
+    assert marked == [
+        (
+            "persistent-silent",
+            True,
+            {"delivery_error": None, "persistent_no_progress": True},
+        )
+    ]
+
+
+def test_persistent_silence_with_tool_work_does_not_count(monkeypatch):
+    marked = []
+
+    def fake_run_job(job, *, defer_agent_teardown=None, run_metadata=None):
+        assert run_metadata is not None
+        run_metadata.update({"persistent": True, "agent_ran": True, "tool_calls": 1})
+        return True, "output", "[SILENT]", None
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "save_job_output", lambda _jid, _out: "/tmp/out")
+    monkeypatch.setattr(s, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda jid, ok, err=None, **kwargs: marked.append((jid, ok, kwargs)),
+    )
+
+    assert s.run_one_job(
+        {"id": "persistent-worked", "name": "t", "session_mode": "persistent"}
+    ) is True
+
+    assert marked[0][2]["persistent_no_progress"] is False
+
+
+def test_interrupted_persistent_tick_resets_silence_without_marking(monkeypatch):
+    cleared = []
+
+    def fake_run_job(job, *, defer_agent_teardown=None, run_metadata=None):
+        assert run_metadata is not None
+        run_metadata.update({"persistent": True, "agent_ran": True, "tool_calls": 1})
+        return True, "output", "[SILENT]", None
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "save_job_output", lambda _jid, _out: "/tmp/out")
+    monkeypatch.setattr(s, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(s, "_consume_interrupted_flag", lambda _jid: True)
+    monkeypatch.setattr(
+        s,
+        "reset_persistent_silence_state",
+        lambda jid: cleared.append(jid) or True,
+    )
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("interrupted run must not be marked complete")
+        ),
+    )
+
+    assert s.run_one_job(
+        {"id": "persistent-interrupted", "name": "t", "session_mode": "persistent"}
+    ) is True
+    assert cleared == ["persistent-interrupted"]
+
+
 def test_run_one_job_empty_response_is_soft_failure(monkeypatch):
     """An empty final response marks the run as NOT ok (issue #8585)."""
     calls = _patch_pipeline(monkeypatch, final="   ")
