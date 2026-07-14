@@ -610,6 +610,18 @@ class TestVisibleTextRedaction:
         assert "state=public-state" in result
         assert redact_visible_text(result) == result
 
+    @pytest.mark.parametrize("scheme", ["ssh", "git", "sftp", "ftps"])
+    def test_masks_transport_url_userinfo(self, scheme):
+        from agent.redact import redact_visible_text
+
+        text = f"Clone {scheme}://deploy:transport-password@example.com/repo"
+
+        result = redact_visible_text(text)
+
+        assert "transport-password" not in result
+        assert result == f"Clone {scheme}://deploy:***@example.com/repo"
+        assert redact_visible_text(result) == result
+
 
 class TestBareTokenUserinfoRedaction:
     """Regression tests for #6396 — a bare credential in URL userinfo

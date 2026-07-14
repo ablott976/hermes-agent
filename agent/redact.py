@@ -278,11 +278,12 @@ _URL_WITH_QUERY_RE = re.compile(
     r"(#\S*)?",                       # optional fragment
 )
 
-# URLs containing userinfo — `scheme://user:password@host` for ANY scheme
-# (not just DB protocols already covered by _DB_CONNSTR_RE above).
-# Catches things like `https://user:token@api.example.com/v1/foo`.
+# URLs containing userinfo — `scheme://user:password@host` for web and
+# transport schemes (not just DB protocols handled by _DB_CONNSTR_RE above).
+# Catches both navigable URLs and credential-bearing git/SSH remotes.
 _URL_USERINFO_RE = re.compile(
-    r"(https?|wss?|ftp)://([^/\s:@]+):([^/\s@]+)@",
+    r"(https?|wss?|git|ssh|ftp|ftps|sftp)://([^/\s:@]+):([^/\s@]+)@",
+    re.IGNORECASE,
 )
 
 # HTTP access logs often use a relative request target rather than a full URL:
@@ -400,7 +401,7 @@ def _redact_url_query_params(text: str) -> str:
 
 
 def _redact_url_userinfo(text: str) -> str:
-    """Strip `user:password@` from HTTP/WS/FTP URLs.
+    """Mask `user:password@` in web and transport URLs.
 
     DB protocols (postgres, mysql, mongodb, redis, amqp) are handled
     separately by `_DB_CONNSTR_RE`.
