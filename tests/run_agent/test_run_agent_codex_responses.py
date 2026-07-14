@@ -2028,6 +2028,76 @@ def test_interim_commentary_uses_codex_commentary_items_when_content_is_empty(mo
     }
 
 
+def test_interim_codex_commentary_force_redacts_secrets_before_callback(monkeypatch):
+    import agent.redact as redact_module
+
+    agent = _build_agent(monkeypatch)
+    observed = []
+    setattr(
+        agent,
+        "interim_assistant_callback",
+        lambda text, *, already_streamed=False: observed.append(text),
+    )
+    monkeypatch.setattr(redact_module, "_REDACT_ENABLED", False)
+    secret = "ghp_" + "1234567890abcdefghijklmnop"
+
+    agent._emit_interim_assistant_message(
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [
+                        {"type": "output_text", "text": f"Using {secret} for the next check."},
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert len(observed) == 1
+    assert secret not in observed[0]
+    assert observed[0] != f"Using {secret} for the next check."
+
+
+def test_interim_codex_commentary_fails_closed_when_redaction_fails(monkeypatch, caplog):
+    agent = _build_agent(monkeypatch)
+    observed = []
+    setattr(
+        agent,
+        "interim_assistant_callback",
+        lambda text, *, already_streamed=False: observed.append(text),
+    )
+    secret = "ghp_" + "abcdefghijklmnopqrstuvwx"
+
+    def fail_redaction(text, *, force=False):
+        raise RuntimeError(text)
+
+    monkeypatch.setattr("run_agent.redact_sensitive_text", fail_redaction)
+    agent._emit_interim_assistant_message(
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [
+                        {"type": "output_text", "text": f"Checking {secret}"},
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert observed == []
+    assert secret not in caplog.text
+
+
 def test_interim_commentary_never_surfaces_codex_analysis_items(monkeypatch):
     agent = _build_agent(monkeypatch)
     observed = []
