@@ -255,11 +255,15 @@ def build_bundle_invocation_message(
     user_instruction: str = "",
     task_id: str | None = None,
     platform: str | None = None,
+    return_member_ids: bool = False,
 ) -> Optional[Tuple[str, List[str], List[str]]]:
     """Build the user message content for a bundle slash command invocation.
 
     Returns ``(message, loaded_skill_names, missing_skill_names)`` or
-    ``None`` if the bundle wasn't found.
+    ``None`` if the bundle wasn't found. When ``return_member_ids`` is true,
+    the lists instead contain configured member identifiers that are available
+    or unavailable (missing or disabled); this keeps runtime fingerprints
+    independent from editable skill frontmatter names.
 
     A bundle that references skills the user doesn't have installed still
     loads — the agent gets a note about which ones were skipped. This is
@@ -292,8 +296,10 @@ def build_bundle_invocation_message(
         disabled_names = set()
 
     loaded_names: List[str] = []
+    loaded_member_ids: List[str] = []
     missing: List[str] = []
     disabled: List[str] = []
+    unavailable_member_ids: List[str] = []
     skill_blocks: List[str] = []
     seen: set[str] = set()
 
@@ -310,6 +316,7 @@ def build_bundle_invocation_message(
         loaded = _load_skill_payload(identifier, task_id=task_id)
         if not loaded:
             missing.append(identifier)
+            unavailable_member_ids.append(identifier)
             continue
         loaded_skill, skill_dir, skill_name = loaded
 
@@ -317,6 +324,7 @@ def build_bundle_invocation_message(
         # skill's canonical name (identifiers may be paths or aliases).
         if skill_name in disabled_names or identifier in disabled_names:
             disabled.append(skill_name or identifier)
+            unavailable_member_ids.append(identifier)
             continue
 
         try:
@@ -337,6 +345,7 @@ def build_bundle_invocation_message(
             )
         )
         loaded_names.append(skill_name)
+        loaded_member_ids.append(identifier)
 
     if not skill_blocks:
         return None
@@ -365,7 +374,9 @@ def build_bundle_invocation_message(
         )
 
     header = "\n".join(header_lines)
-    return ("\n\n".join([header, *skill_blocks]), loaded_names, missing)
+    member_names = loaded_member_ids if return_member_ids else loaded_names
+    unavailable = unavailable_member_ids if return_member_ids else missing
+    return ("\n\n".join([header, *skill_blocks]), member_names, unavailable)
 
 
 # ---------------------------------------------------------------------------

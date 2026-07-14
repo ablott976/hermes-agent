@@ -442,9 +442,13 @@ def test_bundle_member_availability_is_part_of_persistent_skill_contract(monkeyp
         "agent.skill_bundles.resolve_bundle_command_key",
         lambda _name: "/demo",
     )
+    def _build_bundle(*_args, **kwargs):
+        assert kwargs["return_member_ids"] is True
+        return bundle_result["value"]
+
     monkeypatch.setattr(
         "agent.skill_bundles.build_bundle_invocation_message",
-        lambda *_args, **_kwargs: bundle_result["value"],
+        _build_bundle,
     )
 
     partial = _persistent_skill_contract({"id": "job-1", "skills": ["/demo"]})
