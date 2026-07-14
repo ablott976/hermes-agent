@@ -38,6 +38,12 @@ gateway:
   config_read_failed: "⚠️ Could not read config.yaml: {error}"
   config_save_failed: "⚠️ Could not save config: {error}"
 
+  progress:
+    active:          "⏳ Still working. I'm continuing with the task. Total time: {minutes} min."
+    checking:        "⏳ Still working. I'm running the next check. Total time: {minutes} min."
+    check_completed: "⏳ Still working. I finished a check and I'm continuing with the next step. Total time: {minutes} min."
+    waiting_model:   "⏳ Still working. I'm waiting for the model response. Total time: {minutes} min."
+
   # /model command output -- shown after a model switch or when listing models.
   # Provider names, model IDs, capability strings, and cost figures are NOT
   # translated -- they're identifiers/values, not prose.  Only the labels

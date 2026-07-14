@@ -27,6 +27,12 @@ gateway:
   config_read_failed: "⚠️ Impossible de lire config.yaml : {error}"
   config_save_failed: "⚠️ Impossible de sauvegarder la configuration : {error}"
 
+  progress:
+    active:          "⏳ Je travaille toujours et je poursuis la tâche. Durée totale : {minutes} min."
+    checking:        "⏳ Je travaille toujours et j’effectue la vérification suivante. Durée totale : {minutes} min."
+    check_completed: "⏳ Je travaille toujours. J’ai terminé une vérification et je poursuis avec l’étape suivante. Durée totale : {minutes} min."
+    waiting_model:   "⏳ Je travaille toujours et j’attends la réponse du modèle. Durée totale : {minutes} min."
+
   model:
     error_prefix:           "Erreur : {error}"
     switched:               "Modèle changé pour `{model}`"

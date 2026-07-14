@@ -27,6 +27,12 @@ gateway:
   config_read_failed: "⚠️ config.yaml okunamadı: {error}"
   config_save_failed: "⚠️ Yapılandırma kaydedilemedi: {error}"
 
+  progress:
+    active:          "⏳ Çalışmaya devam ediyorum. Görevi sürdürüyorum. Toplam süre: {minutes} dk."
+    checking:        "⏳ Çalışmaya devam ediyorum. Sonraki kontrolü yürütüyorum. Toplam süre: {minutes} dk."
+    check_completed: "⏳ Çalışmaya devam ediyorum. Bir kontrolü tamamladım ve sonraki adıma geçiyorum. Toplam süre: {minutes} dk."
+    waiting_model:   "⏳ Çalışmaya devam ediyorum. Modelin yanıtını bekliyorum. Toplam süre: {minutes} dk."
+
   model:
     error_prefix:           "Hata: {error}"
     switched:               "Model `{model}` olarak değiştirildi"

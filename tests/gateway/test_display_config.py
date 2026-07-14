@@ -195,6 +195,23 @@ class TestYAMLNormalisation:
         assert resolve_display_setting(config, "whatsapp", "interim_assistant_messages") is False
         assert resolve_display_setting(config, "whatsapp", "long_running_notifications") == "generic"
 
+    def test_long_running_visibility_accepts_separate_mode(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "platforms": {
+                    "telegram": {"long_running_notifications": " separate\n"}
+                }
+            }
+        }
+        assert (
+            resolve_display_setting(
+                config, "telegram", "long_running_notifications"
+            )
+            == "separate"
+        )
+
     def test_thinking_progress_string_false_normalised_to_false(self):
         from gateway.display_config import resolve_display_setting
 

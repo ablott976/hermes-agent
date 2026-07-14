@@ -27,6 +27,12 @@ gateway:
   config_read_failed: "⚠️ 无法读取 config.yaml：{error}"
   config_save_failed: "⚠️ 无法保存配置：{error}"
 
+  progress:
+    active:          "⏳ 仍在工作。我正在继续处理任务。总用时：{minutes} 分钟。"
+    checking:        "⏳ 仍在工作。我正在执行下一项检查。总用时：{minutes} 分钟。"
+    check_completed: "⏳ 仍在工作。我已完成一项检查，正在继续下一步。总用时：{minutes} 分钟。"
+    waiting_model:   "⏳ 仍在工作。我正在等待模型响应。总用时：{minutes} 分钟。"
+
   model:
     error_prefix:           "错误：{error}"
     switched:               "已切换模型为 `{model}`"

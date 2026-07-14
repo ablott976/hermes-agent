@@ -17309,7 +17309,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             require_platform_override_for: set[Any] | None = None,
             allow_generic: bool = False,
         ) -> str:
-            """Return off|raw|generic for a gateway visibility surface."""
+            """Return off|raw|generic|separate for a gateway visibility surface."""
             if require_platform_override_for:
                 current_platform = _gateway_platform_value(source.platform)
                 platform_only = {
@@ -17322,8 +17322,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ):
                     return "off"
             value = resolve_display_setting(user_config, platform_key, setting, default)
-            if isinstance(value, str) and value.strip().lower() == "generic":
-                return "generic" if allow_generic else "off"
+            if isinstance(value, str):
+                mode = value.strip().lower()
+                if mode in {"generic", "separate"}:
+                    return mode if allow_generic else "off"
             return "raw" if bool(value) else "off"
 
         def _generic_status_phrase(kind: str, *, tool_name: str | None = None, preview: str | None = None, args: Any = None) -> str:
@@ -17374,6 +17376,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Queue for progress messages (thread-safe)
         progress_queue = queue.Queue() if needs_progress_queue else None
+        # Monotonic timestamp of the last progress content that was actually
+        # visible to the user. Separate heartbeats use this as a silence clock
+        # so real assistant commentary buys a full interval before the fallback.
+        _last_visible_progress_at = [time.monotonic()]
+
+        def _mark_visible_progress() -> None:
+            _last_visible_progress_at[0] = time.monotonic()
+
+        def _on_stream_consumer_new_message() -> None:
+            _mark_visible_progress()
+            if progress_queue is not None:
+                progress_queue.put(("__reset__",))
+
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
@@ -18312,11 +18327,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             chat_id=source.chat_id,
                             config=_consumer_cfg,
                             metadata=_status_thread_metadata,
-                            on_new_message=(
-                                (lambda: progress_queue.put(("__reset__",)))
-                                if progress_queue is not None
-                                else None
-                            ),
+                            on_new_message=_on_stream_consumer_new_message,
                             on_before_finalize=_pause_typing_before_finalize,
                             initial_reply_to_id=event_message_id,
                             run_still_current=_run_still_current,
@@ -18341,12 +18352,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return
                 if already_streamed or not _status_adapter or not str(display_text or "").strip():
                     return
-                safe_schedule_threadsafe(
-                    _status_adapter.send(
+
+                async def _send_interim_and_mark_visible() -> None:
+                    if not _run_still_current():
+                        return
+                    result = await _status_adapter.send(
                         _status_chat_id,
                         display_text,
                         metadata=_status_thread_metadata,
-                    ),
+                    )
+                    if getattr(result, "success", False) and _run_still_current():
+                        _mark_visible_progress()
+
+                safe_schedule_threadsafe(
+                    _send_interim_and_mark_visible(),
                     _loop_for_step,
                     logger=logger,
                     log_message="interim_assistant_callback scheduling error",
@@ -19558,12 +19577,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _notify_adapter = self._adapter_for_source(source)
             if not _notify_adapter:
                 return
-            # Track the heartbeat message id so we can edit-in-place on
-            # platforms that support it (Telegram, Discord, Slack, etc.)
-            # instead of spamming a new "Still working" bubble every
-            # interval. Falls back to send-new when edit fails or isn't
-            # supported by the adapter.
+            # Raw/generic modes keep one editable heartbeat bubble. The explicit
+            # separate mode sends a fresh human-safe fallback after each full
+            # interval without visible assistant commentary.
             _heartbeat_msg_id: Optional[str] = None
+            _separate_heartbeat = _long_running_mode == "separate"
             while True:
                 await asyncio.sleep(_NOTIFY_INTERVAL)
                 # Stop heartbeating once this run no longer owns the session
@@ -19583,43 +19601,112 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     run_generation=run_generation,
                 ):
                     break
+                if (
+                    _separate_heartbeat
+                    and time.monotonic() - _last_visible_progress_at[0]
+                    < _NOTIFY_INTERVAL
+                ):
+                    continue
+
                 _elapsed_mins = int((time.time() - _notify_start) // 60)
-                # Include agent activity context if available. Default
-                # heartbeat is terse: elapsed + current tool. Verbose
-                # iteration counter is gated on busy_ack_detail so users
-                # who want it can opt in per platform.
+                # Raw mode preserves the existing diagnostic detail. Separate
+                # mode uses a closed vocabulary and never interpolates runtime
+                # activity, tool names, arguments, paths, IDs, or results.
                 _agent_ref = agent_holder[0]
+                _activity: Dict[str, Any] = {}
                 _status_detail = ""
-                _want_iteration_detail = bool(
-                    resolve_display_setting(
-                        user_config,
-                        platform_key,
-                        "busy_ack_detail",
-                        True,
+                _want_iteration_detail = False
+                if not _separate_heartbeat:
+                    _want_iteration_detail = bool(
+                        resolve_display_setting(
+                            user_config,
+                            platform_key,
+                            "busy_ack_detail",
+                            True,
+                        )
                     )
-                )
                 if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
                     try:
-                        _a = _agent_ref.get_activity_summary()
-                        _parts = []
-                        if _want_iteration_detail:
-                            _parts.append(
-                                f"iteration {_a['api_call_count']}/{_a['max_iterations']}"
+                        _activity = _agent_ref.get_activity_summary() or {}
+                        if not _separate_heartbeat:
+                            _parts = []
+                            if _want_iteration_detail:
+                                _parts.append(
+                                    f"iteration {_activity['api_call_count']}/{_activity['max_iterations']}"
+                                )
+                            _action = _activity.get("current_tool") or _activity.get(
+                                "last_activity_desc"
                             )
-                        _action = _a.get("current_tool") or _a.get("last_activity_desc")
-                        if _action:
-                            _parts.append(str(_action))
-                        if _parts:
-                            _status_detail = " — " + ", ".join(_parts)
+                            if _action:
+                                _parts.append(str(_action))
+                            if _parts:
+                                _status_detail = " — " + ", ".join(_parts)
                     except Exception:
-                        pass
-                _heartbeat_text = (
-                    _generic_status_phrase("status")
-                    if _long_running_mode == "generic"
-                    else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
-                )
+                        _activity = {}
+
+                if _separate_heartbeat:
+                    _activity_desc = str(
+                        _activity.get("last_activity_desc") or ""
+                    ).strip().lower()
+                    if (
+                        "receiving stream response" in _activity_desc
+                        or "waiting for non-streaming response" in _activity_desc
+                    ):
+                        _progress_key = "gateway.progress.waiting_model"
+                    elif _activity_desc.startswith("tool completed:"):
+                        _progress_key = "gateway.progress.check_completed"
+                    elif _activity.get("current_tool") or _activity_desc.startswith(
+                        "executing"
+                    ):
+                        _progress_key = "gateway.progress.checking"
+                    else:
+                        _progress_key = "gateway.progress.active"
+                    _heartbeat_text = t(
+                        _progress_key,
+                        minutes=max(1, _elapsed_mins),
+                    )
+                elif _long_running_mode == "generic":
+                    _heartbeat_text = _generic_status_phrase("status")
+                else:
+                    _heartbeat_text = (
+                        f"⏳ Working — {_elapsed_mins} min{_status_detail}"
+                    )
+
                 try:
+                    # Recheck immediately before delivery. A commentary send,
+                    # generation boundary, replacement, or completed executor
+                    # can race the timer wake-up.
+                    if not self._should_emit_long_running_notification(
+                        session_key,
+                        agent_holder[0],
+                        _exec_ref,
+                        run_generation=run_generation,
+                    ):
+                        break
+                    if (
+                        _separate_heartbeat
+                        and time.monotonic() - _last_visible_progress_at[0]
+                        < _NOTIFY_INTERVAL
+                    ):
+                        continue
+
                     _notify_res = None
+                    if _separate_heartbeat:
+                        _notify_res = await _notify_adapter.send(
+                            source.chat_id,
+                            _heartbeat_text,
+                            metadata=_non_conversational_metadata(
+                                _status_thread_metadata,
+                                platform=source.platform,
+                            ),
+                        )
+                        if getattr(_notify_res, "success", False):
+                            _mark_visible_progress()
+                            _message_id = getattr(_notify_res, "message_id", None)
+                            if _cleanup_progress and _message_id:
+                                _cleanup_msg_ids.append(str(_message_id))
+                        continue
+
                     if _heartbeat_msg_id:
                         try:
                             _notify_res = await _notify_adapter.edit_message(
@@ -19634,7 +19721,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _notify_res = await _notify_adapter.send(
                             source.chat_id,
                             _heartbeat_text,
-                            metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
+                            metadata=_non_conversational_metadata(
+                                _status_thread_metadata,
+                                platform=source.platform,
+                            ),
                         )
                         if getattr(_notify_res, "success", False) and getattr(
                             _notify_res, "message_id", None

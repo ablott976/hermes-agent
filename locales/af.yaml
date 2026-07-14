@@ -27,6 +27,12 @@ gateway:
   config_read_failed: "⚠️ Kon nie config.yaml lees nie: {error}"
   config_save_failed: "⚠️ Kon nie konfigurasie stoor nie: {error}"
 
+  progress:
+    active:          "⏳ Ek werk steeds en gaan voort met die taak. Totale tyd: {minutes} min."
+    checking:        "⏳ Ek werk steeds en voer die volgende kontrole uit. Totale tyd: {minutes} min."
+    check_completed: "⏳ Ek werk steeds. Ek het ’n kontrole voltooi en gaan voort met die volgende stap. Totale tyd: {minutes} min."
+    waiting_model:   "⏳ Ek werk steeds en wag vir die model se antwoord. Totale tyd: {minutes} min."
+
   model:
     error_prefix:           "Fout: {error}"
     switched:               "Model verander na `{model}`"
