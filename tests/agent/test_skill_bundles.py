@@ -213,6 +213,29 @@ class TestBuildBundleInvocationMessage:
         assert missing == ["skill-ghost"]
         assert "skill-ghost" in msg  # called out in header
 
+    def test_can_return_configured_member_ids_instead_of_frontmatter_names(
+        self,
+        bundles_env,
+    ):
+        bundles_dir, skills_dir = bundles_env
+        skill_dir = _make_skill(skills_dir, "configured-skill")
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: editable-display-name\ndescription: Demo\n---\n\nBody.\n"
+        )
+        _make_bundle_yaml(bundles_dir, "combo", ["configured-skill"])
+        scan_bundles()
+
+        display_result = build_bundle_invocation_message("/combo")
+        identity_result = build_bundle_invocation_message(
+            "/combo",
+            return_member_ids=True,
+        )
+
+        assert display_result is not None
+        assert identity_result is not None
+        assert display_result[1] == ["editable-display-name"]
+        assert identity_result[1:] == (["configured-skill"], [])
+
     def test_skips_platform_disabled_skills(self, bundles_env, monkeypatch):
         """A skill disabled for the invoking platform must not be injected
         via a bundle (mirrors the stacked-skill gate, #58888)."""
@@ -237,6 +260,14 @@ class TestBuildBundleInvocationMessage:
         assert "SECRET DISABLED CONTENT." not in msg
         assert "skill-b" in msg  # called out in the disabled-skipped header line
         assert "disabled" in msg.lower()
+
+        identity_result = build_bundle_invocation_message(
+            "/combo",
+            platform="telegram",
+            return_member_ids=True,
+        )
+        assert identity_result is not None
+        assert identity_result[1:] == (["skill-a"], ["skill-b"])
 
         # Positive control: without the platform the skill loads normally.
         result2 = build_bundle_invocation_message("/combo")

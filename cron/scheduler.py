@@ -2995,6 +2995,7 @@ def _persistent_skill_contract(job: dict) -> list[dict[str, Any]]:
                     bundle_key,
                     user_instruction="",
                     task_id=str(job.get("id") or "") or None,
+                    return_member_ids=True,
                 )
                 if bundle_payload:
                     state = "bundle"
