@@ -20,6 +20,7 @@ from cron.jobs import (
 from cron.scheduler import (
     _base_url_contract,
     _load_persistent_cron_history,
+    _persistent_skill_contract,
     run_job,
     run_one_job,
 )
@@ -431,6 +432,47 @@ def test_system_contract_drift_forks_without_reinjecting_old_history(persistent_
     assert updated["session_root_id"] != original_root
     assert FakeAgent.calls[-1]["history"] == []
     assert "CRON CONTINUATION" not in FakeAgent.calls[-1]["prompt"]
+
+
+def test_bundle_member_availability_is_part_of_persistent_skill_contract(monkeypatch):
+    bundle_result = {
+        "value": ("first loaded body", ["member-a"], ["member-b"]),
+    }
+    monkeypatch.setattr(
+        "agent.skill_bundles.resolve_bundle_command_key",
+        lambda _name: "/demo",
+    )
+    monkeypatch.setattr(
+        "agent.skill_bundles.build_bundle_invocation_message",
+        lambda *_args, **_kwargs: bundle_result["value"],
+    )
+
+    partial = _persistent_skill_contract({"id": "job-1", "skills": ["/demo"]})
+    bundle_result["value"] = (
+        "different loaded body",
+        ["member-a", "member-b"],
+        [],
+    )
+    complete = _persistent_skill_contract({"id": "job-1", "skills": ["/demo"]})
+
+    assert partial == [
+        {
+            "name": "bundle:/demo",
+            "state": "bundle",
+            "loaded": ["member-a"],
+            "missing": ["member-b"],
+        }
+    ]
+    assert complete == [
+        {
+            "name": "bundle:/demo",
+            "state": "bundle",
+            "loaded": ["member-a", "member-b"],
+            "missing": [],
+        }
+    ]
+    assert "loaded body" not in json.dumps(partial)
+    assert partial != complete
 
 
 def test_absolute_skill_body_change_keeps_persistent_root(
