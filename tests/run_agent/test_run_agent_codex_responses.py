@@ -1,3 +1,4 @@
+import copy
 import sys
 import types
 from types import SimpleNamespace
@@ -2063,6 +2064,47 @@ def test_interim_codex_commentary_force_redacts_secrets_before_callback(monkeypa
     assert observed[0] != f"Using {secret} for the next check."
 
 
+def test_interim_codex_commentary_redacts_url_credentials_before_callback(monkeypatch):
+    import agent.redact as redact_module
+
+    agent = _build_agent(monkeypatch)
+    observed = []
+    setattr(
+        agent,
+        "interim_assistant_callback",
+        lambda text, *, already_streamed=False: observed.append(text),
+    )
+    monkeypatch.setattr(redact_module, "_REDACT_ENABLED", False)
+    commentary = (
+        "Checking https://user:password@example.com/cb?code=oauth-code"
+        "&access_token=opaque-token&signature=presigned-value&state=public-state"
+    )
+
+    assistant_msg = {
+        "role": "assistant",
+        "content": "",
+        "codex_message_items": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "content": [{"type": "output_text", "text": commentary}],
+            }
+        ],
+    }
+    raw_items = copy.deepcopy(assistant_msg["codex_message_items"])
+
+    agent._emit_interim_assistant_message(assistant_msg)
+
+    assert len(observed) == 1
+    assert "user:password" not in observed[0]
+    assert "oauth-code" not in observed[0]
+    assert "opaque-token" not in observed[0]
+    assert "presigned-value" not in observed[0]
+    assert "state=public-state" in observed[0]
+    assert assistant_msg["codex_message_items"] == raw_items
+
+
 def test_interim_codex_commentary_fails_closed_when_redaction_fails(monkeypatch, caplog):
     agent = _build_agent(monkeypatch)
     observed = []
@@ -2076,7 +2118,7 @@ def test_interim_codex_commentary_fails_closed_when_redaction_fails(monkeypatch,
     def fail_redaction(text, *, force=False):
         raise RuntimeError(text)
 
-    monkeypatch.setattr("run_agent.redact_sensitive_text", fail_redaction)
+    monkeypatch.setattr("run_agent.redact_visible_text", fail_redaction)
     agent._emit_interim_assistant_message(
         {
             "role": "assistant",

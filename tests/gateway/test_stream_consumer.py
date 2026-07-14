@@ -1867,6 +1867,35 @@ class TestOnNewMessageCallback:
         assert events == ["reset"]
 
     @pytest.mark.asyncio
+    async def test_visible_update_callback_fires_only_on_successful_edit(self):
+        """Visible stream edits refresh silence tracking without becoming new bubbles."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_1")
+        )
+        adapter.edit_message = AsyncMock(
+            side_effect=[
+                SimpleNamespace(success=True),
+                SimpleNamespace(success=False, error="edit rejected"),
+            ]
+        )
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        visible_updates = []
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat",
+            on_visible_update=lambda: visible_updates.append("visible"),
+        )
+
+        assert await consumer._send_or_edit("Hello") is True
+        assert visible_updates == []
+        assert await consumer._send_or_edit("Hello world") is True
+        assert visible_updates == ["visible"]
+        assert await consumer._send_or_edit("Hello world again") is False
+        assert visible_updates == ["visible"]
+
+    @pytest.mark.asyncio
     async def test_callback_fires_on_commentary(self):
         """Commentary messages are fresh bubbles too — fire the callback."""
         adapter = MagicMock()

@@ -123,6 +123,7 @@ class GatewayStreamConsumer:
         config: Optional[StreamConsumerConfig] = None,
         metadata: Optional[dict] = None,
         on_new_message: Optional[callable] = None,
+        on_visible_update: Optional[Callable[[], Any]] = None,
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
         run_still_current: Optional[Callable[[], bool]] = None,
@@ -139,6 +140,10 @@ class GatewayStreamConsumer:
         # the content, not edit the old bubble above it.
         # Called with no arguments. Exceptions are swallowed.
         self._on_new_message = on_new_message
+        # Fired after a successful in-place stream edit or native draft frame.
+        # Gateways use this to distinguish visible model output from silence
+        # without changing the fresh-message callback's ordering semantics.
+        self._on_visible_update = on_visible_update
         # Fired once when the stream transitions into its finalization path.
         # Gateway callers use this to pause typing refreshes before a slow
         # final rich-text edit (Telegram MarkdownV2 finalize, etc.).
@@ -338,6 +343,16 @@ class GatewayStreamConsumer:
             cb()
         except Exception:
             logger.debug("on_new_message callback error", exc_info=True)
+
+    def _notify_visible_update(self) -> None:
+        """Fire the in-place visible-update callback, swallowing any errors."""
+        cb = self._on_visible_update
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception:
+            logger.debug("on_visible_update callback error", exc_info=True)
 
     def _reset_segment_state(self, *, preserve_no_edit: bool = False) -> None:
         if preserve_no_edit and self._message_id == "__no_edit__":
@@ -1337,6 +1352,7 @@ class GatewayStreamConsumer:
             return False
         # Frame delivered.  Track text for parity with edit-based no-op skip.
         self._last_sent_text = text
+        self._notify_visible_update()
         return True
 
     async def _flush_segment_tail_on_edit_failure(self) -> None:
@@ -1804,6 +1820,7 @@ class GatewayStreamConsumer:
                             self._last_sent_text = text
                         # Successful edit — reset flood strike counter
                         self._flood_strikes = 0
+                        self._notify_visible_update()
                         return True
                     else:
                         immediate_final_fallback = False

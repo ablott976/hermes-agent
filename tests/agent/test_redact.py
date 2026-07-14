@@ -588,6 +588,41 @@ class TestWebUrlsNotRedacted:
         assert "dbpass" not in result
 
 
+class TestVisibleTextRedaction:
+    """Visible progress text masks URL credentials without changing tool text."""
+
+    def test_masks_sensitive_query_params_and_userinfo(self):
+        from agent.redact import redact_visible_text
+
+        text = (
+            "Use https://user:password@example.com/cb?code=oauth-code"
+            "&access_token=opaque-token&signature=presigned-value"
+            "&x-amz-signature=aws-value&state=public-state"
+        )
+
+        result = redact_visible_text(text)
+
+        assert "user:password" not in result
+        assert "oauth-code" not in result
+        assert "opaque-token" not in result
+        assert "presigned-value" not in result
+        assert "aws-value" not in result
+        assert "state=public-state" in result
+        assert redact_visible_text(result) == result
+
+    @pytest.mark.parametrize("scheme", ["ssh", "git", "sftp", "ftps"])
+    def test_masks_transport_url_userinfo(self, scheme):
+        from agent.redact import redact_visible_text
+
+        text = f"Clone {scheme}://deploy:transport-password@example.com/repo"
+
+        result = redact_visible_text(text)
+
+        assert "transport-password" not in result
+        assert result == f"Clone {scheme}://deploy:***@example.com/repo"
+        assert redact_visible_text(result) == result
+
+
 class TestBareTokenUserinfoRedaction:
     """Regression tests for #6396 — a bare credential in URL userinfo
     (``scheme://TOKEN@host``, no ``user:pass`` colon) is redacted. This is the

@@ -18328,6 +18328,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             config=_consumer_cfg,
                             metadata=_status_thread_metadata,
                             on_new_message=_on_stream_consumer_new_message,
+                            on_visible_update=_mark_visible_progress,
                             on_before_finalize=_pause_typing_before_finalize,
                             initial_reply_to_id=event_message_id,
                             run_still_current=_run_still_current,

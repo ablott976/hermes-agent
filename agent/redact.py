@@ -278,11 +278,12 @@ _URL_WITH_QUERY_RE = re.compile(
     r"(#\S*)?",                       # optional fragment
 )
 
-# URLs containing userinfo — `scheme://user:password@host` for ANY scheme
-# (not just DB protocols already covered by _DB_CONNSTR_RE above).
-# Catches things like `https://user:token@api.example.com/v1/foo`.
+# URLs containing userinfo — `scheme://user:password@host` for web and
+# transport schemes (not just DB protocols handled by _DB_CONNSTR_RE above).
+# Catches both navigable URLs and credential-bearing git/SSH remotes.
 _URL_USERINFO_RE = re.compile(
-    r"(https?|wss?|ftp)://([^/\s:@]+):([^/\s@]+)@",
+    r"(https?|wss?|git|ssh|ftp|ftps|sftp)://([^/\s:@]+):([^/\s@]+)@",
+    re.IGNORECASE,
 )
 
 # HTTP access logs often use a relative request target rather than a full URL:
@@ -400,7 +401,7 @@ def _redact_url_query_params(text: str) -> str:
 
 
 def _redact_url_userinfo(text: str) -> str:
-    """Strip `user:password@` from HTTP/WS/FTP URLs.
+    """Mask `user:password@` in web and transport URLs.
 
     DB protocols (postgres, mysql, mongodb, redis, amqp) are handled
     separately by `_DB_CONNSTR_RE`.
@@ -429,6 +430,22 @@ def redact_cdp_url(value: object) -> str:
     -- see ``tools.browser_supervisor._redact_cdp_error_text``.
     """
     text = redact_sensitive_text("" if value is None else str(value))
+    if not text:
+        return text
+    text = _redact_url_query_params(text)
+    text = _redact_url_userinfo(text)
+    return text
+
+
+def redact_visible_text(value: object) -> str:
+    """Force-redact credentials at a user-visible output boundary.
+
+    Tool-facing text keeps web URL query values intact so workflows can use
+    OAuth callbacks, magic links, and pre-signed URLs. Visible progress text
+    has no such need, so it also masks sensitive query params and URL
+    userinfo without changing the global redaction contract.
+    """
+    text = redact_sensitive_text("" if value is None else str(value), force=True)
     if not text:
         return text
     text = _redact_url_query_params(text)
