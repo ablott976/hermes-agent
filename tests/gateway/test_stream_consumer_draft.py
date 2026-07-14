@@ -125,11 +125,17 @@ class TestDraftStreamingHappyPath:
     @pytest.mark.asyncio
     async def test_dm_stream_animates_draft_then_finalizes_with_send(self):
         adapter = _make_draft_capable_adapter()
+        visible_updates = []
         cfg = StreamConsumerConfig(
             transport="auto", chat_type="dm",
             edit_interval=0.01, buffer_threshold=5, cursor="",
         )
-        consumer = GatewayStreamConsumer(adapter, "12345", cfg)
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "12345",
+            cfg,
+            on_visible_update=lambda: visible_updates.append("visible"),
+        )
 
         consumer.on_delta("Hello ")
         task = asyncio.create_task(consumer.run())
@@ -143,6 +149,7 @@ class TestDraftStreamingHappyPath:
         assert len(adapter.draft_calls) >= 1, (
             "expected at least one send_draft frame"
         )
+        assert len(visible_updates) == len(adapter.draft_calls)
         # Final draft frame held the full accumulated text.
         assert adapter.draft_calls[-1]["content"] == "Hello world!"
         # All draft frames in this run shared a single draft_id (animation).
@@ -184,6 +191,22 @@ class TestDraftStreamingHappyPath:
 class TestDraftFallbackOnFailure:
     """When a draft frame fails, the consumer disables drafts for the rest
     of the response and continues via the edit-based path."""
+
+    @pytest.mark.asyncio
+    async def test_rejected_draft_does_not_report_visible_update(self):
+        adapter = _make_draft_capable_adapter(draft_succeeds=False)
+        visible_updates = []
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "12345",
+            StreamConsumerConfig(transport="draft", chat_type="dm"),
+            on_visible_update=lambda: visible_updates.append("visible"),
+        )
+        consumer._draft_id = 123
+        consumer._use_draft_streaming = True
+
+        assert await consumer._send_draft_frame("Not delivered") is False
+        assert visible_updates == []
 
     @pytest.mark.asyncio
     async def test_first_draft_failure_disables_drafts_for_run(self):

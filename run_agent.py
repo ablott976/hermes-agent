@@ -147,7 +147,7 @@ from tools.browser_tool import cleanup_browser
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import sanitize_context
 from agent.error_classifier import FailoverReason
-from agent.redact import redact_sensitive_text
+from agent.redact import redact_sensitive_text, redact_visible_text
 from agent.model_metadata import (
     estimate_request_tokens_rough,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.estimate_request_tokens_rough")
     is_local_endpoint,
@@ -4717,7 +4717,7 @@ class AIAgent:
         if not commentary:
             return ""
         try:
-            return redact_sensitive_text(commentary, force=True)
+            return redact_visible_text(commentary)
         except Exception:
             # A failing redactor may include its input in the exception. Keep
             # the warning fixed so neither the visible text nor a traceback is logged.

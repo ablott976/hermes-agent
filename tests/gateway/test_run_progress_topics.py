@@ -714,6 +714,35 @@ class CommentaryResetsHeartbeatAgent:
         }
 
 
+class StreamingUpdatesResetHeartbeatAgent:
+    """Visible in-place stream edits must keep the fallback silence clock fresh."""
+
+    def __init__(self, **kwargs):
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.tools = []
+
+    def get_activity_summary(self):
+        return {
+            "api_call_count": 2,
+            "max_iterations": 50,
+            "current_tool": None,
+            "last_activity_desc": "receiving stream response",
+        }
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        assert self.stream_delta_callback is not None
+        chunks = ["Visible", " stream", " keeps", " updating", "."]
+        for chunk in chunks:
+            self.stream_delta_callback(chunk)
+            time.sleep(0.2)
+        return {
+            "final_response": "".join(chunks),
+            "response_previewed": True,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class PreviewedResponseAgent:
     def __init__(self, **kwargs):
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
@@ -1096,6 +1125,56 @@ async def test_run_agent_separate_heartbeat_waits_after_human_commentary(
         for call in adapter.sent
     )
     assert adapter.edits == []
+
+
+@pytest.mark.asyncio
+async def test_run_agent_separate_heartbeat_waits_while_stream_edits_are_visible(
+    monkeypatch, tmp_path
+):
+    gateway_run = importlib.import_module("gateway.run")
+    original_float_env = gateway_run._float_env
+    monkeypatch.setattr(
+        gateway_run,
+        "_float_env",
+        lambda name, default: (
+            0.35
+            if name == "HERMES_AGENT_NOTIFY_INTERVAL"
+            else original_float_env(name, default)
+        ),
+    )
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        StreamingUpdatesResetHeartbeatAgent,
+        session_id="sess-stream-edits-reset-separate-heartbeat",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "interim_assistant_messages": False,
+                "long_running_notifications": "separate",
+            },
+            "streaming": {
+                "enabled": True,
+                "transport": "edit",
+                "edit_interval": 0.01,
+                "buffer_threshold": 1,
+                "cursor": "",
+            },
+        },
+        adapter_cls=MetadataEditProgressCaptureAdapter,
+        chat_type="dm",
+        chat_id="5049627574",
+        thread_id="",
+    )
+
+    assert result["final_response"] == "Visible stream keeps updating."
+    assert adapter.edits, "expected successful in-place streaming edits"
+    assert not any(
+        "working" in call["content"].lower()
+        or "trabajando" in call["content"].lower()
+        for call in adapter.sent
+    )
 
 
 @pytest.mark.asyncio

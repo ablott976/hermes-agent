@@ -436,6 +436,22 @@ def redact_cdp_url(value: object) -> str:
     return text
 
 
+def redact_visible_text(value: object) -> str:
+    """Force-redact credentials at a user-visible output boundary.
+
+    Tool-facing text keeps web URL query values intact so workflows can use
+    OAuth callbacks, magic links, and pre-signed URLs. Visible progress text
+    has no such need, so it also masks sensitive query params and URL
+    userinfo without changing the global redaction contract.
+    """
+    text = redact_sensitive_text("" if value is None else str(value), force=True)
+    if not text:
+        return text
+    text = _redact_url_query_params(text)
+    text = _redact_url_userinfo(text)
+    return text
+
+
 def _redact_http_request_target_query_params(text: str) -> str:
     """Redact sensitive query params in HTTP access-log request targets."""
     def _sub(m: re.Match) -> str:
