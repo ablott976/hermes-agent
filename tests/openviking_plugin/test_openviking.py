@@ -361,7 +361,7 @@ class TestOpenVikingSkillQuerySafety:
         assert provider.prefetch("What should we recall?", session_id="session-test") == ""
         assert FakeRecallClient.calls == []
 
-    def test_sync_turn_uses_current_session_api_and_honors_char_limits(self, monkeypatch):
+    def test_sync_turn_preserves_peer_id_and_honors_char_limits(self, monkeypatch):
         calls = []
 
         class CurrentApiClient:
@@ -418,7 +418,7 @@ class TestOpenVikingSkillQuerySafety:
                 {
                     "role": "assistant",
                     "parts": [{"type": "text", "text": "ghi"}],
-                    "role_id": "hermes",
+                    "peer_id": "hermes",
                 },
             ),
         ]
@@ -495,6 +495,23 @@ class TestOpenVikingSkillQuerySafety:
         assert paths.count("/api/v1/sessions/session-1/messages/batch") == 1
         assert paths.count("/api/v1/sessions/session-1/messages") == 4
         assert "/api/v1/sessions" not in paths
+        assistant_payloads = {
+            payload["parts"][0]["text"]: payload
+            for path, payload in calls
+            if path.endswith("/messages") and payload.get("role") == "assistant"
+        }
+        assert assistant_payloads == {
+            "first assistant": {
+                "role": "assistant",
+                "parts": [{"type": "text", "text": "first assistant"}],
+                "peer_id": "hermes",
+            },
+            "second assistant": {
+                "role": "assistant",
+                "parts": [{"type": "text", "text": "second assistant"}],
+                "peer_id": "hermes",
+            },
+        }
 
     def test_batch_server_error_never_falls_back_to_single_messages(self, monkeypatch):
         calls = []

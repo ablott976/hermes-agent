@@ -2435,14 +2435,6 @@ class OpenVikingMemoryProvider(MemoryProvider):
             return mode
 
     @staticmethod
-    def _single_message_payload(message: Dict[str, Any]) -> Dict[str, Any]:
-        payload = dict(message)
-        peer_id = payload.pop("peer_id", None)
-        if peer_id and not payload.get("role_id"):
-            payload["role_id"] = peer_id
-        return payload
-
-    @staticmethod
     def _limit_sync_messages(
         messages: List[Dict[str, Any]],
         *,
@@ -2524,7 +2516,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 try:
                     client.post(
                         f"/api/v1/sessions/{sid}/messages",
-                        self._single_message_payload(message),
+                        dict(message),
                     )
                 except Exception as exc:
                     # The server may have persisted the message before a
