@@ -196,8 +196,9 @@ agent↔Nous wire contract lives in `docs/chronos-managed-cron-contract.md`.
 5. The fingerprint covers the prompt, configured skill identities and availability, script/context references, model/provider/API mode, effective tool schemas, system/context contract, and workdir. The loaded skill body stays frozen in the durable conversation, so curator edits do not fork or rewrite a live lineage; changing a configured skill identity/list or any other contract axis still forks a new root and performs a full bootstrap.
 6. The active tip is ended with `cron_waiting` between ticks and reopened for the next run. Pause preserves the pointer; switching to fresh clears it; removal prevents future continuation without deleting session history.
 7. `run_one_job()` passes per-turn tool-call metadata into the atomic run marker. For workspace-scoped persistent jobs (`workdir` set), two consecutive successful silence-marker responses with zero tool calls increment `persistent_silent_ticks`, record both runs, and pause the finite job. Persistent jobs without `workdir`, fresh jobs, and `no_agent` jobs ignore this guard. Useful output, a tool-using silent tick, failure, interruption, a new root, explicit resume/trigger, or a mode change clears the counter. Interrupted ticks clear it through a separate locked mutation without being counted as completed.
+8. `_resolve_cron_max_iterations()` keeps fresh jobs on the profile-wide agent budget. Persistent jobs use `min(agent.max_turns, cron.persistent_max_turns)` with a safe default of 12, and their prompt requires exactly one bounded milestone plus a compact handoff before stopping.
 
-Persistent mode is rejected for `no_agent=True`. The silence counter is internal and immutable through public surfaces. Per-tick output records input/cache-read/output tokens, model/tool calls, and elapsed time. This exposes whether provider prefix caching is actually being used without assuming a provider-specific cache implementation.
+Persistent mode is rejected for `no_agent=True`. The silence counter is internal and immutable through public surfaces. Scheduler-created cron agents also set memory/skill nudge intervals to zero, preventing post-tick background reviews from spending against the persistent context. Per-tick output records input/cache-read/output tokens, model/tool calls, and elapsed time. This exposes whether provider prefix caching is actually being used without assuming a provider-specific cache implementation.
 
 ## Skill-Backed Jobs
 
@@ -232,7 +233,7 @@ The script timeout defaults to 3600 seconds (1 hour). `_get_script_timeout()` re
 3. **Config** — `cron.script_timeout_seconds` in `config.yaml` (read via `load_config()`)
 4. **Default** — 3600 seconds (1 hour)
 
-This timeout bounds the **pre-run script only**, not the agent. Skill-based / LLM-driven jobs run on a separate *inactivity*-based budget (`HERMES_CRON_TIMEOUT`, default 600s of idle time, `0` = unlimited) — they can run for hours as long as they keep calling tools or streaming tokens, and are only killed after the configured idle period with no activity. Scripts are dispatched to a persistent thread pool (not held under the tick lock), so a long-running script does not block other due jobs from firing.
+This timeout bounds the **pre-run script only**, not the agent. Skill-based / LLM-driven jobs also use a separate *inactivity*-based budget (`HERMES_CRON_TIMEOUT`, default 600s of idle time, `0` = unlimited). Fresh jobs can keep running while active up to their normal agent budget; persistent jobs additionally stop at their milestone-sized `cron.persistent_max_turns` budget. Scripts are dispatched to a persistent thread pool (not held under the tick lock), so a long-running script does not block other due jobs from firing.
 
 ### Provider Recovery
 

@@ -21,9 +21,11 @@ from cron.scheduler import (
     _base_url_contract,
     _load_persistent_cron_history,
     _persistent_skill_contract,
+    _resolve_cron_max_iterations,
     run_job,
     run_one_job,
 )
+from hermes_cli.config import DEFAULT_CONFIG
 from hermes_state import SessionDB as RealSessionDB
 
 
@@ -85,6 +87,7 @@ class FakeSessionStore:
 
 class FakeAgent:
     calls: list[dict[str, Any]] = []
+    instances: list["FakeAgent"] = []
     fail_next = False
     system_contract = "stable-system-contract"
 
@@ -100,6 +103,10 @@ class FakeAgent:
         ]
         self.session_id = kwargs["session_id"]
         self._session_db = kwargs["session_db"]
+        self.max_iterations = kwargs["max_iterations"]
+        self._memory_nudge_interval = 10
+        self._skill_nudge_interval = 10
+        type(self).instances.append(self)
 
     def _build_system_prompt_parts(self, _system_message=None):
         return {
@@ -178,6 +185,7 @@ class FakeAgent:
 def persistent_env(tmp_path, monkeypatch):
     store = FakeSessionStore()
     FakeAgent.calls = []
+    FakeAgent.instances = []
     FakeAgent.fail_next = False
     FakeAgent.system_contract = "stable-system-contract"
 
@@ -233,6 +241,66 @@ def test_fresh_remains_default_and_persistent_rejects_script_only(persistent_env
             no_agent=True,
             session_mode="persistent",
         )
+
+
+@pytest.mark.parametrize(
+    ("job", "cfg", "expected"),
+    [
+        ({"session_mode": "fresh"}, {"agent": {"max_turns": 300}}, 300),
+        ({"session_mode": "persistent"}, {"agent": {"max_turns": 300}}, 12),
+        ({"session_mode": "persistent"}, {"agent": {"max_turns": 8}}, 8),
+        (
+            {"session_mode": "persistent"},
+            {"agent": {"max_turns": 300}, "cron": {"persistent_max_turns": 20}},
+            20,
+        ),
+        (
+            {"session_mode": "persistent"},
+            {"agent": {"max_turns": 300}, "cron": {"persistent_max_turns": 0}},
+            12,
+        ),
+        (
+            {"session_mode": "persistent"},
+            {"agent": {"max_turns": 300}, "cron": {"persistent_max_turns": "many"}},
+            12,
+        ),
+        (
+            {"session_mode": "persistent"},
+            {"agent": {"max_turns": 300}, "cron": {"persistent_max_turns": True}},
+            12,
+        ),
+    ],
+)
+def test_persistent_ticks_use_a_bounded_iteration_budget(job, cfg, expected):
+    assert DEFAULT_CONFIG["cron"]["persistent_max_turns"] == 12
+    assert _resolve_cron_max_iterations(job, cfg) == expected
+
+
+def test_scheduler_applies_persistent_budget_and_disables_background_review(
+    persistent_env,
+):
+    job = _create_persistent_job()
+
+    assert run_job(job)[0] is True
+
+    agent = FakeAgent.instances[-1]
+    assert agent.max_iterations == 12
+    assert agent._memory_nudge_interval == 0
+    assert agent._skill_nudge_interval == 0
+
+
+def test_scheduler_reads_persistent_budget_override_from_config(
+    persistent_env,
+    tmp_path,
+):
+    (tmp_path / "config.yaml").write_text(
+        "agent:\n  max_turns: 30\ncron:\n  persistent_max_turns: 7\n",
+        encoding="utf-8",
+    )
+
+    assert run_job(_create_persistent_job())[0] is True
+
+    assert FakeAgent.instances[-1].max_iterations == 7
 
 
 def test_switching_to_fresh_clears_scheduler_owned_continuation_state(persistent_env):
@@ -321,8 +389,12 @@ def test_second_tick_resumes_same_conversation_with_compact_prompt(persistent_en
     first_call, second_call = FakeAgent.calls
     assert first_call["session_id"] == second_call["session_id"]
     assert "Implement the next verified milestone." in first_call["prompt"]
+    assert "exactly one bounded milestone" in first_call["prompt"]
+    assert "changed, checks, next_action, and blockers" in first_call["prompt"]
     assert "CRON CONTINUATION" in second_call["prompt"]
     assert "Implement the next verified milestone." not in second_call["prompt"]
+    assert "exactly one bounded milestone" in second_call["prompt"]
+    assert "Do not begin another milestone in this tick" in second_call["prompt"]
     assert [message["role"] for message in second_call["history"]] == [
         "user",
         "assistant",
