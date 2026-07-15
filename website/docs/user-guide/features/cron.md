@@ -97,7 +97,7 @@ cronjob(
 
 A persistent job loads its full prompt and skills on the first run. Later runs add a compact continuation turn plus any new script or upstream-job data, which keeps the stable conversation prefix available for provider prompt caching. Each tick is limited to one bounded milestone and ends with a compact `changed` / `checks` / `next_action` / `blockers` handoff for the following tick. Automatic memory/skill background reviews are disabled for cron agents so they do not add hidden model calls after the milestone finishes.
 
-Persistent ticks use at most 12 agent turns by default, or a lower profile-wide `agent.max_turns` value. Change the milestone budget globally when needed:
+Persistent ticks use at most 12 agent turns by default, or a lower profile-wide `agent.max_turns` value. On the Codex app-server runtime, Hermes enforces the same budget against completed tool iterations inside the otherwise opaque Codex turn. Change the milestone budget globally when needed:
 
 ```yaml
 cron:

@@ -85,6 +85,29 @@ class TestRunConversationCodexPath:
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
+    def test_max_iterations_is_forwarded_to_codex_tool_budget(self, monkeypatch):
+        captured = {}
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            captured.update(kwargs)
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                turn_id="turn-budget-1",
+                thread_id="thread-budget-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "thread-budget-1"
+        )
+        agent = _make_codex_agent(max_iterations=7, platform="cron")
+
+        result = agent.run_conversation("bounded work")
+
+        assert result["completed"] is True
+        assert captured["max_tool_iterations"] == 7
+
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(
