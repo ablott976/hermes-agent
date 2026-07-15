@@ -14,8 +14,10 @@ import pytest
 def temp_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME so jobs.json doesn't touch the real store."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    # cron.jobs caches no home at import; get_hermes_home() reads the env live.
-    yield tmp_path
+    from cron.jobs import use_cron_store
+
+    with use_cron_store(tmp_path):
+        yield tmp_path
 
 
 def test_claim_succeeds_once_then_blocks(temp_home):
