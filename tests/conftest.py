@@ -360,6 +360,30 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
 
+    # ``cron.jobs`` intentionally keeps default-store paths as module-level
+    # compatibility constants.  If another test plugin imports that module
+    # during collection, changing HERMES_HOME here is too late unless those
+    # cached paths are re-anchored as well.  Without this guard, cron tests can
+    # create jobs in a developer's live profile even though the environment is
+    # otherwise hermetic.
+    import cron.jobs as _cron_jobs
+
+    fake_cron_dir = fake_hermes_home / "cron"
+    monkeypatch.setattr(_cron_jobs, "HERMES_DIR", fake_hermes_home)
+    monkeypatch.setattr(_cron_jobs, "CRON_DIR", fake_cron_dir)
+    monkeypatch.setattr(_cron_jobs, "JOBS_FILE", fake_cron_dir / "jobs.json")
+    monkeypatch.setattr(_cron_jobs, "OUTPUT_DIR", fake_cron_dir / "output")
+    monkeypatch.setattr(
+        _cron_jobs,
+        "TICKER_HEARTBEAT_FILE",
+        fake_cron_dir / "ticker_heartbeat",
+    )
+    monkeypatch.setattr(
+        _cron_jobs,
+        "TICKER_SUCCESS_FILE",
+        fake_cron_dir / "ticker_last_success",
+    )
+
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.
     monkeypatch.setenv("TZ", "UTC")
