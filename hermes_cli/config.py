@@ -2690,6 +2690,11 @@ DEFAULT_CONFIG = {
         # 1 = serial (pre-v0.9 behaviour).
         # Also overridable via HERMES_CRON_MAX_PARALLEL env var.
         "max_parallel_jobs": None,
+        # Persistent jobs are finite continuations. Bound each tick to one
+        # milestone-sized agent loop instead of inheriting a profile-wide
+        # max_turns value that may be hundreds of calls. The global agent limit
+        # remains authoritative when it is lower than this value.
+        "persistent_max_turns": 12,
         # Per-job output-file retention: save_job_output keeps the N most
         # recent .md files and prunes older ones. 0 or negative disables
         # pruning (for operators who manage cleanup externally). Default 50.

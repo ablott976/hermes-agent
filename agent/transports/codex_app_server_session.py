@@ -370,6 +370,7 @@ class CodexAppServerSession:
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
+        max_tool_iterations: Optional[int] = None,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, while
         forwarding server-initiated approval requests and projecting items
@@ -380,6 +381,12 @@ class CodexAppServerSession:
         `turn/completed`, fast-fail and mark the session for retirement.
         Mirrors openclaw beta.8's post-tool completion watchdog (#81697)
         so a wedged codex doesn't burn the full turn deadline.
+
+        max_tool_iterations: optional hard cap on completed tool-shaped items
+        inside this Codex turn. Unlike the normal Hermes loop, app-server owns
+        its internal model/tool cycle, so this is the enforceable equivalent of
+        ``AIAgent.max_iterations``. Reaching the cap interrupts and retires the
+        turn before another tool can run.
         """
         # Pre-create the result so startup failures (codex subprocess can't
         # spawn, initialize handshake rejects, thread/start blows up) surface
@@ -444,6 +451,30 @@ class CodexAppServerSession:
             return result
 
         result.turn_id = (ts.get("turn") or {}).get("id")
+        tool_iteration_limit: Optional[int] = None
+        if max_tool_iterations is not None and not isinstance(max_tool_iterations, bool):
+            try:
+                parsed_limit = int(max_tool_iterations)
+                if parsed_limit > 0:
+                    tool_iteration_limit = parsed_limit
+            except (TypeError, ValueError):
+                pass
+
+        def _interrupt_at_tool_budget() -> bool:
+            if (
+                tool_iteration_limit is None
+                or result.tool_iterations < tool_iteration_limit
+            ):
+                return False
+            self._issue_interrupt(result.turn_id)
+            result.interrupted = True
+            result.error = (
+                "codex app-server tool iteration limit reached "
+                f"({result.tool_iterations}/{tool_iteration_limit})"
+            )
+            result.should_retire = True
+            return True
+
         deadline = time.monotonic() + turn_timeout
         turn_complete = False
         # Post-tool watchdog state. last_tool_completion_at is set whenever
@@ -501,6 +532,7 @@ class CodexAppServerSession:
                 # (e.g. _pending_file_changes for fileChange approvals) is
                 # up to date when we make the approval decision. Bounded
                 # to avoid starving the server-request response.
+                tool_budget_reached = False
                 for _ in range(8):
                     pending = self._client.take_notification(timeout=0)
                     if pending is None:
@@ -514,6 +546,9 @@ class CodexAppServerSession:
                     if proj.is_tool_iteration:
                         result.tool_iterations += 1
                         last_tool_completion_at = time.monotonic()
+                        if _interrupt_at_tool_budget():
+                            tool_budget_reached = True
+                            break
                     if proj.final_text is not None:
                         result.final_text = proj.final_text
                         if _has_turn_aborted_marker(proj.final_text):
@@ -523,6 +558,8 @@ class CodexAppServerSession:
                                 result.error
                                 or "codex reported turn_aborted"
                             )
+                if tool_budget_reached:
+                    break
                 self._handle_server_request(sreq)
                 # Activity counts as live signal — reset the post-tool
                 # quiet timer so an approval round-trip doesn't trip it.
@@ -560,6 +597,8 @@ class CodexAppServerSession:
                 # Arm/refresh the post-tool quiet watchdog whenever a
                 # tool-shaped item completes.
                 last_tool_completion_at = time.monotonic()
+                if _interrupt_at_tool_budget():
+                    break
             else:
                 # Any non-tool projected activity (assistant message,
                 # status update, etc.) means codex is still producing

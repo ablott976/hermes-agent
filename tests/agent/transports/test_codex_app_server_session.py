@@ -288,6 +288,35 @@ class TestRunTurn:
         # Each tool item produces (assistant, tool) — 2*2 + final assistant = 5 msgs
         assert len(r.projected_messages) == 5
 
+    def test_tool_iteration_budget_interrupts_and_retires_turn(self):
+        client = FakeClient()
+        for i, item_id in enumerate(("ex1", "ex2", "ex3"), start=1):
+            client.queue_notification(
+                "item/completed",
+                item={
+                    "type": "commandExecution", "id": item_id,
+                    "command": f"cmd{i}", "cwd": "/tmp",
+                    "status": "completed", "aggregatedOutput": "ok",
+                    "exitCode": 0, "commandActions": [],
+                },
+                threadId="t", turnId="tu1",
+            )
+
+        result = make_session(client).run_turn(
+            "do bounded work",
+            turn_timeout=2.0,
+            max_tool_iterations=2,
+        )
+
+        assert result.tool_iterations == 2
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert result.error == "codex app-server tool iteration limit reached (2/2)"
+        assert any(
+            method == "turn/interrupt" and params.get("turnId") == "turn-fake-001"
+            for method, params in client.requests
+        )
+
     def test_turn_start_failure_returns_error(self):
         client = FakeClient()
         from agent.transports.codex_app_server import CodexAppServerError

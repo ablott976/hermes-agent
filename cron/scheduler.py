@@ -51,6 +51,9 @@ from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_AGENT_MAX_TURNS = 90
+_DEFAULT_PERSISTENT_MAX_TURNS = 12
+
 
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     """Return a compact one-line failure message for chat delivery.
@@ -254,6 +257,46 @@ from cron.jobs import (
     save_job_output,
     set_persistent_session_state,
 )
+
+
+def _positive_int(value: Any, default: int) -> int:
+    """Return a positive integer or a conservative default."""
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _resolve_cron_max_iterations(job: dict, cfg: Any) -> int:
+    """Resolve the per-tick agent budget without widening the global limit.
+
+    Fresh jobs keep the historical profile-wide ``agent.max_turns`` budget.
+    Persistent jobs are finite continuations, so each tick gets a smaller
+    milestone-sized budget and hands off the next action to the following tick.
+    Operators can raise or lower that cap with ``cron.persistent_max_turns``;
+    the global agent limit remains the hard upper bound.
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    raw_agent_cfg = cfg.get("agent")
+    agent_cfg = raw_agent_cfg if isinstance(raw_agent_cfg, dict) else {}
+    global_limit = _positive_int(
+        agent_cfg.get("max_turns") or cfg.get("max_turns"),
+        _DEFAULT_AGENT_MAX_TURNS,
+    )
+    if normalize_session_mode(job.get("session_mode"), strict=False) != SESSION_MODE_PERSISTENT:
+        return global_limit
+
+    raw_cron_cfg = cfg.get("cron")
+    cron_cfg = raw_cron_cfg if isinstance(raw_cron_cfg, dict) else {}
+    persistent_limit = _positive_int(
+        cron_cfg.get("persistent_max_turns"),
+        _DEFAULT_PERSISTENT_MAX_TURNS,
+    )
+    return min(global_limit, persistent_limit)
+
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -2726,18 +2769,31 @@ def _build_job_prompt(
                 logger.warning("context_from: failed to read output for job %r: %s", source_job_id, e)
                 # silent skip — do not pollute the prompt with error messages
 
+    persistent_tick_hint = ""
+    if normalize_session_mode(job.get("session_mode"), strict=False) == SESSION_MODE_PERSISTENT:
+        persistent_tick_hint = (
+            "[PERSISTENT TICK CONTRACT: Execute exactly one bounded milestone "
+            "from the current plan or handoff, then stop. Run only the focused "
+            "verification needed for that milestone. Before responding, update "
+            "any existing durable plan/state checkpoint; do not invent a new "
+            "state file when none is configured. Do not begin another milestone "
+            "in this tick. End with a compact handoff covering changed, checks, "
+            "next_action, and blockers.]\n\n"
+        )
+
     # Keep the complete delivery contract in the bootstrap turn. Later turns
     # only need a compact continuation marker because the original contract is
     # already in the persisted conversation.
     if continuation:
         continuation_hint = (
             "[CRON CONTINUATION: Resume the same task from the exact point where "
-            "the previous turn ended. Complete the next useful milestone; do not "
-            "restate or reconstruct the full plan. Your final response is delivered "
-            "automatically. If there is genuinely nothing new to report, respond "
-            "with exactly \"[SILENT]\".]\n\n"
+            "the previous turn ended; do not restate or reconstruct the full plan. "
+            "Your final response is delivered automatically. If there is genuinely "
+            "nothing new to report, respond with exactly \"[SILENT]\".]\n\n"
         )
         prompt = continuation_hint + prompt
+        if persistent_tick_hint:
+            prompt += "\n\n" + persistent_tick_hint
         return _scan_assembled_cron_prompt(
             prompt,
             job,
@@ -2759,6 +2815,8 @@ def _build_job_prompt(
         "findings normally, or say [SILENT] and nothing more.]\n\n"
     )
     prompt = cron_hint + prompt
+    if persistent_tick_hint:
+        prompt += "\n\n" + persistent_tick_hint
     if skills is None:
         legacy = job.get("skill")
         skills = [legacy] if legacy else []
@@ -3713,8 +3771,16 @@ def run_job(
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
+        # Persistent jobs advance through bounded milestones across ticks instead
+        # of inheriting a profile-wide budget large enough to finish the whole
+        # plan in one run. Fresh jobs retain the historical global limit.
+        max_iterations = _resolve_cron_max_iterations(job, _cfg)
+        if _persistent_job:
+            logger.info(
+                "Persistent cron tick budget job=%s max_iterations=%d",
+                job_id,
+                max_iterations,
+            )
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
@@ -3893,6 +3959,13 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+
+        # A cron tick already has a finite execution contract and no user is
+        # present to approve autonomous self-improvement. Background memory/skill
+        # reviews would add hidden model calls over the full persistent context
+        # after the requested milestone has finished.
+        setattr(agent, "_memory_nudge_interval", 0)
+        setattr(agent, "_skill_nudge_interval", 0)
 
         if _persistent_job:
             assert _session_db is not None  # guarded before prompt construction
