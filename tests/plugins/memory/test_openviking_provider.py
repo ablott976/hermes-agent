@@ -2206,6 +2206,36 @@ def test_on_session_switch_commits_old_session_and_rotates_id():
     assert provider._turn_count == 0
 
 
+def test_auto_commit_false_skips_end_and_switch_commits(monkeypatch):
+    monkeypatch.setenv("OPENVIKING_AUTO_COMMIT", "false")
+    provider = _make_provider_with_session("old-sid", turn_count=3)
+
+    provider.on_session_end([])
+    provider.on_session_switch("new-sid", parent_session_id="old-sid")
+    assert provider._drain_finalizers(timeout=1.0)
+
+    client = provider._client
+    assert isinstance(client, MagicMock)
+    client.get.assert_not_called()
+    client.post.assert_not_called()
+    assert provider._session_id == "new-sid"
+    assert provider._turn_count == 0
+
+
+def test_min_commit_turns_blocks_early_commit(monkeypatch):
+    monkeypatch.setenv("OPENVIKING_AUTO_COMMIT", "true")
+    monkeypatch.setenv("OPENVIKING_MIN_COMMIT_TURNS", "5")
+    provider = _make_provider_with_session("old-sid", turn_count=4)
+
+    provider.on_session_end([])
+
+    client = provider._client
+    assert isinstance(client, MagicMock)
+    client.get.assert_not_called()
+    client.post.assert_not_called()
+    assert provider._turn_count == 4
+
+
 def test_on_session_switch_skips_commit_for_empty_old_session():
     """No turns accumulated → nothing to extract → no commit call."""
     provider = _make_provider_with_session("old-sid", turn_count=0)

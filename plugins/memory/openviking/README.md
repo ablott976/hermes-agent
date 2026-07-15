@@ -35,6 +35,19 @@ All config via environment variables in `.env`:
 | `OPENVIKING_ACCOUNT` | `default` | Tenant account for local/trusted mode |
 | `OPENVIKING_USER` | `default` | Tenant user for local/trusted mode |
 | `OPENVIKING_AGENT` | `hermes` | Hermes peer ID in OpenViking, used for peer-scoped memories |
+| `OPENVIKING_AUTO_SYNC` | `true` | Automatically mirror conversation turns into OpenViking sessions |
+| `OPENVIKING_AUTO_PREFETCH` | `true` | Automatically search and inject OpenViking context before a turn |
+| `OPENVIKING_AUTO_COMMIT` | `true` | Automatically commit sessions on end/switch; commits may invoke OpenViking summary/extraction models |
+| `OPENVIKING_MIN_COMMIT_TURNS` | `1` | Minimum mirrored turns required before an automatic commit |
+| `OPENVIKING_SYNC_USER_CHAR_LIMIT` | `4000` | Maximum user characters mirrored per simple turn |
+| `OPENVIKING_SYNC_ASSISTANT_CHAR_LIMIT` | `4000` | Maximum assistant characters mirrored per simple turn |
+| `OPENVIKING_PREFETCH_TOP_K` | `6` | Legacy fallback for automatic recall count when `OPENVIKING_RECALL_LIMIT` is unset |
+
+The three automatic lifecycle controls only gate implicit provider activity. Explicit
+`viking_search`, `viking_read`, `viking_remember`, `viking_forget`, and
+`viking_add_resource` calls remain available. For a low-cost explicit-only setup,
+set all three `OPENVIKING_AUTO_*` values to `false`; this also prevents automatic
+session commits from generating archive summaries.
 
 When `OPENVIKING_API_KEY` is set, Hermes lets OpenViking derive account/user
 identity from the key. In local or trusted deployments without an API key,

@@ -339,6 +339,192 @@ class TestOpenVikingSkillQuerySafety:
         assert provider._inflight_writers == {}
         assert RecordingVikingClient.calls == []
 
+    def test_auto_sync_false_skips_all_session_network_calls(self, monkeypatch):
+        RecordingVikingClient.calls = []
+        monkeypatch.setenv("OPENVIKING_AUTO_SYNC", "false")
+        monkeypatch.setattr(openviking_plugin, "_VikingClient", RecordingVikingClient)
+        provider = OpenVikingMemoryProvider()
+        provider._client = cast(Any, object())
+        provider._endpoint = "http://openviking.test"
+        provider._session_id = "session-1"
+
+        provider.sync_turn("user message", "assistant message")
+
+        assert provider._turn_count == 0
+        assert provider._inflight_writers == {}
+        assert RecordingVikingClient.calls == []
+
+    def test_auto_prefetch_false_skips_search(self, monkeypatch):
+        provider = make_prefetch_provider(monkeypatch, {})
+        monkeypatch.setenv("OPENVIKING_AUTO_PREFETCH", "false")
+
+        assert provider.prefetch("What should we recall?", session_id="session-test") == ""
+        assert FakeRecallClient.calls == []
+
+    def test_sync_turn_uses_current_session_api_and_honors_char_limits(self, monkeypatch):
+        calls = []
+
+        class CurrentApiClient:
+            session_exists = False
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def get(self, path, params=None, **kwargs):
+                calls.append(("get", path, params or {}))
+                if path == "/openapi.json":
+                    return {
+                        "paths": {
+                            "/api/v1/sessions/{session_id}/messages": {"post": {}},
+                        }
+                    }
+                if path == "/api/v1/sessions/session-1" and not self.__class__.session_exists:
+                    raise RuntimeError("NOT_FOUND")
+                return {"result": {"session_id": "session-1"}}
+
+            def post(self, path, payload=None, **kwargs):
+                payload = payload or {}
+                calls.append(("post", path, payload))
+                if path == "/api/v1/sessions":
+                    self.__class__.session_exists = True
+                    return {"result": {"session_id": payload["session_id"]}}
+                return {"result": {}}
+
+        monkeypatch.setenv("OPENVIKING_AUTO_SYNC", "true")
+        monkeypatch.setenv("OPENVIKING_SYNC_USER_CHAR_LIMIT", "4")
+        monkeypatch.setenv("OPENVIKING_SYNC_ASSISTANT_CHAR_LIMIT", "3")
+        monkeypatch.setattr(openviking_plugin, "_VikingClient", CurrentApiClient)
+        provider = OpenVikingMemoryProvider()
+        provider._client = cast(Any, object())
+        provider._endpoint = "http://openviking.test"
+        provider._account = "default"
+        provider._user = "default"
+        provider._agent = "hermes"
+        provider._session_id = "session-1"
+
+        provider.sync_turn("abcdef", "ghijk")
+        assert provider._drain_writers("session-1", timeout=5.0)
+
+        assert calls == [
+            ("get", "/openapi.json", {}),
+            (
+                "post",
+                "/api/v1/sessions/session-1/messages",
+                {"role": "user", "parts": [{"type": "text", "text": "abcd"}]},
+            ),
+            (
+                "post",
+                "/api/v1/sessions/session-1/messages",
+                {
+                    "role": "assistant",
+                    "parts": [{"type": "text", "text": "ghi"}],
+                    "role_id": "hermes",
+                },
+            ),
+        ]
+
+    def test_current_api_partial_write_is_not_retried_or_duplicated(self, monkeypatch):
+        roles = []
+
+        class PartialFailureClient:
+            instances = 0
+
+            def __init__(self, *args, **kwargs):
+                self.__class__.instances += 1
+
+            def get(self, path, params=None, **kwargs):
+                if path == "/openapi.json":
+                    return {
+                        "paths": {
+                            "/api/v1/sessions/{session_id}/messages": {"post": {}},
+                        }
+                    }
+                return {"result": {"session_id": "session-1"}}
+
+            def post(self, path, payload=None, **kwargs):
+                payload = payload or {}
+                if path.endswith("/messages"):
+                    roles.append(payload["role"])
+                    if payload["role"] == "assistant":
+                        raise RuntimeError("assistant write failed")
+                return {"result": {}}
+
+        monkeypatch.setenv("OPENVIKING_AUTO_SYNC", "true")
+        monkeypatch.setattr(openviking_plugin, "_VikingClient", PartialFailureClient)
+        provider = OpenVikingMemoryProvider()
+        provider._client = cast(Any, object())
+        provider._endpoint = "http://openviking.test"
+        provider._agent = "hermes"
+        provider._session_id = "session-1"
+
+        provider.sync_turn("user", "assistant")
+        assert provider._drain_writers("session-1", timeout=5.0)
+
+        assert PartialFailureClient.instances == 1
+        assert roles == ["user", "assistant"]
+
+    def test_missing_openapi_falls_back_only_on_batch_not_found(self, monkeypatch):
+        calls = []
+
+        class LegacyClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def get(self, path, params=None, **kwargs):
+                raise RuntimeError("openapi unavailable")
+
+            def post(self, path, payload=None, **kwargs):
+                calls.append((path, payload or {}))
+                if path.endswith("/messages/batch"):
+                    raise openviking_plugin._OpenVikingHTTPError("NOT_FOUND", 404)
+                return {"result": {}}
+
+        monkeypatch.setenv("OPENVIKING_AUTO_SYNC", "true")
+        monkeypatch.setattr(openviking_plugin, "_VikingClient", LegacyClient)
+        provider = OpenVikingMemoryProvider()
+        provider._client = cast(Any, object())
+        provider._endpoint = "http://openviking.test"
+        provider._agent = "hermes"
+        provider._session_id = "session-1"
+
+        provider.sync_turn("first user", "first assistant")
+        provider.sync_turn("second user", "second assistant")
+        assert provider._drain_writers("session-1", timeout=5.0)
+
+        paths = [path for path, _ in calls]
+        assert paths.count("/api/v1/sessions/session-1/messages/batch") == 1
+        assert paths.count("/api/v1/sessions/session-1/messages") == 4
+        assert "/api/v1/sessions" not in paths
+
+    def test_batch_server_error_never_falls_back_to_single_messages(self, monkeypatch):
+        calls = []
+
+        class ServerErrorClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def get(self, path, params=None, **kwargs):
+                raise RuntimeError("openapi unavailable")
+
+            def post(self, path, payload=None, **kwargs):
+                calls.append(path)
+                raise openviking_plugin._OpenVikingHTTPError("SERVER_ERROR", 500)
+
+        monkeypatch.setenv("OPENVIKING_AUTO_SYNC", "true")
+        monkeypatch.setattr(openviking_plugin, "_VikingClient", ServerErrorClient)
+        provider = OpenVikingMemoryProvider()
+        provider._client = cast(Any, object())
+        provider._endpoint = "http://openviking.test"
+        provider._session_id = "session-1"
+
+        provider.sync_turn("user", "assistant")
+        assert provider._drain_writers("session-1", timeout=5.0)
+
+        assert calls == [
+            "/api/v1/sessions/session-1/messages/batch",
+            "/api/v1/sessions/session-1/messages/batch",
+        ]
+
 
 class TestOpenVikingConfigSchema:
     def test_recall_policy_options_are_exposed_in_setup_schema(self):
@@ -366,8 +552,44 @@ class TestOpenVikingConfigSchema:
             "resources": False,
         }
 
+    def test_legacy_prefetch_top_k_controls_recall_when_new_limit_is_unset(self, monkeypatch):
+        monkeypatch.delenv("OPENVIKING_RECALL_LIMIT", raising=False)
+        monkeypatch.setenv("OPENVIKING_PREFETCH_TOP_K", "1")
+
+        assert OpenVikingMemoryProvider()._recall_config()["limit"] == 1
+
 
 class TestOpenVikingTurnConversion:
+    def test_limit_sync_messages_caps_text_and_tool_content(self):
+        messages = [
+            {"role": "user", "parts": [{"type": "text", "text": "abcdef"}]},
+            {"role": "assistant", "parts": [{"type": "text", "text": "12345"}]},
+            {
+                "role": "assistant",
+                "parts": [
+                    {
+                        "type": "tool",
+                        "tool_id": "call-1",
+                        "tool_name": "shell_command",
+                        "tool_input": {"command": "a very long command"},
+                        "tool_output": "XYZ",
+                        "tool_status": "completed",
+                    }
+                ],
+            },
+        ]
+
+        limited = OpenVikingMemoryProvider._limit_sync_messages(
+            messages,
+            user_limit=4,
+            assistant_limit=7,
+        )
+
+        assert limited[0]["parts"] == [{"type": "text", "text": "abcd"}]
+        assert limited[1]["parts"] == [{"type": "text", "text": "12345"}]
+        assert limited[2]["parts"][0]["tool_input"] == {}
+        assert limited[2]["parts"][0]["tool_output"] == "XY"
+
     def test_extract_current_turn_anchors_on_latest_matching_user_and_assistant(self):
         messages = [
             {"role": "user", "content": "Please inspect the repository for assemble hooks."},
