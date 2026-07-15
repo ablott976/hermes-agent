@@ -366,12 +366,14 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # cached paths are re-anchored as well.  Without this guard, cron tests can
     # create jobs in a developer's live profile even though the environment is
     # otherwise hermetic.
+    import cron as _cron_package
     import cron.jobs as _cron_jobs
 
     fake_cron_dir = fake_hermes_home / "cron"
     monkeypatch.setattr(_cron_jobs, "HERMES_DIR", fake_hermes_home)
     monkeypatch.setattr(_cron_jobs, "CRON_DIR", fake_cron_dir)
     monkeypatch.setattr(_cron_jobs, "JOBS_FILE", fake_cron_dir / "jobs.json")
+    monkeypatch.setattr(_cron_package, "JOBS_FILE", fake_cron_dir / "jobs.json")
     monkeypatch.setattr(_cron_jobs, "OUTPUT_DIR", fake_cron_dir / "output")
     monkeypatch.setattr(
         _cron_jobs,
