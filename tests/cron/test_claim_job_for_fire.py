@@ -7,6 +7,8 @@ claim for a given fire. Single-machine deployments always win (unaffected).
 These exercise the real store against a temp HERMES_HOME (no mocks) per the
 E2E-over-mocks discipline for file-touching code.
 """
+from datetime import datetime, timezone
+
 import pytest
 
 
@@ -32,6 +34,22 @@ def test_claim_succeeds_once_then_blocks(temp_home):
     assert claim_job_for_fire(jid) is True
     assert claim_job_for_fire(jid) is False
     assert get_job(jid)["next_run_at"] != before
+
+
+def test_interval_claim_advances_from_the_scheduled_slot(temp_home, monkeypatch):
+    from cron.jobs import claim_job_for_fire, create_job, get_job, load_jobs, save_jobs
+
+    now = datetime(2026, 7, 16, 22, 2, 19, tzinfo=timezone.utc)
+    monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+    job = create_job(prompt="x", schedule="every 1m", name="cadence")
+    jobs = load_jobs()
+    jobs[0]["next_run_at"] = "2026-07-16T22:00:27+00:00"
+    save_jobs(jobs)
+
+    assert claim_job_for_fire(job["id"]) is True
+    updated = get_job(job["id"])
+    assert updated is not None
+    assert updated["next_run_at"] == "2026-07-16T22:02:27+00:00"
 
 
 def test_claim_oneshot_cannot_be_double_claimed(temp_home):

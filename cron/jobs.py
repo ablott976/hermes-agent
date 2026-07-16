@@ -799,15 +799,27 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
         minutes = schedule.get("minutes")
         if minutes is None:
             return None
+        try:
+            interval = timedelta(minutes=float(minutes))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if interval.total_seconds() <= 0:
+            return None
         if last_run_at:
             try:
                 last = _ensure_aware(datetime.fromisoformat(last_run_at))
-                next_run = last + timedelta(minutes=minutes)
+                next_run = last + interval
+                if next_run <= now:
+                    missed = int(
+                        (now - next_run).total_seconds()
+                        // interval.total_seconds()
+                    ) + 1
+                    next_run += interval * missed
             except Exception:
-                next_run = now + timedelta(minutes=minutes)
+                next_run = now + interval
         else:
             # First run is now + interval
-            next_run = now + timedelta(minutes=minutes)
+            next_run = now + interval
         return next_run.isoformat()
 
     elif kind == "cron":
@@ -1911,8 +1923,38 @@ def mark_job_run(
                     )
                     return
                 
-                # Compute next run
-                job["next_run_at"] = compute_next_run(job["schedule"], now)
+                # Recurring jobs are pre-advanced before execution for crash
+                # safety. Preserve that scheduled occurrence when it is still
+                # future instead of rebasing from completion time: with a
+                # one-minute ticker, a few seconds of runtime otherwise make
+                # every one-minute interval fire only every two minutes.
+                schedule = job["schedule"]
+                kind = schedule.get("kind")
+                precomputed = job.get("next_run_at")
+                recurring_candidate = (
+                    compute_next_run(schedule, now)
+                    if kind in {"cron", "interval"}
+                    else None
+                )
+                precomputed_is_future = False
+                if kind in {"cron", "interval"} and precomputed:
+                    try:
+                        precomputed_is_future = _ensure_aware(
+                            datetime.fromisoformat(precomputed)
+                        ) > _hermes_now()
+                    except Exception:
+                        precomputed_is_future = False
+                if kind in {"cron", "interval"} and recurring_candidate is None:
+                    job["next_run_at"] = None
+                elif precomputed_is_future:
+                    job["next_run_at"] = precomputed
+                elif kind == "interval" and precomputed:
+                    job["next_run_at"] = compute_next_run(schedule, precomputed)
+                else:
+                    job["next_run_at"] = recurring_candidate or compute_next_run(
+                        schedule,
+                        now,
+                    )
 
                 # If no next run, decide whether this is terminal completion
                 # (one-shot) or a transient failure (recurring schedule couldn't
@@ -2064,7 +2106,12 @@ def advance_next_run(job_id: str) -> bool:
                 if kind not in {"cron", "interval"}:
                     return False
                 now = _hermes_now().isoformat()
-                new_next = compute_next_run(job["schedule"], now)
+                anchor = (
+                    job.get("next_run_at")
+                    if kind == "interval" and job.get("next_run_at")
+                    else now
+                )
+                new_next = compute_next_run(job["schedule"], anchor)
                 if new_next and new_next != job.get("next_run_at"):
                     job["next_run_at"] = new_next
                     save_jobs(jobs)
@@ -2137,7 +2184,12 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
             job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
-                nxt = compute_next_run(job["schedule"], now.isoformat())
+                anchor = (
+                    job.get("next_run_at")
+                    if kind == "interval" and job.get("next_run_at")
+                    else now.isoformat()
+                )
+                nxt = compute_next_run(job["schedule"], anchor)
                 if nxt:
                     job["next_run_at"] = nxt
             save_jobs(jobs)
