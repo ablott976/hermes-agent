@@ -55,11 +55,6 @@ class GatewayAuthorizationMixin:
             if profile_name == active_profile:
                 adapters = getattr(self, "adapters", None) or {}
                 return adapters.get(platform)
-            if profile_name == "default":
-                # A default-profile stamp belongs to self.adapters only on the
-                # default gateway.  On a dedicated named gateway, fail closed
-                # rather than send through that named profile's bot.
-                return None
             profile_adapters = getattr(self, "_profile_adapters", None) or {}
             if profile_name in profile_adapters:
                 return profile_adapters[profile_name].get(platform)

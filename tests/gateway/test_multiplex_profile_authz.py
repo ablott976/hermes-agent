@@ -142,6 +142,22 @@ def test_dedicated_named_profile_resolves_only_its_own_adapter():
     assert runner._authorization_adapter(Platform.TELEGRAM, "other") is None
 
 
+def test_dedicated_named_profile_resolves_multiplexed_default_adapter():
+    """A named multiplexer resolves default through its secondary registry."""
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    maker_adapter = MagicMock()
+    default_adapter = MagicMock()
+    runner.adapters = {Platform.TELEGRAM: maker_adapter}
+    runner._profile_adapters = {
+        "default": {Platform.TELEGRAM: default_adapter},
+    }
+    runner._active_profile_name = lambda: "maker"
+
+    assert runner._authorization_adapter(Platform.TELEGRAM, "default") is default_adapter
+
+
 def test_default_profile_stamp_still_resolves_on_default_gateway():
     """The default gateway keeps its existing stamped and unstamped routes."""
     from gateway.run import GatewayRunner
