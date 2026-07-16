@@ -320,17 +320,49 @@ def _jobs_lock():
 # caller to rewrite them could make one job resume another job's conversation.
 _IMMUTABLE_JOB_FIELDS = frozenset({
     "id",
+    "persistent_contract_forks",
+    "persistent_contract_update_pending",
     "persistent_silent_ticks",
     "session_root_id",
+    "session_runtime_contract",
     "session_runtime_fingerprint",
 })
 _INTERNAL_JOB_FIELDS = frozenset({
+    "persistent_contract_forks",
+    "persistent_contract_update_pending",
     "persistent_silent_ticks",
     "session_root_id",
+    "session_runtime_contract",
     "session_runtime_fingerprint",
 })
 
 _PERSISTENT_SILENT_PAUSE_THRESHOLD = 2
+_PERSISTENT_CONTRACT_FORK_PAUSE_THRESHOLD = 2
+_PERSISTENT_CONTRACT_UPDATE_FIELDS = frozenset({
+    "base_url",
+    "context_from",
+    "enabled_toolsets",
+    "model",
+    "prompt",
+    "provider",
+    "script",
+    "skill",
+    "skills",
+    "workdir",
+})
+_PERSISTENT_RUNTIME_CONTRACT_COMPONENTS = frozenset({
+    "api_mode",
+    "base_url",
+    "context_from",
+    "model",
+    "prompt",
+    "provider",
+    "script",
+    "skills",
+    "system_contract",
+    "tool_contract",
+    "workdir",
+})
 
 
 def public_job_view(job: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -471,8 +503,11 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
         # hand-edited/legacy persistent value as fresh and discard unusable
         # continuation metadata in the normalized public/runtime view.
         session_mode = SESSION_MODE_FRESH
+        normalized.pop("persistent_contract_forks", None)
+        normalized.pop("persistent_contract_update_pending", None)
         normalized.pop("persistent_silent_ticks", None)
         normalized.pop("session_root_id", None)
+        normalized.pop("session_runtime_contract", None)
         normalized.pop("session_runtime_fingerprint", None)
     normalized["session_mode"] = session_mode
 
@@ -1441,11 +1476,17 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 # Fresh is the historical default. Remove persistent continuation
                 # state so switching back later cannot revive a stale conversation.
                 updated.pop("session_mode", None)
+                updated.pop("persistent_contract_forks", None)
+                updated.pop("persistent_contract_update_pending", None)
                 updated.pop("persistent_silent_ticks", None)
                 updated.pop("session_root_id", None)
+                updated.pop("session_runtime_contract", None)
                 updated.pop("session_runtime_fingerprint", None)
             else:
                 updated["session_mode"] = SESSION_MODE_PERSISTENT
+                if _PERSISTENT_CONTRACT_UPDATE_FIELDS.intersection(updates):
+                    updated["persistent_contract_update_pending"] = uuid.uuid4().hex
+                    updated.pop("persistent_contract_forks", None)
                 # Explicit activation covers resume_job(), trigger_job(), and
                 # switching into persistent mode. A manual restart must get a
                 # fresh no-progress budget even when the durable root remains.
@@ -1453,6 +1494,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     "session_mode" in updates
                     or ("enabled" in updates and bool(updates.get("enabled")))
                 ):
+                    updated.pop("persistent_contract_forks", None)
                     updated.pop("persistent_silent_ticks", None)
 
             if schedule_changed:
@@ -1518,21 +1560,50 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     return None
 
 
+def _normalize_persistent_runtime_contract(value: Any) -> Dict[str, Any]:
+    """Validate the scheduler-owned map before it reaches durable storage."""
+    if not isinstance(value, dict) or value.get("version") != 4:
+        raise ValueError("persistent runtime contract must use version 4")
+    unexpected = set(value) - ({"version"} | _PERSISTENT_RUNTIME_CONTRACT_COMPONENTS)
+    missing = _PERSISTENT_RUNTIME_CONTRACT_COMPONENTS - set(value)
+    if unexpected or missing:
+        raise ValueError("persistent runtime contract has invalid components")
+    normalized: Dict[str, Any] = {"version": 4}
+    for name in sorted(_PERSISTENT_RUNTIME_CONTRACT_COMPONENTS):
+        digest = str(value.get(name) or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError(
+                f"persistent runtime contract component {name!r} must be a SHA-256 digest"
+            )
+        normalized[name] = digest
+    return normalized
+
+
 def set_persistent_session_state(
     job_id: str,
     root_session_id: str,
     runtime_fingerprint: str,
+    *,
+    runtime_contract: Optional[Dict[str, Any]] = None,
+    unexpected_fork: bool = False,
+    contract_update_token: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Persist scheduler-owned continuation state for a persistent job.
+    """Atomically persist continuation state and enforce the root-fork fuse.
 
-    This deliberately bypasses ``update_job`` because the two fields are
-    immutable through public/API update surfaces. The job lock keeps the write
-    atomic with scheduler, CLI, and tool mutations.
+    Runtime components contain only validated SHA-256 digests. A legacy job
+    without that map, an initial root, or an explicit contract update may fork
+    once without consuming the unexpected-fork budget. Two consecutive
+    unexplained forks pause before a third expensive bootstrap.
     """
     root = str(root_session_id or "").strip()
     fingerprint = str(runtime_fingerprint or "").strip()
     if not root or not fingerprint:
         raise ValueError("persistent session state requires a root id and fingerprint")
+    contract = (
+        _normalize_persistent_runtime_contract(runtime_contract)
+        if runtime_contract is not None
+        else None
+    )
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -1542,14 +1613,93 @@ def set_persistent_session_state(
             if normalize_session_mode(job.get("session_mode"), strict=False) != SESSION_MODE_PERSISTENT:
                 raise ValueError("persistent session state can only be set on a persistent job")
             updated = dict(job)
-            if updated.get("session_root_id") != root:
+            live_update_token = str(
+                updated.get("persistent_contract_update_pending") or ""
+            )
+            caller_update_token = str(contract_update_token or "")
+            if live_update_token != caller_update_token:
+                stale = _normalize_job_record(updated)
+                stale["_persistent_state_write_applied"] = False
+                return stale
+            root_changed = updated.get("session_root_id") != root
+            explicit_update = bool(live_update_token)
+            if explicit_update:
+                updated.pop("persistent_contract_update_pending", None)
+            legacy_contract = not isinstance(updated.get("session_runtime_contract"), dict)
+            count_unexpected = bool(
+                root_changed
+                and unexpected_fork
+                and not explicit_update
+                and not legacy_contract
+            )
+
+            if count_unexpected:
+                try:
+                    fork_count = max(0, int(updated.get("persistent_contract_forks") or 0)) + 1
+                except (TypeError, ValueError):
+                    fork_count = 1
+                updated["persistent_contract_forks"] = fork_count
+                if fork_count >= _PERSISTENT_CONTRACT_FORK_PAUSE_THRESHOLD:
+                    updated.update({
+                        "enabled": False,
+                        "state": "paused",
+                        "next_run_at": None,
+                        "paused_at": _hermes_now().isoformat(),
+                        "paused_reason": (
+                            "Persistent conversation contract changed on two "
+                            "consecutive ticks; paused before another full bootstrap."
+                        ),
+                    })
+                    jobs[i] = updated
+                    save_jobs(jobs)
+                    paused = _normalize_job_record(updated)
+                    paused["_persistent_state_write_applied"] = True
+                    return paused
+            elif root_changed:
+                updated.pop("persistent_contract_forks", None)
+
+            if root_changed:
                 updated.pop("persistent_silent_ticks", None)
             updated["session_root_id"] = root
             updated["session_runtime_fingerprint"] = fingerprint
+            if contract is not None:
+                updated["session_runtime_contract"] = contract
             jobs[i] = updated
             save_jobs(jobs)
-            return _normalize_job_record(updated)
+            persisted = _normalize_job_record(updated)
+            persisted["_persistent_state_write_applied"] = True
+            return persisted
     return None
+
+
+def reset_persistent_contract_fork_state(
+    job_id: str,
+    *,
+    contract_update_token: Optional[str] = None,
+) -> bool:
+    """Clear anti-churn state after a compatible, current-snapshot resume."""
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            live_update_token = str(
+                job.get("persistent_contract_update_pending") or ""
+            )
+            if live_update_token != str(contract_update_token or ""):
+                return False
+            changed = False
+            if "persistent_contract_update_pending" in job:
+                job.pop("persistent_contract_update_pending", None)
+                changed = True
+            if "persistent_contract_forks" in job:
+                job.pop("persistent_contract_forks", None)
+                changed = True
+            if not changed:
+                return False
+            save_jobs(jobs)
+            return True
+    return False
 
 
 def reset_persistent_silence_state(job_id: str) -> bool:
