@@ -10,10 +10,14 @@ from typing import Any
 import pytest
 
 from cron.jobs import (
+    claim_persistent_rollover,
+    claim_persistent_rollover_recovery,
     create_job,
     get_job,
+    load_jobs,
     pause_job,
     resume_job,
+    save_jobs,
     set_persistent_session_state,
     update_job,
 )
@@ -24,6 +28,7 @@ from cron.scheduler import (
     _persistent_skill_contract,
     _persistent_tool_contract,
     _resolve_cron_max_iterations,
+    _resolve_persistent_rollover_runs,
     run_job,
     run_one_job,
 )
@@ -533,6 +538,290 @@ def test_second_tick_resumes_same_conversation_with_compact_prompt(persistent_en
     assert stored["session_runtime_fingerprint"]
     assert persistent_env.reopened == [first_call["session_id"]]
     assert persistent_env.ended[-1][1] == "cron_waiting"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    ((0, 0), (-1, 0), (True, 0), (5.5, 0), ("invalid", 0), ("5", 5), (5, 5)),
+)
+def test_resolve_persistent_rollover_runs_is_opt_in_and_fail_closed(raw, expected):
+    assert _resolve_persistent_rollover_runs(
+        {"cron": {"persistent_rollover_runs": raw}}
+    ) == expected
+
+
+def test_persistent_rollover_is_disabled_by_default():
+    assert DEFAULT_CONFIG["cron"]["persistent_rollover_runs"] == 0
+
+
+def test_planned_rollover_bootstraps_once_then_resumes_new_root(
+    persistent_env,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "cron.scheduler.load_config",
+        lambda: {"cron": {"persistent_rollover_runs": 5}},
+    )
+    job = _create_persistent_job()
+    assert run_job(job)[0] is True
+    original = get_job(job["id"])
+    assert original is not None
+    original_root = original["session_root_id"]
+    jobs = load_jobs()
+    jobs[0]["repeat"]["completed"] = 5
+    jobs[0]["persistent_contract_forks"] = 1
+    save_jobs(jobs)
+
+    rollover_candidate = get_job(job["id"])
+    assert rollover_candidate is not None
+    assert run_job(rollover_candidate)[0] is True
+    rolled = get_job(job["id"])
+    assert rolled is not None
+    rolled_root = rolled["session_root_id"]
+    assert rolled_root != original_root
+    assert rolled["persistent_rollover_checkpoint"] == 5
+    assert rolled["persistent_planned_rollovers"] == 1
+    assert rolled["persistent_contract_forks"] == 1
+    assert "persistent_contract_update_pending" not in rolled
+    bootstrap = FakeAgent.calls[-1]
+    assert bootstrap["session_id"] == rolled_root
+    assert bootstrap["history"] == []
+    assert "CRON CONTINUATION" not in bootstrap["prompt"]
+
+    resume_candidate = get_job(job["id"])
+    assert resume_candidate is not None
+    assert run_job(resume_candidate)[0] is True
+    resumed = get_job(job["id"])
+    assert resumed is not None
+    assert resumed["session_root_id"] == rolled_root
+    continuation = FakeAgent.calls[-1]
+    assert continuation["session_id"] == rolled_root
+    assert [message["role"] for message in continuation["history"]] == [
+        "user",
+        "assistant",
+    ]
+    assert "CRON CONTINUATION" in continuation["prompt"]
+
+
+def test_planned_rollover_preserves_armed_fork_fuse(
+    persistent_env,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "cron.scheduler.load_config",
+        lambda: {"cron": {"persistent_rollover_runs": 5}},
+    )
+    job = _create_persistent_job()
+    assert run_job(job)[0] is True
+    jobs = load_jobs()
+    jobs[0]["repeat"]["completed"] = 5
+    jobs[0]["persistent_contract_forks"] = 1
+    save_jobs(jobs)
+    candidate = get_job(job["id"])
+    assert candidate is not None
+
+    assert run_job(candidate)[0] is True
+
+    rolled = get_job(job["id"])
+    assert rolled is not None
+    rolled_root = rolled["session_root_id"]
+    assert rolled["persistent_contract_forks"] == 1
+    paused = set_persistent_session_state(
+        job["id"],
+        "unexpected-root-after-rollover",
+        "unexpected-fingerprint-after-rollover",
+        runtime_contract=rolled["session_runtime_contract"],
+        unexpected_fork=True,
+    )
+    assert paused is not None
+    assert paused["enabled"] is False
+    assert paused["persistent_contract_forks"] == 2
+    assert paused["session_root_id"] == rolled_root
+
+
+def test_crash_after_rollover_claim_recovers_with_one_bootstrap(
+    persistent_env,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "cron.scheduler.load_config",
+        lambda: {"cron": {"persistent_rollover_runs": 5}},
+    )
+    job = _create_persistent_job()
+    assert run_job(job)[0] is True
+    stored = get_job(job["id"])
+    assert stored is not None
+    jobs = load_jobs()
+    jobs[0]["repeat"]["completed"] = 5
+    save_jobs(jobs)
+    claimed = claim_persistent_rollover(
+        job["id"],
+        expected_root_id=stored["session_root_id"],
+        expected_completed=5,
+        rollover_runs=5,
+    )
+    assert claimed is not None
+    assert claimed["_persistent_rollover_claim"] == "applied"
+    jobs = load_jobs()
+    jobs[0]["persistent_rollover_lease"]["at"] = "2000-01-01T00:00:00+00:00"
+    save_jobs(jobs)
+    rootless = get_job(job["id"])
+    assert rootless is not None
+    assert "session_root_id" not in rootless
+
+    calls_before = len(FakeAgent.calls)
+    assert run_job(rootless)[0] is True
+    recovered = get_job(job["id"])
+    assert recovered is not None
+    recovered_root = recovered["session_root_id"]
+    assert len(FakeAgent.calls) == calls_before + 1
+    assert "persistent_contract_update_pending" not in recovered
+    assert "persistent_contract_forks" not in recovered
+
+    resume_candidate = get_job(job["id"])
+    assert resume_candidate is not None
+    assert run_job(resume_candidate)[0] is True
+    resumed = get_job(job["id"])
+    assert resumed is not None
+    assert resumed["session_root_id"] == recovered_root
+    assert len(FakeAgent.calls) == calls_before + 2
+
+
+def test_stale_rollover_runner_defers_without_model_or_repeat_increment(
+    persistent_env,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "cron.scheduler.load_config",
+        lambda: {"cron": {"persistent_rollover_runs": 5}},
+    )
+    job = _create_persistent_job()
+    assert run_job(job)[0] is True
+    jobs = load_jobs()
+    jobs[0]["repeat"]["completed"] = 5
+    save_jobs(jobs)
+    stale_snapshot = get_job(job["id"])
+    assert stale_snapshot is not None
+    claimed = claim_persistent_rollover(
+        job["id"],
+        expected_root_id=stale_snapshot["session_root_id"],
+        expected_completed=5,
+        rollover_runs=5,
+    )
+    assert claimed is not None
+    assert claimed["_persistent_rollover_claim"] == "applied"
+    calls_before = len(FakeAgent.calls)
+
+    assert run_one_job(stale_snapshot) is True
+
+    current = get_job(job["id"])
+    assert current is not None
+    assert len(FakeAgent.calls) == calls_before
+    assert current["repeat"]["completed"] == 5
+    assert "session_root_id" not in current
+    assert current["persistent_rollover_checkpoint"] == 5
+    stale_write = set_persistent_session_state(
+        job["id"],
+        stale_snapshot["session_root_id"],
+        stale_snapshot["session_runtime_fingerprint"],
+        contract_update_token=str(
+            stale_snapshot.get("persistent_contract_update_pending") or ""
+        ),
+    )
+    assert stale_write is not None
+    assert stale_write["_persistent_state_write_applied"] is False
+    after_stale_write = get_job(job["id"])
+    assert after_stale_write is not None
+    assert "session_root_id" not in after_stale_write
+
+
+def test_concurrent_rootless_recovery_snapshots_allow_one_model_bootstrap(
+    persistent_env,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "cron.scheduler.load_config",
+        lambda: {"cron": {"persistent_rollover_runs": 5}},
+    )
+    job = _create_persistent_job()
+    assert run_job(job)[0] is True
+    jobs = load_jobs()
+    jobs[0]["repeat"]["completed"] = 5
+    save_jobs(jobs)
+    stored = get_job(job["id"])
+    assert stored is not None
+    claimed = claim_persistent_rollover(
+        job["id"],
+        expected_root_id=stored["session_root_id"],
+        expected_completed=5,
+        rollover_runs=5,
+    )
+    assert claimed is not None
+    jobs = load_jobs()
+    jobs[0]["persistent_rollover_lease"]["at"] = "2000-01-01T00:00:00+00:00"
+    save_jobs(jobs)
+    first_snapshot = get_job(job["id"])
+    second_snapshot = get_job(job["id"])
+    assert first_snapshot is not None
+    assert second_snapshot is not None
+    calls_before = len(FakeAgent.calls)
+
+    assert run_job(first_snapshot)[0] is True
+    second_metadata: dict[str, Any] = {}
+    success, _doc, response, error = run_job(
+        second_snapshot,
+        run_metadata=second_metadata,
+    )
+
+    assert success is True
+    assert response == "[SILENT]"
+    assert error is None
+    assert second_metadata["deferred"] is True
+    assert len(FakeAgent.calls) == calls_before + 1
+    final = get_job(job["id"])
+    assert final is not None
+    assert final["session_root_id"]
+    assert "persistent_rollover_lease" not in final
+
+
+def test_rollover_lease_is_revalidated_immediately_before_model(
+    persistent_env,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "cron.scheduler.load_config",
+        lambda: {"cron": {"persistent_rollover_runs": 5}},
+    )
+    job = _create_persistent_job()
+    assert run_job(job)[0] is True
+    jobs = load_jobs()
+    jobs[0]["repeat"]["completed"] = 5
+    save_jobs(jobs)
+    candidate = get_job(job["id"])
+    assert candidate is not None
+    calls_before = len(FakeAgent.calls)
+
+    def _lose_lease(job_id, *, expected_owner):
+        takeover = claim_persistent_rollover_recovery(
+            job_id,
+            expected_completed=5,
+            expected_owner=expected_owner,
+            lease_ttl_seconds=0,
+        )
+        assert takeover is not None
+        assert takeover["_persistent_rollover_recovery"] == "applied"
+        return False
+
+    monkeypatch.setattr(
+        "cron.scheduler.heartbeat_persistent_rollover_lease",
+        _lose_lease,
+    )
+
+    success, _doc, _response, error = run_job(candidate)
+
+    assert success is False
+    assert "lost before model execution" in str(error)
+    assert len(FakeAgent.calls) == calls_before
 
 
 def test_two_zero_tool_silences_autopause_through_shared_run_pipeline(

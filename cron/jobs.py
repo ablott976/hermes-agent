@@ -322,6 +322,9 @@ _IMMUTABLE_JOB_FIELDS = frozenset({
     "id",
     "persistent_contract_forks",
     "persistent_contract_update_pending",
+    "persistent_rollover_lease",
+    "persistent_planned_rollovers",
+    "persistent_rollover_checkpoint",
     "persistent_silent_ticks",
     "session_root_id",
     "session_runtime_contract",
@@ -330,6 +333,9 @@ _IMMUTABLE_JOB_FIELDS = frozenset({
 _INTERNAL_JOB_FIELDS = frozenset({
     "persistent_contract_forks",
     "persistent_contract_update_pending",
+    "persistent_rollover_lease",
+    "persistent_planned_rollovers",
+    "persistent_rollover_checkpoint",
     "persistent_silent_ticks",
     "session_root_id",
     "session_runtime_contract",
@@ -505,6 +511,9 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
         session_mode = SESSION_MODE_FRESH
         normalized.pop("persistent_contract_forks", None)
         normalized.pop("persistent_contract_update_pending", None)
+        normalized.pop("persistent_rollover_lease", None)
+        normalized.pop("persistent_planned_rollovers", None)
+        normalized.pop("persistent_rollover_checkpoint", None)
         normalized.pop("persistent_silent_ticks", None)
         normalized.pop("session_root_id", None)
         normalized.pop("session_runtime_contract", None)
@@ -1490,6 +1499,9 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updated.pop("session_mode", None)
                 updated.pop("persistent_contract_forks", None)
                 updated.pop("persistent_contract_update_pending", None)
+                updated.pop("persistent_rollover_lease", None)
+                updated.pop("persistent_planned_rollovers", None)
+                updated.pop("persistent_rollover_checkpoint", None)
                 updated.pop("persistent_silent_ticks", None)
                 updated.pop("session_root_id", None)
                 updated.pop("session_runtime_contract", None)
@@ -1591,6 +1603,256 @@ def _normalize_persistent_runtime_contract(value: Any) -> Dict[str, Any]:
     return normalized
 
 
+def claim_persistent_rollover(
+    job_id: str,
+    *,
+    expected_root_id: str,
+    expected_completed: int,
+    rollover_runs: int,
+) -> Optional[Dict[str, Any]]:
+    """Atomically claim one planned persistent-root rollover.
+
+    The compare-and-swap covers both the current root and completed-run count.
+    A successful claim rotates the contract-update token so any runner that
+    captured the previous job snapshot can no longer write continuation state.
+    Runtime contract/fingerprint stay intact; only the root pointer is cleared
+    so the claiming runner (or a crash-recovery tick) bootstraps exactly once.
+
+    The returned normalized job carries an ephemeral
+    ``_persistent_rollover_claim`` status: ``applied``, ``stale`` or
+    ``not_due``. The status is never persisted or exposed by public views.
+    """
+    if isinstance(rollover_runs, bool) or not isinstance(rollover_runs, int):
+        raise ValueError("persistent rollover interval must be a positive integer")
+    if rollover_runs <= 0:
+        raise ValueError("persistent rollover interval must be a positive integer")
+    expected_root = str(expected_root_id or "").strip()
+    try:
+        expected_count = max(0, int(expected_completed))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("expected completed count must be a non-negative integer") from exc
+
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job.get("id") != job_id:
+                continue
+            if normalize_session_mode(
+                job.get("session_mode"), strict=False
+            ) != SESSION_MODE_PERSISTENT:
+                raise ValueError(
+                    "persistent rollover can only be claimed on a persistent job"
+                )
+
+            updated = dict(job)
+            live_root = str(updated.get("session_root_id") or "").strip()
+            repeat = updated.get("repeat")
+            try:
+                live_completed = max(
+                    0,
+                    int((repeat or {}).get("completed") or 0)
+                    if isinstance(repeat, dict)
+                    else 0,
+                )
+            except (TypeError, ValueError):
+                live_completed = 0
+
+            rollover_owner = ""
+            status = "not_due"
+            if live_root != expected_root or live_completed != expected_count:
+                status = "stale"
+            else:
+                try:
+                    checkpoint = max(
+                        0,
+                        int(updated.get("persistent_rollover_checkpoint") or 0),
+                    )
+                except (TypeError, ValueError):
+                    checkpoint = 0
+                due = bool(
+                    live_root
+                    and live_completed > 0
+                    and live_completed % rollover_runs == 0
+                    and checkpoint != live_completed
+                )
+                if due:
+                    rollover_owner = uuid.uuid4().hex
+                    try:
+                        rollover_count = max(
+                            0,
+                            int(updated.get("persistent_planned_rollovers") or 0),
+                        ) + 1
+                    except (TypeError, ValueError):
+                        rollover_count = 1
+                    updated["persistent_rollover_checkpoint"] = live_completed
+                    updated["persistent_planned_rollovers"] = rollover_count
+                    updated["persistent_rollover_lease"] = {
+                        "owner": rollover_owner,
+                        "at": _hermes_now().isoformat(),
+                    }
+                    updated["persistent_contract_update_pending"] = uuid.uuid4().hex
+                    updated.pop("session_root_id", None)
+                    updated.pop("persistent_silent_ticks", None)
+                    jobs[i] = updated
+                    save_jobs(jobs)
+                    status = "applied"
+
+            result = _normalize_job_record(updated)
+            result["_persistent_rollover_claim"] = status
+            if status == "applied":
+                result["_persistent_rollover_owner"] = rollover_owner
+            return result
+    return None
+
+
+def claim_persistent_rollover_recovery(
+    job_id: str,
+    *,
+    expected_completed: int,
+    expected_owner: str,
+    lease_ttl_seconds: float = 900.0,
+) -> Optional[Dict[str, Any]]:
+    """Claim an abandoned planned-rollover bootstrap before any model call.
+
+    A fresh lease returns ``busy``. An expired (or absent after a pre-bootstrap
+    crash) lease is atomically replaced and the update token is rotated so the
+    former owner cannot persist stale state. ``stale`` means the caller's job
+    snapshot no longer matches the live lease/completed boundary.
+    """
+    try:
+        completed = max(0, int(expected_completed))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("expected completed count must be a non-negative integer") from exc
+    try:
+        ttl = max(0.0, float(lease_ttl_seconds))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("rollover lease TTL must be a non-negative number") from exc
+    snapshot_owner = str(expected_owner or "").strip()
+
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job.get("id") != job_id:
+                continue
+            if normalize_session_mode(
+                job.get("session_mode"), strict=False
+            ) != SESSION_MODE_PERSISTENT:
+                raise ValueError(
+                    "persistent rollover recovery requires a persistent job"
+                )
+            updated = dict(job)
+            repeat = updated.get("repeat")
+            try:
+                live_completed = max(
+                    0,
+                    int((repeat or {}).get("completed") or 0)
+                    if isinstance(repeat, dict)
+                    else 0,
+                )
+            except (TypeError, ValueError):
+                live_completed = 0
+            try:
+                checkpoint = max(
+                    0,
+                    int(updated.get("persistent_rollover_checkpoint") or 0),
+                )
+            except (TypeError, ValueError):
+                checkpoint = 0
+            lease = updated.get("persistent_rollover_lease")
+            lease = lease if isinstance(lease, dict) else {}
+            live_owner = str(lease.get("owner") or "").strip()
+            update_token = str(
+                updated.get("persistent_contract_update_pending") or ""
+            ).strip()
+            rollover_pending = bool(
+                completed > 0
+                and live_completed == completed
+                and checkpoint == completed
+                and (live_owner or update_token)
+            )
+            new_owner = ""
+            if not rollover_pending or live_owner != snapshot_owner:
+                status = "stale"
+            else:
+                lease_age = float("inf")
+                raw_at = str(lease.get("at") or "").strip()
+                if live_owner and raw_at:
+                    try:
+                        lease_at = datetime.fromisoformat(raw_at.replace("Z", "+00:00"))
+                        lease_age = max(
+                            0.0,
+                            (_hermes_now() - lease_at).total_seconds(),
+                        )
+                    except (TypeError, ValueError):
+                        lease_age = float("inf")
+                if live_owner and lease_age < ttl:
+                    status = "busy"
+                else:
+                    new_owner = uuid.uuid4().hex
+                    updated["persistent_rollover_lease"] = {
+                        "owner": new_owner,
+                        "at": _hermes_now().isoformat(),
+                    }
+                    updated["persistent_contract_update_pending"] = uuid.uuid4().hex
+                    jobs[i] = updated
+                    save_jobs(jobs)
+                    status = "applied"
+
+            result = _normalize_job_record(updated)
+            result["_persistent_rollover_recovery"] = status
+            if status == "applied":
+                result["_persistent_rollover_owner"] = new_owner
+            return result
+    return None
+
+
+def heartbeat_persistent_rollover_lease(job_id: str, *, expected_owner: str) -> bool:
+    """Refresh a live rollover bootstrap lease owned by this runner."""
+    owner = str(expected_owner or "").strip()
+    if not owner:
+        return False
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job.get("id") != job_id:
+                continue
+            lease = job.get("persistent_rollover_lease")
+            lease = lease if isinstance(lease, dict) else {}
+            if str(lease.get("owner") or "").strip() != owner:
+                return False
+            updated = dict(job)
+            updated["persistent_rollover_lease"] = {
+                "owner": owner,
+                "at": _hermes_now().isoformat(),
+            }
+            jobs[i] = updated
+            save_jobs(jobs)
+            return True
+    return False
+
+
+def release_persistent_rollover_lease(job_id: str, *, expected_owner: str) -> bool:
+    """Release a rollover bootstrap lease without touching root/contract state."""
+    owner = str(expected_owner or "").strip()
+    if not owner:
+        return False
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job.get("id") != job_id:
+                continue
+            lease = job.get("persistent_rollover_lease")
+            lease = lease if isinstance(lease, dict) else {}
+            if str(lease.get("owner") or "").strip() != owner:
+                return False
+            updated = dict(job)
+            updated.pop("persistent_rollover_lease", None)
+            jobs[i] = updated
+            save_jobs(jobs)
+            return True
+    return False
+
+
 def set_persistent_session_state(
     job_id: str,
     root_session_id: str,
@@ -1599,6 +1861,7 @@ def set_persistent_session_state(
     runtime_contract: Optional[Dict[str, Any]] = None,
     unexpected_fork: bool = False,
     contract_update_token: Optional[str] = None,
+    preserve_fork_budget: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Atomically persist continuation state and enforce the root-fork fuse.
 
@@ -1667,7 +1930,7 @@ def set_persistent_session_state(
                     paused = _normalize_job_record(updated)
                     paused["_persistent_state_write_applied"] = True
                     return paused
-            elif root_changed:
+            elif root_changed and not preserve_fork_budget:
                 updated.pop("persistent_contract_forks", None)
 
             if root_changed:

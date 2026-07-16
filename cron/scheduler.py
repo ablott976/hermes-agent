@@ -249,12 +249,16 @@ from cron.jobs import (
     SESSION_MODE_PERSISTENT,
     advance_next_run,
     claim_dispatch,
+    claim_persistent_rollover,
+    claim_persistent_rollover_recovery,
     get_due_jobs,
     heartbeat_run_claim,
+    heartbeat_persistent_rollover_lease,
     mark_job_run,
     normalize_session_mode,
     reset_persistent_contract_fork_state,
     reset_persistent_silence_state,
+    release_persistent_rollover_lease,
     save_job_output,
     set_persistent_session_state,
 )
@@ -297,6 +301,21 @@ def _resolve_cron_max_iterations(job: dict, cfg: Any) -> int:
         _DEFAULT_PERSISTENT_MAX_TURNS,
     )
     return min(global_limit, persistent_limit)
+
+
+def _resolve_persistent_rollover_runs(cfg: Any) -> int:
+    """Return the opt-in planned-root interval, or 0 when disabled/invalid."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    raw_cron_cfg = cfg.get("cron")
+    cron_cfg = raw_cron_cfg if isinstance(raw_cron_cfg, dict) else {}
+    raw = cron_cfg.get("persistent_rollover_runs", 0)
+    if isinstance(raw, bool):
+        return 0
+    if isinstance(raw, int):
+        return raw if raw > 0 else 0
+    if isinstance(raw, str) and re.fullmatch(r"[1-9][0-9]*", raw.strip()):
+        return int(raw.strip())
+    return 0
 
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -3499,6 +3518,147 @@ def run_job(
     _contract_update_token = str(
         job.get("persistent_contract_update_pending") or ""
     )
+    _rollover_lease_owner = ""
+
+    def _release_rollover_lease_if_owned() -> None:
+        nonlocal _rollover_lease_owner
+        if not _rollover_lease_owner:
+            return
+        owner = _rollover_lease_owner
+        _rollover_lease_owner = ""
+        if not release_persistent_rollover_lease(
+            job_id,
+            expected_owner=owner,
+        ):
+            logger.warning(
+                "Job '%s': rollover lease was no longer owned at teardown",
+                job_id,
+            )
+    if _persistent_job:
+        repeat = job.get("repeat")
+        try:
+            _completed_runs = max(
+                0,
+                int((repeat or {}).get("completed") or 0)
+                if isinstance(repeat, dict)
+                else 0,
+            )
+        except (TypeError, ValueError):
+            _completed_runs = 0
+        try:
+            _rollover_checkpoint = max(
+                0,
+                int(job.get("persistent_rollover_checkpoint") or 0),
+            )
+        except (TypeError, ValueError):
+            _rollover_checkpoint = 0
+        _rollover_lease = job.get("persistent_rollover_lease")
+        _rollover_lease = (
+            _rollover_lease if isinstance(_rollover_lease, dict) else {}
+        )
+        _snapshot_rollover_owner = str(
+            _rollover_lease.get("owner") or ""
+        ).strip()
+        _pending_rollover_recovery = bool(
+            _completed_runs > 0
+            and _rollover_checkpoint == _completed_runs
+            and (_snapshot_rollover_owner or _contract_update_token)
+        )
+        if _pending_rollover_recovery:
+            _recovery = claim_persistent_rollover_recovery(
+                job_id,
+                expected_completed=_completed_runs,
+                expected_owner=_snapshot_rollover_owner,
+            )
+            if _recovery is None:
+                raise RuntimeError(
+                    "Persistent cron job disappeared before rollover recovery"
+                )
+            _recovery_status = _recovery.get("_persistent_rollover_recovery")
+            if _recovery_status != "applied":
+                logger.info(
+                    "Job '%s': planned rollover bootstrap is owned by another "
+                    "runner; deferring without a model call (status=%s)",
+                    job_id,
+                    _recovery_status,
+                )
+                if run_metadata is not None:
+                    run_metadata["deferred"] = True
+                _close_early_session_store()
+                return True, "", SILENT_MARKER, None
+            job = _recovery
+            _rollover_lease_owner = str(
+                job.get("_persistent_rollover_owner") or ""
+            ).strip()
+            _persistent_root = str(job.get("session_root_id") or "").strip()
+            _stored_runtime_fingerprint = str(
+                job.get("session_runtime_fingerprint") or ""
+            ).strip()
+            _stored_runtime_contract = job.get("session_runtime_contract")
+            if not isinstance(_stored_runtime_contract, dict):
+                _stored_runtime_contract = None
+            _contract_update_token = str(
+                job.get("persistent_contract_update_pending") or ""
+            )
+            if run_metadata is not None:
+                run_metadata["planned_rollover"] = True
+        elif _persistent_root:
+            try:
+                _rollover_cfg = load_config() or {}
+            except Exception:
+                _rollover_cfg = {}
+            _rollover_runs = _resolve_persistent_rollover_runs(_rollover_cfg)
+            _rollover_due = bool(
+                _rollover_runs
+                and _completed_runs > 0
+                and _completed_runs % _rollover_runs == 0
+                and _rollover_checkpoint != _completed_runs
+            )
+            if _rollover_due:
+                _claimed_rollover = claim_persistent_rollover(
+                    job_id,
+                    expected_root_id=_persistent_root,
+                    expected_completed=_completed_runs,
+                    rollover_runs=_rollover_runs,
+                )
+                if _claimed_rollover is None:
+                    raise RuntimeError(
+                        "Persistent cron job disappeared before rollover could be claimed"
+                    )
+                _claim_status = _claimed_rollover.get("_persistent_rollover_claim")
+                if _claim_status == "stale":
+                    logger.info(
+                        "Job '%s': planned rollover was claimed by a newer runner; "
+                        "deferring without a model call",
+                        job_id,
+                    )
+                    if run_metadata is not None:
+                        run_metadata["deferred"] = True
+                    _close_early_session_store()
+                    return True, "", SILENT_MARKER, None
+                if _claim_status == "applied":
+                    job = _claimed_rollover
+                    _rollover_lease_owner = str(
+                        job.get("_persistent_rollover_owner") or ""
+                    ).strip()
+                    _persistent_root = ""
+                    _stored_runtime_fingerprint = str(
+                        job.get("session_runtime_fingerprint") or ""
+                    ).strip()
+                    _stored_runtime_contract = job.get("session_runtime_contract")
+                    if not isinstance(_stored_runtime_contract, dict):
+                        _stored_runtime_contract = None
+                    _contract_update_token = str(
+                        job.get("persistent_contract_update_pending") or ""
+                    )
+                    if run_metadata is not None:
+                        run_metadata["planned_rollover"] = True
+                    logger.info(
+                        "Job '%s': claimed planned persistent rollover after %d "
+                        "completed runs; bootstrapping one bounded root",
+                        job_id,
+                        _completed_runs,
+                    )
     _persistent_resume_matched = False
     _persistent_tip = None
     _conversation_history = []
@@ -3506,12 +3666,17 @@ def run_job(
         if _session_db is None:
             error_msg = "Persistent cron sessions require the SQLite session store"
             logger.error("Job '%s': %s", job_id, error_msg)
+            _release_rollover_lease_if_owned()
             return False, "", "", error_msg
         if _persistent_root:
-            _persistent_tip, _conversation_history = _load_persistent_cron_history(
-                _session_db,
-                _persistent_root,
-            )
+            try:
+                _persistent_tip, _conversation_history = _load_persistent_cron_history(
+                    _session_db,
+                    _persistent_root,
+                )
+            except BaseException:
+                _release_rollover_lease_if_owned()
+                raise
     _resume_persistent_turn = bool(_persistent_tip and _conversation_history)
 
     # Wake-gate: if this job has a pre-check script, run it BEFORE building
@@ -3552,6 +3717,7 @@ def run_job(
                 "Script gate returned `wakeAgent=false` — agent skipped.\n"
             )
             _close_early_session_store()
+            _release_rollover_lease_if_owned()
             return True, silent_doc, SILENT_MARKER, None
 
     try:
@@ -3587,10 +3753,12 @@ def run_job(
             "the threat pattern (`tools/cronjob_tools.py::_CRON_THREAT_PATTERNS`)."
         )
         _close_early_session_store()
+        _release_rollover_lease_if_owned()
         return False, blocked_doc, "", str(block_exc)
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         _close_early_session_store()
+        _release_rollover_lease_if_owned()
         return True, "", SILENT_MARKER, None
     origin = _resolve_origin(job)
     _cron_session_id = _persistent_tip or _new_cron_session_id(
@@ -4051,6 +4219,7 @@ def run_job(
                         _runtime_fingerprint,
                         runtime_contract=_runtime_contract,
                         contract_update_token=_contract_update_token,
+                        preserve_fork_budget=bool(_rollover_lease_owner),
                     )
                     if migrated and not migrated.get(
                         "_persistent_state_write_applied", True
@@ -4106,6 +4275,7 @@ def run_job(
                         )
                     ),
                     contract_update_token=_contract_update_token,
+                    preserve_fork_budget=bool(_rollover_lease_owner),
                 )
                 if persisted is None:
                     raise RuntimeError(
@@ -4176,6 +4346,7 @@ def run_job(
         )
         _CLAIM_HEARTBEAT_SECONDS = 60.0
         _last_claim_heartbeat = time.monotonic()
+        _last_rollover_heartbeat = time.monotonic()
 
         def _heartbeat_run_claim_if_due():
             nonlocal _last_claim_heartbeat
@@ -4191,6 +4362,37 @@ def run_job(
                 logger.debug(
                     "Job '%s': run_claim heartbeat failed", job_name, exc_info=True
                 )
+
+        def _heartbeat_rollover_lease_if_due():
+            nonlocal _last_rollover_heartbeat
+            if not _rollover_lease_owner:
+                return
+            _mono = time.monotonic()
+            if _mono - _last_rollover_heartbeat < _CLAIM_HEARTBEAT_SECONDS:
+                return
+            _last_rollover_heartbeat = _mono
+            if not heartbeat_persistent_rollover_lease(
+                job_id,
+                expected_owner=_rollover_lease_owner,
+            ):
+                if hasattr(agent, "interrupt"):
+                    agent.interrupt("Persistent rollover lease was lost")
+                raise RuntimeError(
+                    "Persistent rollover lease was lost before the tick completed"
+                )
+
+        if _rollover_lease_owner:
+            # Tool/skill discovery and prompt construction can be slow. Recheck
+            # ownership at the final trust boundary so a lease that expired and
+            # was recovered during setup cannot produce a duplicate model call.
+            if not heartbeat_persistent_rollover_lease(
+                job_id,
+                expected_owner=_rollover_lease_owner,
+            ):
+                raise RuntimeError(
+                    "Persistent rollover lease was lost before model execution"
+                )
+            _last_rollover_heartbeat = time.monotonic()
 
         _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Preserve scheduler-scoped ContextVar state (for example skill-declared
@@ -4233,6 +4435,7 @@ def run_job(
                         result = _cron_future.result()
                         break
                     _heartbeat_run_claim_if_due()
+                    _heartbeat_rollover_lease_if_due()
                     if _progress_enabled:
                         _maybe_send_cron_progress(
                             job,
@@ -4394,7 +4597,7 @@ def run_job(
             )
             if run_metadata is not None:
                 run_metadata.update({"agent_ran": True, "tool_calls": tool_calls})
-            if _persistent_resume_matched:
+            if _persistent_resume_matched and not _rollover_lease_owner:
                 reset_persistent_contract_fork_state(
                     job_id,
                     contract_update_token=_contract_update_token,
@@ -4441,6 +4644,14 @@ def run_job(
         return False, output, "", error_msg
 
     finally:
+        if _rollover_lease_owner:
+            try:
+                _release_rollover_lease_if_owned()
+            except Exception:
+                logger.exception(
+                    "Job '%s': failed to release persistent rollover lease",
+                    job_id,
+                )
         # Restore TERMINAL_CWD to whatever it was before this job ran.  We
         # only ever mutate it when the job has a workdir; see the setup block
         # at the top of run_job for the serialization guarantee.
@@ -4613,6 +4824,14 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             raise
         finally:
             reset_secret_scope(_scope_token)
+
+        if _run_metadata.get("deferred") is True:
+            # Another scheduler already claimed the same planned rollover.
+            # This stale runner must not save output, deliver, or increment the
+            # repeat counter; the winning runner owns the next model call.
+            for _deferred_agent in _deferred_agents:
+                _teardown_cron_agent(_deferred_agent, job["id"])
+            return True
 
         # Everything from here through delivery runs with the agent still live
         # (deferred teardown). Wrap it ALL in a try/finally so that if any step

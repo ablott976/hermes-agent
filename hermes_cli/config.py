@@ -2695,6 +2695,11 @@ DEFAULT_CONFIG = {
         # max_turns value that may be hundreds of calls. The global agent limit
         # remains authoritative when it is lower than this value.
         "persistent_max_turns": 12,
+        # Optional planned root rollover for persistent cron conversations.
+        # 0 disables it. A positive N starts one full bootstrap after every N
+        # successful ticks, preserving the job's durable plan/state while
+        # bounding conversation growth and prompt-cache prefix size.
+        "persistent_rollover_runs": 0,
         # Per-job output-file retention: save_job_output keeps the N most
         # recent .md files and prunes older ones. 0 or negative disables
         # pruning (for operators who manage cleanup externally). Default 50.

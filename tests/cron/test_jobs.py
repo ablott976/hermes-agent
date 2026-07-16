@@ -25,6 +25,10 @@ from cron.jobs import (
     heartbeat_run_claim,
     get_due_jobs,
     save_job_output,
+    claim_persistent_rollover,
+    claim_persistent_rollover_recovery,
+    heartbeat_persistent_rollover_lease,
+    release_persistent_rollover_lease,
     set_persistent_session_state,
     public_job_view,
     reset_persistent_silence_state,
@@ -327,6 +331,190 @@ class TestJobCRUD:
         assert "session_root_id" not in public
         assert "session_runtime_fingerprint" not in public
         assert get_job(job["id"])["session_root_id"] == "cron_root"
+
+    def test_claim_persistent_rollover_rotates_token_and_preserves_contract(
+        self,
+        tmp_cron_dir,
+    ):
+        job = create_job(
+            prompt="Continue development",
+            schedule="every 1m",
+            session_mode="persistent",
+        )
+        digest = hashlib.sha256(b"rollover-contract").hexdigest()
+        contract = {
+            "version": 4,
+            **{
+                name: digest
+                for name in {
+                    "api_mode",
+                    "base_url",
+                    "context_from",
+                    "model",
+                    "prompt",
+                    "provider",
+                    "script",
+                    "skills",
+                    "system_contract",
+                    "tool_contract",
+                    "workdir",
+                }
+            },
+        }
+        set_persistent_session_state(
+            job["id"],
+            "root-before-rollover",
+            "fingerprint",
+            runtime_contract=contract,
+        )
+        jobs = load_jobs()
+        jobs[0]["repeat"]["completed"] = 5
+        jobs[0]["persistent_silent_ticks"] = 1
+        jobs[0]["persistent_contract_forks"] = 1
+        save_jobs(jobs)
+
+        claimed = claim_persistent_rollover(
+            job["id"],
+            expected_root_id="root-before-rollover",
+            expected_completed=5,
+            rollover_runs=5,
+        )
+
+        assert claimed is not None
+        assert claimed["_persistent_rollover_claim"] == "applied"
+        stored = get_job(job["id"])
+        assert stored is not None
+        assert "session_root_id" not in stored
+        assert stored["session_runtime_fingerprint"] == "fingerprint"
+        assert stored["session_runtime_contract"] == contract
+        assert stored["persistent_rollover_checkpoint"] == 5
+        assert stored["persistent_planned_rollovers"] == 1
+        assert stored["persistent_contract_update_pending"]
+        assert "persistent_silent_ticks" not in stored
+        assert stored["persistent_contract_forks"] == 1
+        lease = stored["persistent_rollover_lease"]
+        assert lease["owner"] == claimed["_persistent_rollover_owner"]
+        public = public_job_view(stored)
+        assert public is not None
+        assert "persistent_rollover_checkpoint" not in public
+        assert "persistent_planned_rollovers" not in public
+        assert "persistent_rollover_lease" not in public
+        with pytest.raises(ValueError, match="persistent_rollover_checkpoint"):
+            update_job(job["id"], {"persistent_rollover_checkpoint": 10})
+
+    @pytest.mark.parametrize(
+        ("expected_root", "expected_completed"),
+        (("stale-root", 5), ("root", 4)),
+    )
+    def test_claim_persistent_rollover_rejects_stale_snapshot(
+        self,
+        tmp_cron_dir,
+        expected_root,
+        expected_completed,
+    ):
+        job = create_job(
+            prompt="Continue development",
+            schedule="every 1m",
+            session_mode="persistent",
+        )
+        set_persistent_session_state(job["id"], "root", "fingerprint")
+        jobs = load_jobs()
+        jobs[0]["repeat"]["completed"] = 5
+        save_jobs(jobs)
+
+        rejected = claim_persistent_rollover(
+            job["id"],
+            expected_root_id=expected_root,
+            expected_completed=expected_completed,
+            rollover_runs=5,
+        )
+
+        assert rejected is not None
+        assert rejected["_persistent_rollover_claim"] == "stale"
+        stored = get_job(job["id"])
+        assert stored is not None
+        assert stored["session_root_id"] == "root"
+        assert "persistent_rollover_checkpoint" not in stored
+
+    def test_fresh_mode_clears_persistent_rollover_state(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Continue development",
+            schedule="every 1m",
+            session_mode="persistent",
+        )
+        set_persistent_session_state(job["id"], "root", "fingerprint")
+        jobs = load_jobs()
+        jobs[0]["persistent_rollover_checkpoint"] = 5
+        jobs[0]["persistent_planned_rollovers"] = 2
+        jobs[0]["persistent_rollover_lease"] = {
+            "owner": "owner",
+            "at": "2026-07-16T00:00:00+00:00",
+        }
+        save_jobs(jobs)
+
+        updated = update_job(job["id"], {"session_mode": "fresh"})
+
+        assert updated is not None
+        stored = load_jobs()[0]
+        assert "persistent_rollover_checkpoint" not in stored
+        assert "persistent_planned_rollovers" not in stored
+        assert "persistent_rollover_lease" not in stored
+
+    def test_rollover_recovery_lease_is_single_owner_and_releasable(
+        self,
+        tmp_cron_dir,
+    ):
+        job = create_job(
+            prompt="Continue development",
+            schedule="every 1m",
+            session_mode="persistent",
+        )
+        set_persistent_session_state(job["id"], "root", "fingerprint")
+        jobs = load_jobs()
+        jobs[0]["repeat"]["completed"] = 5
+        save_jobs(jobs)
+        claimed = claim_persistent_rollover(
+            job["id"],
+            expected_root_id="root",
+            expected_completed=5,
+            rollover_runs=5,
+        )
+        assert claimed is not None
+        owner = claimed["_persistent_rollover_owner"]
+
+        busy = claim_persistent_rollover_recovery(
+            job["id"],
+            expected_completed=5,
+            expected_owner=owner,
+        )
+        assert busy is not None
+        assert busy["_persistent_rollover_recovery"] == "busy"
+        takeover = claim_persistent_rollover_recovery(
+            job["id"],
+            expected_completed=5,
+            expected_owner=owner,
+            lease_ttl_seconds=0,
+        )
+        assert takeover is not None
+        assert takeover["_persistent_rollover_recovery"] == "applied"
+        new_owner = takeover["_persistent_rollover_owner"]
+        stale = claim_persistent_rollover_recovery(
+            job["id"],
+            expected_completed=5,
+            expected_owner=owner,
+            lease_ttl_seconds=0,
+        )
+        assert stale is not None
+        assert stale["_persistent_rollover_recovery"] == "stale"
+        assert heartbeat_persistent_rollover_lease(
+            job["id"], expected_owner=new_owner
+        ) is True
+        assert release_persistent_rollover_lease(
+            job["id"], expected_owner=new_owner
+        ) is True
+        final = get_job(job["id"])
+        assert final is not None
+        assert "persistent_rollover_lease" not in final
 
     def test_persistent_contract_fork_fuse_pauses_before_third_bootstrap(
         self,
