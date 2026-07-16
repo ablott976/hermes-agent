@@ -339,6 +339,50 @@ def test_notifier_uses_active_named_profile_adapter(tmp_path, monkeypatch):
         conn.close()
 
 
+def test_named_multiplexer_uses_secondary_default_profile_adapter(tmp_path, monkeypatch):
+    """A named multiplexer delivers default-owned subs via the default adapter."""
+    db_path = tmp_path / "multiplexed-default-profile.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="owned by default", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-default",
+            notifier_profile="default",
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    maker_adapter = RecordingAdapter()
+    default_adapter = RecordingAdapter()
+    runner = _make_runner(maker_adapter)
+    runner.adapters = {Platform.DISCORD: maker_adapter}  # type: ignore[assignment]
+    runner._kanban_notifier_profile = "maker"
+    runner._profile_adapters = {  # type: ignore[assignment]
+        "default": {Platform.TELEGRAM: default_adapter},
+    }
+    runner._active_profile_name = lambda: "maker"
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert maker_adapter.sent == []
+    assert len(default_adapter.sent) == 1
+    assert default_adapter.sent[0]["chat_id"] == "chat-default"
+    assert tid in default_adapter.sent[0]["text"]
+
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn) == []
+    finally:
+        conn.close()
+
+
 def _unseen_terminal_events_for(tid, chat_id):
     conn = kb.connect()
     try:
