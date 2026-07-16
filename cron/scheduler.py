@@ -253,6 +253,7 @@ from cron.jobs import (
     heartbeat_run_claim,
     mark_job_run,
     normalize_session_mode,
+    reset_persistent_contract_fork_state,
     reset_persistent_silence_state,
     save_job_output,
     set_persistent_session_state,
@@ -3079,17 +3080,48 @@ def _persistent_skill_contract(job: dict) -> list[dict[str, Any]]:
     return contract
 
 
-def _persistent_runtime_fingerprint(job: dict, agent, workdir: Optional[str]) -> str:
-    """Hash the effective conversation contract without persisting secrets.
+def _persistent_tool_contract(tools: Any) -> list[dict[str, Any]]:
+    """Return the semantic tool contract used for persistent compatibility.
 
-    Runtime script/upstream output is intentionally excluded: it is new turn
-    data, not part of the cached conversation contract. Stable/context system
-    prompt layers and full tool schemas are represented only by digests so
-    changes fork the lineage without exposing their content. Configured skills
-    use stable identities because their loaded bodies are already frozen in the
-    durable history; editing a skill on disk does not rewrite that history.
-    The volatile system-prompt layer (date/session metadata) is omitted because
-    it is intentionally frozen for the lifetime of an existing conversation.
+    Tool descriptions and registry order are model guidance, not replay
+    compatibility boundaries. Persisted history remains safe while names and
+    parameter schemas are unchanged because every new request receives the
+    current descriptions. Parameter types, properties and requiredness remain
+    part of the contract and therefore still fork on incompatible changes.
+    """
+    contract: list[dict[str, Any]] = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        function = function if isinstance(function, dict) else {}
+        name = str(function.get("name") or tool.get("name") or "").strip()
+        if not name:
+            continue
+        parameters = function.get("parameters")
+        if not isinstance(parameters, dict):
+            parameters = {}
+        contract.append({
+            "name": name,
+            "parameters": parameters,
+            "strict": bool(function.get("strict", False)),
+        })
+    return sorted(
+        contract,
+        key=lambda item: (item["name"], _canonical_digest(item)),
+    )
+
+
+def _persistent_runtime_contract(
+    job: dict,
+    agent,
+    workdir: Optional[str],
+) -> dict[str, Any]:
+    """Build a non-secret component map for persistent compatibility.
+
+    Each value is independently hashed so operators can identify which
+    component changed without persisting prompts, tool schemas, routes,
+    credentials, context files, skill content or workdir paths.
     """
     context_from = job.get("context_from")
     if isinstance(context_from, str):
@@ -3113,8 +3145,7 @@ def _persistent_runtime_fingerprint(job: dict, agent, workdir: Optional[str]) ->
             )
             system_parts = {"state": "error"}
 
-    payload = {
-        "version": 3,
+    raw_components = {
         "prompt": str(job.get("prompt") or ""),
         "skills": _persistent_skill_contract(job),
         "script": str(job.get("script") or ""),
@@ -3123,11 +3154,24 @@ def _persistent_runtime_fingerprint(job: dict, agent, workdir: Optional[str]) ->
         "provider": str(getattr(agent, "provider", "") or ""),
         "base_url": _base_url_contract(getattr(agent, "base_url", "")),
         "api_mode": str(getattr(agent, "api_mode", "") or ""),
-        "system_contract": _canonical_digest(system_parts),
-        "tool_contract": _canonical_digest(getattr(agent, "tools", None) or []),
+        "system_contract": system_parts,
+        "tool_contract": _persistent_tool_contract(
+            getattr(agent, "tools", None) or []
+        ),
         "workdir": str(workdir or ""),
     }
-    return _canonical_digest(payload)
+    return {
+        "version": 4,
+        **{
+            name: _canonical_digest(value)
+            for name, value in raw_components.items()
+        },
+    }
+
+
+def _persistent_runtime_fingerprint(job: dict, agent, workdir: Optional[str]) -> str:
+    """Hash the non-secret persistent runtime component map."""
+    return _canonical_digest(_persistent_runtime_contract(job, agent, workdir))
 
 
 def _load_persistent_cron_history(session_db, root_session_id: str):
@@ -3449,6 +3493,13 @@ def run_job(
     _stored_runtime_fingerprint = str(
         job.get("session_runtime_fingerprint") or ""
     ).strip()
+    _stored_runtime_contract = job.get("session_runtime_contract")
+    if not isinstance(_stored_runtime_contract, dict):
+        _stored_runtime_contract = None
+    _contract_update_token = str(
+        job.get("persistent_contract_update_pending") or ""
+    )
+    _persistent_resume_matched = False
     _persistent_tip = None
     _conversation_history = []
     if _persistent_job:
@@ -3969,17 +4020,19 @@ def run_job(
 
         if _persistent_job:
             assert _session_db is not None  # guarded before prompt construction
-            _runtime_fingerprint = _persistent_runtime_fingerprint(
+            _runtime_contract = _persistent_runtime_contract(
                 job,
                 agent,
                 _job_workdir,
             )
+            _runtime_fingerprint = _canonical_digest(_runtime_contract)
             _contract_matches = bool(
                 _resume_persistent_turn
                 and _stored_runtime_fingerprint
                 and _stored_runtime_fingerprint == _runtime_fingerprint
             )
             if _contract_matches:
+                _persistent_resume_matched = True
                 # Each tick gets a fresh in-memory agent, but the durable tip is
                 # reopened and its exact persisted system prompt is restored by
                 # run_conversation before the next model request.
@@ -3990,12 +4043,36 @@ def run_job(
                     _cron_session_id,
                     len(_conversation_history),
                 )
-            else:
-                if _persistent_tip:
-                    logger.info(
-                        "Job '%s': starting a new persistent root because the "
-                        "conversation contract changed or the prior state was incomplete",
+                setattr(agent, "session_id", _cron_session_id)
+                if _stored_runtime_contract is None:
+                    migrated = set_persistent_session_state(
                         job_id,
+                        _persistent_root,
+                        _runtime_fingerprint,
+                        runtime_contract=_runtime_contract,
+                        contract_update_token=_contract_update_token,
+                    )
+                    if migrated and not migrated.get(
+                        "_persistent_state_write_applied", True
+                    ):
+                        return True, "", SILENT_MARKER, None
+            else:
+                if _stored_runtime_contract is None:
+                    changed_components = ["legacy_or_missing_component_map"]
+                else:
+                    changed_components = sorted(
+                        name
+                        for name in set(_stored_runtime_contract) | set(_runtime_contract)
+                        if name != "version"
+                        and _stored_runtime_contract.get(name) != _runtime_contract.get(name)
+                    )
+                if _persistent_root:
+                    logger.warning(
+                        "Job '%s': starting a new persistent root because the "
+                        "conversation contract changed or the prior state was incomplete; "
+                        "changed_components=%s",
+                        job_id,
+                        changed_components,
                     )
                 if _persistent_tip:
                     _cron_session_id = _new_cron_session_id(
@@ -4019,12 +4096,39 @@ def run_job(
                     job_id,
                     _cron_session_id,
                     _runtime_fingerprint,
+                    runtime_contract=_runtime_contract,
+                    unexpected_fork=bool(
+                        _persistent_root
+                        and _stored_runtime_fingerprint
+                        and (
+                            not _resume_persistent_turn
+                            or _stored_runtime_fingerprint != _runtime_fingerprint
+                        )
+                    ),
+                    contract_update_token=_contract_update_token,
                 )
                 if persisted is None:
                     raise RuntimeError(
                         "Persistent cron job disappeared before session state could be saved"
                     )
-                _persistent_root = _cron_session_id
+                if not persisted.get("_persistent_state_write_applied", True):
+                    logger.info(
+                        "Job '%s': contract update changed during dispatch; "
+                        "deferring to the next tick",
+                        job_id,
+                    )
+                    return True, "", SILENT_MARKER, None
+                if not persisted.get("enabled", True) and (
+                    "contract changed" in str(persisted.get("paused_reason") or "").lower()
+                ):
+                    pause_message = (
+                        "Cron pausado automáticamente: el contrato de la conversación "
+                        "cambió en dos ticks consecutivos. No se inició otro bootstrap."
+                    )
+                    return True, pause_message, pause_message, None
+                _persistent_root = str(
+                    persisted.get("session_root_id") or _cron_session_id
+                )
                 _stored_runtime_fingerprint = _runtime_fingerprint
 
         # Run the agent with an *inactivity*-based timeout: the job can run
@@ -4290,6 +4394,11 @@ def run_job(
             )
             if run_metadata is not None:
                 run_metadata.update({"agent_ran": True, "tool_calls": tool_calls})
+            if _persistent_resume_matched:
+                reset_persistent_contract_fork_state(
+                    job_id,
+                    contract_update_token=_contract_update_token,
+                )
 
         output = f"""# Cron Job: {job_name}
 

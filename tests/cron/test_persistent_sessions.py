@@ -20,7 +20,9 @@ from cron.jobs import (
 from cron.scheduler import (
     _base_url_contract,
     _load_persistent_cron_history,
+    _persistent_runtime_contract,
     _persistent_skill_contract,
+    _persistent_tool_contract,
     _resolve_cron_max_iterations,
     run_job,
     run_one_job,
@@ -90,6 +92,32 @@ class FakeAgent:
     instances: list["FakeAgent"] = []
     fail_next = False
     system_contract = "stable-system-contract"
+    tool_contract = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "terminal",
+                "description": "Run a command.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+        },
+    ]
 
     def __init__(self, **kwargs):
         self.model = kwargs["model"]
@@ -97,10 +125,7 @@ class FakeAgent:
         self.base_url = kwargs["base_url"]
         self.api_mode = kwargs["api_mode"]
         self.valid_tool_names = {"read_file", "terminal"}
-        self.tools = [
-            {"type": "function", "function": {"name": "read_file"}},
-            {"type": "function", "function": {"name": "terminal"}},
-        ]
+        self.tools = json.loads(json.dumps(type(self).tool_contract))
         self.session_id = kwargs["session_id"]
         self._session_db = kwargs["session_db"]
         self.max_iterations = kwargs["max_iterations"]
@@ -188,6 +213,32 @@ def persistent_env(tmp_path, monkeypatch):
     FakeAgent.instances = []
     FakeAgent.fail_next = False
     FakeAgent.system_contract = "stable-system-contract"
+    FakeAgent.tool_contract = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "terminal",
+                "description": "Run a command.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+        },
+    ]
 
     monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
     monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
@@ -241,6 +292,85 @@ def test_fresh_remains_default_and_persistent_rejects_script_only(persistent_env
             no_agent=True,
             session_mode="persistent",
         )
+
+
+def test_persistent_tool_contract_ignores_descriptions_and_order_but_keeps_schema():
+    original = [
+        {
+            "type": "function",
+            "function": {
+                "name": "demo",
+                "description": "Original model guidance.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "count": {"type": "integer"},
+                        "label": {"type": "string"},
+                    },
+                    "required": ["count"],
+                },
+            },
+        },
+        {"type": "function", "function": {"name": "other"}},
+    ]
+    metadata_only = [
+        {"type": "function", "function": {"name": "other", "description": "New text"}},
+        {
+            "type": "function",
+            "function": {
+                "name": "demo",
+                "description": "Reworded model guidance.",
+                "parameters": {
+                    "required": ["count"],
+                    "properties": {
+                        "label": {"type": "string"},
+                        "count": {"type": "integer"},
+                    },
+                    "type": "object",
+                },
+            },
+        },
+    ]
+    incompatible = json.loads(json.dumps(metadata_only))
+    incompatible[1]["function"]["parameters"]["required"] = ["count", "label"]
+    strict_change = json.loads(json.dumps(metadata_only))
+    strict_change[1]["function"]["strict"] = True
+
+    assert _persistent_tool_contract(original) == _persistent_tool_contract(metadata_only)
+    assert _persistent_tool_contract(original) != _persistent_tool_contract(incompatible)
+    assert _persistent_tool_contract(original) != _persistent_tool_contract(strict_change)
+
+
+def test_runtime_contract_contains_only_digests(persistent_env):
+    job = _create_persistent_job()
+    agent = FakeAgent(
+        model="secret-model-name",
+        provider="secret-provider-name",
+        base_url="https://user:password@example.invalid/v1",
+        api_mode="chat_completions",
+        max_iterations=12,
+        session_id="probe",
+        session_db=persistent_env,
+    )
+
+    contract = _persistent_runtime_contract(job, agent, "/private/customer/workdir")
+    encoded = json.dumps(contract, sort_keys=True)
+
+    assert contract["version"] == 4
+    assert all(
+        key == "version" or (isinstance(value, str) and len(value) == 64)
+        for key, value in contract.items()
+    )
+    for raw in (
+        job["prompt"],
+        "secret-model-name",
+        "secret-provider-name",
+        "password",
+        "/private/customer/workdir",
+        "read_file",
+        "path",
+    ):
+        assert raw not in encoded
 
 
 @pytest.mark.parametrize(
@@ -492,6 +622,135 @@ def test_contract_drift_forks_and_bootstraps_new_root(persistent_env):
     assert "continuing since" in persistent_env.sessions[updated["session_root_id"]]["title"]
 
 
+def test_tool_description_and_registry_order_drift_keeps_persistent_root(persistent_env):
+    job = _create_persistent_job()
+    assert run_job(job)[0] is True
+    original_root = get_job(job["id"])["session_root_id"]
+
+    changed = json.loads(json.dumps(FakeAgent.tool_contract))
+    changed.reverse()
+    changed[0]["function"]["description"] = "Reworded guidance only."
+    changed[1]["function"]["description"] = "Another description only."
+    FakeAgent.tool_contract = changed
+
+    assert run_job(get_job(job["id"]))[0] is True
+    assert get_job(job["id"])["session_root_id"] == original_root
+    assert "CRON CONTINUATION" in FakeAgent.calls[-1]["prompt"]
+
+
+def test_two_consecutive_semantic_tool_drifts_pause_before_third_bootstrap(
+    persistent_env,
+):
+    job = _create_persistent_job()
+    assert run_job(job)[0] is True
+
+    first_drift = json.loads(json.dumps(FakeAgent.tool_contract))
+    first_drift[0]["function"]["parameters"]["required"] = []
+    FakeAgent.tool_contract = first_drift
+    assert run_job(get_job(job["id"]))[0] is True
+    after_first = get_job(job["id"])
+    assert after_first["enabled"] is True
+    assert after_first["persistent_contract_forks"] == 1
+    assert len(FakeAgent.calls) == 2
+
+    second_drift = json.loads(json.dumps(FakeAgent.tool_contract))
+    second_drift[0]["function"]["parameters"]["properties"]["path"]["type"] = "integer"
+    FakeAgent.tool_contract = second_drift
+    result = run_job(get_job(job["id"]))
+    paused = get_job(job["id"])
+
+    assert result[0] is True
+    assert "pausado automáticamente" in result[2]
+    assert paused["enabled"] is False
+    assert paused["state"] == "paused"
+    assert paused["persistent_contract_forks"] == 2
+    assert len(FakeAgent.calls) == 2
+
+
+def test_successful_semantic_resume_resets_contract_fork_counter(persistent_env):
+    job = _create_persistent_job()
+    assert run_job(job)[0] is True
+
+    changed = json.loads(json.dumps(FakeAgent.tool_contract))
+    changed[0]["function"]["parameters"]["required"] = []
+    FakeAgent.tool_contract = changed
+    assert run_job(get_job(job["id"]))[0] is True
+    assert get_job(job["id"])["persistent_contract_forks"] == 1
+
+    assert run_job(get_job(job["id"]))[0] is True
+    assert "persistent_contract_forks" not in get_job(job["id"])
+
+
+def test_compatible_explicit_update_is_consumed_before_future_drift_fuse(
+    persistent_env,
+):
+    job = _create_persistent_job()
+    assert run_job(job)[0] is True
+
+    updated = update_job(job["id"], {"prompt": job["prompt"]})
+    assert updated is not None
+    assert updated["persistent_contract_update_pending"]
+    assert run_job(updated)[0] is True
+    compatible = get_job(job["id"])
+    assert compatible is not None
+    assert "persistent_contract_update_pending" not in compatible
+
+    first_drift = json.loads(json.dumps(FakeAgent.tool_contract))
+    first_drift[0]["function"]["parameters"]["required"] = []
+    FakeAgent.tool_contract = first_drift
+    assert run_job(compatible)[0] is True
+    after_first = get_job(job["id"])
+    assert after_first is not None
+    assert after_first["persistent_contract_forks"] == 1
+
+    second_drift = json.loads(json.dumps(FakeAgent.tool_contract))
+    second_drift[0]["function"]["parameters"]["properties"]["path"]["type"] = "integer"
+    FakeAgent.tool_contract = second_drift
+    calls_before_pause = len(FakeAgent.calls)
+    result = run_job(after_first)
+    paused = get_job(job["id"])
+
+    assert result[0] is True
+    assert paused is not None
+    assert paused["enabled"] is False
+    assert len(FakeAgent.calls) == calls_before_pause
+
+
+def test_contract_fuse_survives_run_pipeline_and_manual_resume_resets_it(
+    persistent_env,
+):
+    job = _create_persistent_job()
+    assert run_one_job(job) is True
+
+    first_drift = json.loads(json.dumps(FakeAgent.tool_contract))
+    first_drift[0]["function"]["parameters"]["required"] = []
+    FakeAgent.tool_contract = first_drift
+    first = get_job(job["id"])
+    assert first is not None
+    assert run_one_job(first) is True
+
+    second_drift = json.loads(json.dumps(FakeAgent.tool_contract))
+    second_drift[0]["function"]["parameters"]["properties"]["path"]["type"] = "integer"
+    FakeAgent.tool_contract = second_drift
+    before_pause = get_job(job["id"])
+    assert before_pause is not None
+    calls_before_pause = len(FakeAgent.calls)
+    assert run_one_job(before_pause) is True
+    paused = get_job(job["id"])
+
+    assert paused is not None
+    assert paused["enabled"] is False
+    assert paused["state"] == "paused"
+    assert paused["persistent_contract_forks"] == 2
+    assert paused["repeat"]["completed"] == 3
+    assert len(FakeAgent.calls) == calls_before_pause
+
+    resumed = resume_job(job["id"])
+    assert resumed is not None
+    assert resumed["enabled"] is True
+    assert "persistent_contract_forks" not in resumed
+
+
 def test_system_contract_drift_forks_without_reinjecting_old_history(persistent_env):
     job = _create_persistent_job()
     assert run_job(job)[0] is True
@@ -668,6 +927,58 @@ def test_orphaned_pointer_forks_before_bootstrap(persistent_env):
     assert stored["session_root_id"] != "missing-root"
     assert FakeAgent.calls[-1]["history"] == []
     assert "CRON CONTINUATION" not in FakeAgent.calls[-1]["prompt"]
+
+
+def test_orphaned_pointer_with_contract_drift_logs_changed_components(
+    persistent_env,
+    caplog,
+):
+    job = _create_persistent_job()
+    assert run_job(job)[0] is True
+    stored = get_job(job["id"])
+    assert stored is not None
+    root = stored["session_root_id"]
+    persistent_env.sessions.pop(root)
+    persistent_env.messages.pop(root)
+    changed = json.loads(json.dumps(FakeAgent.tool_contract))
+    changed[0]["function"]["parameters"]["required"] = []
+    FakeAgent.tool_contract = changed
+
+    with caplog.at_level("WARNING"):
+        assert run_job(stored)[0] is True
+
+    assert "changed_components=['tool_contract']" in caplog.text
+
+
+def test_two_consecutive_orphaned_roots_pause_before_third_bootstrap(
+    persistent_env,
+):
+    job = _create_persistent_job()
+    assert run_job(job)[0] is True
+    first = get_job(job["id"])
+    assert first is not None
+    first_root = first["session_root_id"]
+    persistent_env.sessions.pop(first_root)
+    persistent_env.messages.pop(first_root)
+
+    assert run_job(first)[0] is True
+    replacement = get_job(job["id"])
+    assert replacement is not None
+    assert replacement["persistent_contract_forks"] == 1
+    replacement_root = replacement["session_root_id"]
+    persistent_env.sessions.pop(replacement_root)
+    persistent_env.messages.pop(replacement_root)
+    calls_before_pause = len(FakeAgent.calls)
+
+    result = run_job(replacement)
+    paused = get_job(job["id"])
+
+    assert result[0] is True
+    assert paused is not None
+    assert paused["enabled"] is False
+    assert paused["persistent_contract_forks"] == 2
+    assert paused["session_root_id"] == replacement_root
+    assert len(FakeAgent.calls) == calls_before_pause
 
 
 def test_crashed_user_tail_is_not_replayed_on_retry(persistent_env):

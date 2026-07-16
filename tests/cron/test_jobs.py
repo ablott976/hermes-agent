@@ -1,5 +1,6 @@
 """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
 
+import hashlib
 import threading
 import pytest
 from datetime import datetime, timedelta, timezone
@@ -314,6 +315,296 @@ class TestJobCRUD:
         assert "session_root_id" not in public
         assert "session_runtime_fingerprint" not in public
         assert get_job(job["id"])["session_root_id"] == "cron_root"
+
+    def test_persistent_contract_fork_fuse_pauses_before_third_bootstrap(
+        self,
+        tmp_cron_dir,
+    ):
+        job = create_job(
+            prompt="Continue safely.",
+            schedule="every 1m",
+            session_mode="persistent",
+        )
+
+        def contract(seed):
+            components = {
+                "api_mode",
+                "base_url",
+                "context_from",
+                "model",
+                "prompt",
+                "provider",
+                "script",
+                "skills",
+                "system_contract",
+                "tool_contract",
+                "workdir",
+            }
+            return {
+                "version": 4,
+                **{
+                    name: hashlib.sha256(f"{seed}:{name}".encode()).hexdigest()
+                    for name in components
+                },
+            }
+
+        first = set_persistent_session_state(
+            job["id"], "root-1", "fingerprint-1", runtime_contract=contract("one")
+        )
+        second = set_persistent_session_state(
+            job["id"],
+            "root-2",
+            "fingerprint-2",
+            runtime_contract=contract("two"),
+            unexpected_fork=True,
+        )
+        paused = set_persistent_session_state(
+            job["id"],
+            "root-3",
+            "fingerprint-3",
+            runtime_contract=contract("three"),
+            unexpected_fork=True,
+        )
+
+        assert first is not None
+        assert second is not None
+        assert paused is not None
+        assert first["session_root_id"] == "root-1"
+        assert second["persistent_contract_forks"] == 1
+        assert paused["enabled"] is False
+        assert paused["state"] == "paused"
+        assert paused["persistent_contract_forks"] == 2
+        assert paused["session_root_id"] == "root-2"
+        assert paused["session_runtime_fingerprint"] == "fingerprint-2"
+        assert "before another full bootstrap" in paused["paused_reason"]
+        public = public_job_view(paused)
+        assert public is not None
+        assert "persistent_contract_forks" not in public
+        assert "session_runtime_contract" not in public
+
+    def test_explicit_contract_update_does_not_consume_fork_budget(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Original contract.",
+            schedule="every 1m",
+            session_mode="persistent",
+        )
+        digest = hashlib.sha256(b"component").hexdigest()
+        contract = {
+            "version": 4,
+            **{
+                name: digest
+                for name in {
+                    "api_mode",
+                    "base_url",
+                    "context_from",
+                    "model",
+                    "prompt",
+                    "provider",
+                    "script",
+                    "skills",
+                    "system_contract",
+                    "tool_contract",
+                    "workdir",
+                }
+            },
+        }
+        set_persistent_session_state(
+            job["id"], "root-1", "fingerprint-1", runtime_contract=contract
+        )
+
+        updated = update_job(job["id"], {"prompt": "Explicitly revised contract."})
+        assert updated is not None
+        update_token = updated["persistent_contract_update_pending"]
+        assert isinstance(update_token, str) and update_token
+        revised = set_persistent_session_state(
+            job["id"],
+            "root-2",
+            "fingerprint-2",
+            runtime_contract=contract,
+            unexpected_fork=True,
+            contract_update_token=update_token,
+        )
+
+        assert revised is not None
+        assert revised["enabled"] is True
+        assert revised["session_root_id"] == "root-2"
+        assert "persistent_contract_forks" not in revised
+        assert "persistent_contract_update_pending" not in revised
+
+    def test_stale_runner_cannot_consume_or_overwrite_newer_contract_update(
+        self,
+        tmp_cron_dir,
+    ):
+        job = create_job(
+            prompt="Original contract.",
+            schedule="every 1m",
+            session_mode="persistent",
+        )
+        digest = hashlib.sha256(b"stale-runner").hexdigest()
+        contract = {
+            "version": 4,
+            **{
+                name: digest
+                for name in {
+                    "api_mode", "base_url", "context_from", "model", "prompt",
+                    "provider", "script", "skills", "system_contract",
+                    "tool_contract", "workdir",
+                }
+            },
+        }
+        set_persistent_session_state(
+            job["id"], "root-1", "fingerprint-1", runtime_contract=contract
+        )
+        updated = update_job(job["id"], {"prompt": "Newer explicit contract."})
+        assert updated is not None
+        live_token = updated["persistent_contract_update_pending"]
+
+        stale = set_persistent_session_state(
+            job["id"],
+            "stale-root",
+            "stale-fingerprint",
+            runtime_contract=contract,
+            unexpected_fork=True,
+            contract_update_token=None,
+        )
+        current = get_job(job["id"])
+
+        assert stale is not None
+        assert stale["_persistent_state_write_applied"] is False
+        assert current is not None
+        assert current["session_root_id"] == "root-1"
+        assert current["session_runtime_fingerprint"] == "fingerprint-1"
+        assert current["persistent_contract_update_pending"] == live_token
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "persistent_contract_forks",
+            "persistent_contract_update_pending",
+            "session_runtime_contract",
+        ],
+    )
+    def test_new_persistent_internal_fields_reject_public_updates(
+        self,
+        tmp_cron_dir,
+        field,
+    ):
+        job = create_job(
+            prompt="Protected internals.",
+            schedule="every 1m",
+            session_mode="persistent",
+        )
+        with pytest.raises(ValueError, match=field):
+            update_job(job["id"], {field: "attacker-controlled"})
+
+    def test_runtime_contract_rejects_raw_or_malformed_components(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Validate contract.",
+            schedule="every 1m",
+            session_mode="persistent",
+        )
+        with pytest.raises(ValueError, match="invalid components"):
+            set_persistent_session_state(
+                job["id"],
+                "root",
+                "fingerprint",
+                runtime_contract={"version": 4, "prompt": "raw prompt"},
+            )
+
+    def test_legacy_opaque_fingerprint_gets_one_free_contract_migration(
+        self,
+        tmp_cron_dir,
+    ):
+        job = create_job(
+            prompt="Legacy continuation.",
+            schedule="every 1m",
+            session_mode="persistent",
+        )
+        legacy = set_persistent_session_state(job["id"], "legacy-root", "legacy-v3")
+        assert legacy is not None
+        digest = hashlib.sha256(b"migration").hexdigest()
+        contract = {
+            "version": 4,
+            **{
+                name: digest
+                for name in {
+                    "api_mode", "base_url", "context_from", "model", "prompt",
+                    "provider", "script", "skills", "system_contract",
+                    "tool_contract", "workdir",
+                }
+            },
+        }
+
+        migrated = set_persistent_session_state(
+            job["id"],
+            "v4-root",
+            "v4-fingerprint",
+            runtime_contract=contract,
+            unexpected_fork=True,
+        )
+
+        assert migrated is not None
+        assert migrated["enabled"] is True
+        assert migrated["session_root_id"] == "v4-root"
+        assert migrated["session_runtime_contract"] == contract
+        assert "persistent_contract_forks" not in migrated
+
+    def test_concurrent_contract_forks_atomically_pause_at_threshold(
+        self,
+        tmp_cron_dir,
+    ):
+        job = create_job(
+            prompt="Concurrent continuation.",
+            schedule="every 1m",
+            session_mode="persistent",
+        )
+        components = {
+            "api_mode", "base_url", "context_from", "model", "prompt",
+            "provider", "script", "skills", "system_contract",
+            "tool_contract", "workdir",
+        }
+
+        def contract(seed):
+            return {
+                "version": 4,
+                **{
+                    name: hashlib.sha256(f"{seed}:{name}".encode()).hexdigest()
+                    for name in components
+                },
+            }
+
+        set_persistent_session_state(
+            job["id"], "root-0", "fingerprint-0", runtime_contract=contract("zero")
+        )
+        barrier = threading.Barrier(3)
+        results = []
+
+        def fork(index):
+            barrier.wait()
+            results.append(
+                set_persistent_session_state(
+                    job["id"],
+                    f"root-{index}",
+                    f"fingerprint-{index}",
+                    runtime_contract=contract(str(index)),
+                    unexpected_fork=True,
+                )
+            )
+
+        threads = [threading.Thread(target=fork, args=(index,)) for index in (1, 2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert len(results) == 2
+        final = get_job(job["id"])
+        assert final is not None
+        assert final["enabled"] is False
+        assert final["persistent_contract_forks"] == 2
+        assert final["session_root_id"] in {"root-1", "root-2"}
 
     @pytest.mark.parametrize("value", ["resume", "continuable", "", 123])
     def test_create_rejects_invalid_session_mode(self, tmp_cron_dir, value):
