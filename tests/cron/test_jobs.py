@@ -1320,6 +1320,31 @@ class TestAdvanceNextRun:
         assert updated is not None
         assert updated["next_run_at"] == "2026-07-16T22:02:27+00:00"
 
+    def test_catch_up_fast_forward_is_not_advanced_twice(
+        self,
+        tmp_cron_dir,
+        monkeypatch,
+    ):
+        now = datetime(2026, 7, 16, 22, 2, 19, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        job = create_job(prompt="Catch-up check", schedule="every 1h")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = "2026-07-16T20:00:27+00:00"
+        save_jobs(jobs)
+
+        due = get_due_jobs()
+        assert [item["id"] for item in due] == [job["id"]]
+        fast_forwarded = get_job(job["id"])
+        assert fast_forwarded is not None
+        assert fast_forwarded["next_run_at"] == "2026-07-16T23:02:19+00:00"
+
+        assert advance_next_run(job["id"]) is False
+        mark_job_run(job["id"], success=True)
+
+        completed = get_job(job["id"])
+        assert completed is not None
+        assert completed["next_run_at"] == "2026-07-16T23:02:19+00:00"
+
     def test_mark_run_preserves_a_future_precomputed_occurrence(
         self,
         tmp_cron_dir,

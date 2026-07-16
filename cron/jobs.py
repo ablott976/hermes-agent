@@ -2105,10 +2105,22 @@ def advance_next_run(job_id: str) -> bool:
                 kind = job.get("schedule", {}).get("kind")
                 if kind not in {"cron", "interval"}:
                     return False
-                now = _hermes_now().isoformat()
+                now_dt = _hermes_now()
+                now = now_dt.isoformat()
+                stored_next = job.get("next_run_at")
+                if stored_next:
+                    try:
+                        if _ensure_aware(datetime.fromisoformat(stored_next)) > now_dt:
+                            # get_due_jobs() may already have fast-forwarded a
+                            # stale recurring job before returning one catch-up
+                            # execution. That future slot is the crash-safe
+                            # pre-advance; advancing it again skips a period.
+                            return False
+                    except Exception:
+                        pass
                 anchor = (
-                    job.get("next_run_at")
-                    if kind == "interval" and job.get("next_run_at")
+                    stored_next
+                    if kind == "interval" and stored_next
                     else now
                 )
                 new_next = compute_next_run(job["schedule"], anchor)
@@ -2184,12 +2196,7 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
             job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
-                anchor = (
-                    job.get("next_run_at")
-                    if kind == "interval" and job.get("next_run_at")
-                    else now.isoformat()
-                )
-                nxt = compute_next_run(job["schedule"], anchor)
+                nxt = compute_next_run(job["schedule"], now.isoformat())
                 if nxt:
                     job["next_run_at"] = nxt
             save_jobs(jobs)
