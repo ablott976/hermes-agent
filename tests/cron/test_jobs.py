@@ -217,6 +217,18 @@ class TestComputeNextRun:
         # Should be ~30 minutes from last run
         assert next_dt > datetime.now().astimezone() + timedelta(minutes=29)
 
+    def test_interval_skips_missed_slots_but_keeps_original_cadence(self, monkeypatch):
+        now = datetime(2026, 7, 16, 22, 2, 19, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        schedule = {"kind": "interval", "minutes": 1}
+
+        result = compute_next_run(
+            schedule,
+            last_run_at="2026-07-16T22:00:27+00:00",
+        )
+
+        assert result == "2026-07-16T22:02:27+00:00"
+
     def test_cron_returns_future(self):
         pytest.importorskip("croniter")
         schedule = {"kind": "cron", "expr": "* * * * *"}  # every minute
@@ -1289,6 +1301,85 @@ class TestAdvanceNextRun:
         from cron.jobs import _ensure_aware, _hermes_now
         new_next_dt = _ensure_aware(datetime.fromisoformat(updated["next_run_at"]))
         assert new_next_dt > _hermes_now(), "next_run_at should be in the future after advance"
+
+    def test_advances_from_scheduled_slot_instead_of_dispatch_time(
+        self,
+        tmp_cron_dir,
+        monkeypatch,
+    ):
+        now = datetime(2026, 7, 16, 22, 2, 19, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        job = create_job(prompt="Cadence check", schedule="every 1m")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = "2026-07-16T22:00:27+00:00"
+        save_jobs(jobs)
+
+        assert advance_next_run(job["id"]) is True
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["next_run_at"] == "2026-07-16T22:02:27+00:00"
+
+    def test_catch_up_fast_forward_is_not_advanced_twice(
+        self,
+        tmp_cron_dir,
+        monkeypatch,
+    ):
+        now = datetime(2026, 7, 16, 22, 2, 19, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        job = create_job(prompt="Catch-up check", schedule="every 1h")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = "2026-07-16T20:00:27+00:00"
+        save_jobs(jobs)
+
+        due = get_due_jobs()
+        assert [item["id"] for item in due] == [job["id"]]
+        fast_forwarded = get_job(job["id"])
+        assert fast_forwarded is not None
+        assert fast_forwarded["next_run_at"] == "2026-07-16T23:02:19+00:00"
+
+        assert advance_next_run(job["id"]) is False
+        mark_job_run(job["id"], success=True)
+
+        completed = get_job(job["id"])
+        assert completed is not None
+        assert completed["next_run_at"] == "2026-07-16T23:02:19+00:00"
+
+    def test_mark_run_preserves_a_future_precomputed_occurrence(
+        self,
+        tmp_cron_dir,
+        monkeypatch,
+    ):
+        now = datetime(2026, 7, 16, 22, 2, 22, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        job = create_job(prompt="Cadence check", schedule="every 1m")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = "2026-07-16T22:02:27+00:00"
+        save_jobs(jobs)
+
+        mark_job_run(job["id"], success=True)
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["next_run_at"] == "2026-07-16T22:02:27+00:00"
+
+    def test_mark_run_advances_an_expired_precomputed_occurrence(
+        self,
+        tmp_cron_dir,
+        monkeypatch,
+    ):
+        now = datetime(2026, 7, 16, 22, 4, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        job = create_job(prompt="Long cadence check", schedule="every 1m")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = "2026-07-16T22:02:27+00:00"
+        save_jobs(jobs)
+
+        mark_job_run(job["id"], success=True)
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["next_run_at"] == "2026-07-16T22:04:27+00:00"
 
     def test_advances_cron_job(self, tmp_cron_dir):
         """Cron-expression jobs should have next_run_at bumped to the next occurrence."""
