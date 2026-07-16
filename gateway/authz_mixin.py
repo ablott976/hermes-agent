@@ -40,20 +40,32 @@ class GatewayAuthorizationMixin:
 
         In multiplex mode, secondary-profile adapters live in
         ``_profile_adapters[profile]`` while the default/active profile uses
-        ``self.adapters``. ``SessionSource.profile`` selects which map to consult.
-        When a stamped profile has its own adapter registry entry, the default
-        profile's same-platform adapter must not be consulted as a fallback.
+        ``self.adapters``. Dedicated named gateways also keep their active
+        profile's adapters in ``self.adapters``. ``SessionSource.profile``
+        selects which map to consult. When a stamped profile is not the active
+        profile, the active profile's same-platform adapter must not be
+        consulted as a fallback.
         """
         if not platform:
             return None
         profile_name = (profile or "").strip() or None
-        if profile_name and profile_name != "default":
+        if profile_name:
+            active_profile_name = getattr(self, "_active_profile_name", None)
+            active_profile = active_profile_name() if callable(active_profile_name) else "default"
+            if profile_name == active_profile:
+                adapters = getattr(self, "adapters", None) or {}
+                return adapters.get(platform)
+            if profile_name == "default":
+                # A default-profile stamp belongs to self.adapters only on the
+                # default gateway.  On a dedicated named gateway, fail closed
+                # rather than send through that named profile's bot.
+                return None
             profile_adapters = getattr(self, "_profile_adapters", None) or {}
             if profile_name in profile_adapters:
                 return profile_adapters[profile_name].get(platform)
-            # Fail closed: a stamped secondary profile with no registry entry
+            # Fail closed: a stamped non-active profile with no registry entry
             # (e.g. its adapter failed to connect) must NOT fall back to the
-            # default profile's adapter — that sends replies out the wrong bot.
+            # active profile's adapter — that sends replies out the wrong bot.
             return None
         adapters = getattr(self, "adapters", None) or {}
         return adapters.get(platform)

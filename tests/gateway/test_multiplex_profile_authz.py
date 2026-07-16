@@ -127,6 +127,35 @@ def test_adapter_for_source_resolves_secondary_profile_adapter(monkeypatch):
     ) is default_adapter
 
 
+def test_dedicated_named_profile_resolves_only_its_own_adapter():
+    """A dedicated profile uses self.adapters only for its own profile stamp."""
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    maker_adapter = MagicMock()
+    runner.adapters = {Platform.TELEGRAM: maker_adapter}
+    runner._profile_adapters = {}
+    runner._active_profile_name = lambda: "maker"
+
+    assert runner._authorization_adapter(Platform.TELEGRAM, "maker") is maker_adapter
+    assert runner._authorization_adapter(Platform.TELEGRAM, "default") is None
+    assert runner._authorization_adapter(Platform.TELEGRAM, "other") is None
+
+
+def test_default_profile_stamp_still_resolves_on_default_gateway():
+    """The default gateway keeps its existing stamped and unstamped routes."""
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    default_adapter = MagicMock()
+    runner.adapters = {Platform.TELEGRAM: default_adapter}
+    runner._profile_adapters = {}
+    runner._active_profile_name = lambda: "default"
+
+    assert runner._authorization_adapter(Platform.TELEGRAM) is default_adapter
+    assert runner._authorization_adapter(Platform.TELEGRAM, "default") is default_adapter
+
+
 def test_secondary_allowlist_dm_behavior_ignores_unauthorized(monkeypatch):
     """Unauthorized-DM behavior must read the secondary adapter's dm_policy."""
     runner, _default_adapter, secondary_adapter = _make_multiplex_runner(monkeypatch)
