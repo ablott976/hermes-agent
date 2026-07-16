@@ -294,6 +294,51 @@ def test_notifier_owning_profile_adapter_no_default_fallback(tmp_path, monkeypat
     assert [ev.kind for ev in _unseen_terminal_events_for(tid, "chat-beta")] == ["completed"]
 
 
+def test_notifier_uses_active_named_profile_adapter(tmp_path, monkeypatch):
+    """A dedicated named gateway must deliver its own stamped subscription.
+
+    Dedicated gateways keep their live adapters in ``self.adapters``.  The
+    subscription still carries the concrete profile name so another gateway
+    cannot send it through the wrong bot.  Resolution must therefore treat a
+    stamp matching the runner's active profile as the local adapter map.
+    """
+    db_path = tmp_path / "dedicated-profile.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="owned by maker", assignee="maker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-maker",
+            notifier_profile="maker",
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_notifier_profile = "maker"
+    runner._profile_adapters = {}
+    runner._active_profile_name = lambda: "maker"
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == "chat-maker"
+    assert tid in adapter.sent[0]["text"]
+
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn) == []
+    finally:
+        conn.close()
+
+
 def _unseen_terminal_events_for(tid, chat_id):
     conn = kb.connect()
     try:
