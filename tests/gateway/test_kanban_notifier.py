@@ -362,6 +362,7 @@ def test_named_multiplexer_uses_secondary_default_profile_adapter(tmp_path, monk
     maker_adapter = RecordingAdapter()
     default_adapter = RecordingAdapter()
     runner = _make_runner(maker_adapter)
+    runner.adapters = {Platform.DISCORD: maker_adapter}  # type: ignore[assignment]
     runner._kanban_notifier_profile = "maker"
     runner._profile_adapters = {  # type: ignore[assignment]
         "default": {Platform.TELEGRAM: default_adapter},
