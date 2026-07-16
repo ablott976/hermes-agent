@@ -950,6 +950,37 @@ def test_orphaned_pointer_with_contract_drift_logs_changed_components(
     assert "changed_components=['tool_contract']" in caplog.text
 
 
+def test_two_consecutive_orphaned_roots_pause_before_third_bootstrap(
+    persistent_env,
+):
+    job = _create_persistent_job()
+    assert run_job(job)[0] is True
+    first = get_job(job["id"])
+    assert first is not None
+    first_root = first["session_root_id"]
+    persistent_env.sessions.pop(first_root)
+    persistent_env.messages.pop(first_root)
+
+    assert run_job(first)[0] is True
+    replacement = get_job(job["id"])
+    assert replacement is not None
+    assert replacement["persistent_contract_forks"] == 1
+    replacement_root = replacement["session_root_id"]
+    persistent_env.sessions.pop(replacement_root)
+    persistent_env.messages.pop(replacement_root)
+    calls_before_pause = len(FakeAgent.calls)
+
+    result = run_job(replacement)
+    paused = get_job(job["id"])
+
+    assert result[0] is True
+    assert paused is not None
+    assert paused["enabled"] is False
+    assert paused["persistent_contract_forks"] == 2
+    assert paused["session_root_id"] == replacement_root
+    assert len(FakeAgent.calls) == calls_before_pause
+
+
 def test_crashed_user_tail_is_not_replayed_on_retry(persistent_env):
     job = _create_persistent_job()
     FakeAgent.fail_next = True

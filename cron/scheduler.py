@@ -4098,9 +4098,12 @@ def run_job(
                     _runtime_fingerprint,
                     runtime_contract=_runtime_contract,
                     unexpected_fork=bool(
-                        _resume_persistent_turn
+                        _persistent_root
                         and _stored_runtime_fingerprint
-                        and _stored_runtime_fingerprint != _runtime_fingerprint
+                        and (
+                            not _resume_persistent_turn
+                            or _stored_runtime_fingerprint != _runtime_fingerprint
+                        )
                     ),
                     contract_update_token=_contract_update_token,
                 )
