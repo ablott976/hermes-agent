@@ -115,8 +115,12 @@ one cache-stable root for the configured number of successful ticks, then claims
 a planned rollover before the next model call and loads the full job prompt once
 into a new root. The following ticks use compact continuation prompts again.
 Planned rollovers preserve the runtime contract and do not consume the unexplained
-fork fuse. Invalid, fractional, negative, boolean, or zero values disable the
-feature. Changing the value affects the next completed-run boundary.
+feature. Invalid, fractional, negative, boolean, or zero values disable the
+feature. Changing the value affects the next successful-run boundary. Failed
+attempts still advance the historical `repeat.completed` counter used for repeat
+limits, but they do not advance `persistent_successful_runs` or trigger a
+rollover. Existing persistent jobs without that internal counter begin their
+first configured rollover cycle from zero successful runs after deployment.
 
 Loaded skill text is part of that durable conversation snapshot. Editing the skill file while the job is running does not restart the conversation or inject the new body mid-lineage; changing the configured skill identity/list still starts a compatible new root. To deliberately reload an edited skill body, switch the job to `fresh` and then back to `persistent` before resuming.
 

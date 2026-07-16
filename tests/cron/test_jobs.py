@@ -369,6 +369,7 @@ class TestJobCRUD:
         )
         jobs = load_jobs()
         jobs[0]["repeat"]["completed"] = 5
+        jobs[0]["persistent_successful_runs"] = 5
         jobs[0]["persistent_silent_ticks"] = 1
         jobs[0]["persistent_contract_forks"] = 1
         save_jobs(jobs)
@@ -376,7 +377,7 @@ class TestJobCRUD:
         claimed = claim_persistent_rollover(
             job["id"],
             expected_root_id="root-before-rollover",
-            expected_completed=5,
+            expected_successful_runs=5,
             rollover_runs=5,
         )
 
@@ -389,6 +390,7 @@ class TestJobCRUD:
         assert stored["session_runtime_contract"] == contract
         assert stored["persistent_rollover_checkpoint"] == 5
         assert stored["persistent_planned_rollovers"] == 1
+        assert stored["persistent_successful_runs"] == 5
         assert stored["persistent_contract_update_pending"]
         assert "persistent_silent_ticks" not in stored
         assert stored["persistent_contract_forks"] == 1
@@ -399,6 +401,7 @@ class TestJobCRUD:
         assert "persistent_rollover_checkpoint" not in public
         assert "persistent_planned_rollovers" not in public
         assert "persistent_rollover_lease" not in public
+        assert "persistent_successful_runs" not in public
         with pytest.raises(ValueError, match="persistent_rollover_checkpoint"):
             update_job(job["id"], {"persistent_rollover_checkpoint": 10})
 
@@ -420,12 +423,13 @@ class TestJobCRUD:
         set_persistent_session_state(job["id"], "root", "fingerprint")
         jobs = load_jobs()
         jobs[0]["repeat"]["completed"] = 5
+        jobs[0]["persistent_successful_runs"] = 5
         save_jobs(jobs)
 
         rejected = claim_persistent_rollover(
             job["id"],
             expected_root_id=expected_root,
-            expected_completed=expected_completed,
+            expected_successful_runs=expected_completed,
             rollover_runs=5,
         )
 
@@ -459,6 +463,26 @@ class TestJobCRUD:
         assert "persistent_rollover_checkpoint" not in stored
         assert "persistent_planned_rollovers" not in stored
         assert "persistent_rollover_lease" not in stored
+        assert "persistent_successful_runs" not in stored
+
+    def test_persistent_success_counter_ignores_failed_attempts(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Continue development",
+            schedule="every 1m",
+            session_mode="persistent",
+        )
+
+        mark_job_run(job["id"], False, "provider failed")
+        after_failure = get_job(job["id"])
+        assert after_failure is not None
+        assert after_failure["repeat"]["completed"] == 1
+        assert "persistent_successful_runs" not in after_failure
+
+        mark_job_run(job["id"], True)
+        after_success = get_job(job["id"])
+        assert after_success is not None
+        assert after_success["repeat"]["completed"] == 2
+        assert after_success["persistent_successful_runs"] == 1
 
     def test_rollover_recovery_lease_is_single_owner_and_releasable(
         self,
@@ -472,11 +496,12 @@ class TestJobCRUD:
         set_persistent_session_state(job["id"], "root", "fingerprint")
         jobs = load_jobs()
         jobs[0]["repeat"]["completed"] = 5
+        jobs[0]["persistent_successful_runs"] = 5
         save_jobs(jobs)
         claimed = claim_persistent_rollover(
             job["id"],
             expected_root_id="root",
-            expected_completed=5,
+            expected_successful_runs=5,
             rollover_runs=5,
         )
         assert claimed is not None
@@ -484,14 +509,14 @@ class TestJobCRUD:
 
         busy = claim_persistent_rollover_recovery(
             job["id"],
-            expected_completed=5,
+            expected_successful_runs=5,
             expected_owner=owner,
         )
         assert busy is not None
         assert busy["_persistent_rollover_recovery"] == "busy"
         takeover = claim_persistent_rollover_recovery(
             job["id"],
-            expected_completed=5,
+            expected_successful_runs=5,
             expected_owner=owner,
             lease_ttl_seconds=0,
         )
@@ -500,7 +525,7 @@ class TestJobCRUD:
         new_owner = takeover["_persistent_rollover_owner"]
         stale = claim_persistent_rollover_recovery(
             job["id"],
-            expected_completed=5,
+            expected_successful_runs=5,
             expected_owner=owner,
             lease_ttl_seconds=0,
         )

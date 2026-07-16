@@ -325,6 +325,7 @@ _IMMUTABLE_JOB_FIELDS = frozenset({
     "persistent_rollover_lease",
     "persistent_planned_rollovers",
     "persistent_rollover_checkpoint",
+    "persistent_successful_runs",
     "persistent_silent_ticks",
     "session_root_id",
     "session_runtime_contract",
@@ -336,6 +337,7 @@ _INTERNAL_JOB_FIELDS = frozenset({
     "persistent_rollover_lease",
     "persistent_planned_rollovers",
     "persistent_rollover_checkpoint",
+    "persistent_successful_runs",
     "persistent_silent_ticks",
     "session_root_id",
     "session_runtime_contract",
@@ -514,6 +516,7 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
         normalized.pop("persistent_rollover_lease", None)
         normalized.pop("persistent_planned_rollovers", None)
         normalized.pop("persistent_rollover_checkpoint", None)
+        normalized.pop("persistent_successful_runs", None)
         normalized.pop("persistent_silent_ticks", None)
         normalized.pop("session_root_id", None)
         normalized.pop("session_runtime_contract", None)
@@ -1502,6 +1505,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updated.pop("persistent_rollover_lease", None)
                 updated.pop("persistent_planned_rollovers", None)
                 updated.pop("persistent_rollover_checkpoint", None)
+                updated.pop("persistent_successful_runs", None)
                 updated.pop("persistent_silent_ticks", None)
                 updated.pop("session_root_id", None)
                 updated.pop("session_runtime_contract", None)
@@ -1607,12 +1611,12 @@ def claim_persistent_rollover(
     job_id: str,
     *,
     expected_root_id: str,
-    expected_completed: int,
+    expected_successful_runs: int,
     rollover_runs: int,
 ) -> Optional[Dict[str, Any]]:
     """Atomically claim one planned persistent-root rollover.
 
-    The compare-and-swap covers both the current root and completed-run count.
+    The compare-and-swap covers both the current root and success-only count.
     A successful claim rotates the contract-update token so any runner that
     captured the previous job snapshot can no longer write continuation state.
     Runtime contract/fingerprint stay intact; only the root pointer is cleared
@@ -1628,9 +1632,9 @@ def claim_persistent_rollover(
         raise ValueError("persistent rollover interval must be a positive integer")
     expected_root = str(expected_root_id or "").strip()
     try:
-        expected_count = max(0, int(expected_completed))
+        expected_success_count = max(0, int(expected_successful_runs))
     except (TypeError, ValueError) as exc:
-        raise ValueError("expected completed count must be a non-negative integer") from exc
+        raise ValueError("expected successful-run count must be non-negative") from exc
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -1646,20 +1650,20 @@ def claim_persistent_rollover(
 
             updated = dict(job)
             live_root = str(updated.get("session_root_id") or "").strip()
-            repeat = updated.get("repeat")
             try:
-                live_completed = max(
+                live_successful_runs = max(
                     0,
-                    int((repeat or {}).get("completed") or 0)
-                    if isinstance(repeat, dict)
-                    else 0,
+                    int(updated.get("persistent_successful_runs") or 0),
                 )
             except (TypeError, ValueError):
-                live_completed = 0
+                live_successful_runs = 0
 
             rollover_owner = ""
             status = "not_due"
-            if live_root != expected_root or live_completed != expected_count:
+            if (
+                live_root != expected_root
+                or live_successful_runs != expected_success_count
+            ):
                 status = "stale"
             else:
                 try:
@@ -1671,9 +1675,9 @@ def claim_persistent_rollover(
                     checkpoint = 0
                 due = bool(
                     live_root
-                    and live_completed > 0
-                    and live_completed % rollover_runs == 0
-                    and checkpoint != live_completed
+                    and live_successful_runs > 0
+                    and live_successful_runs % rollover_runs == 0
+                    and checkpoint != live_successful_runs
                 )
                 if due:
                     rollover_owner = uuid.uuid4().hex
@@ -1684,7 +1688,7 @@ def claim_persistent_rollover(
                         ) + 1
                     except (TypeError, ValueError):
                         rollover_count = 1
-                    updated["persistent_rollover_checkpoint"] = live_completed
+                    updated["persistent_rollover_checkpoint"] = live_successful_runs
                     updated["persistent_planned_rollovers"] = rollover_count
                     updated["persistent_rollover_lease"] = {
                         "owner": rollover_owner,
@@ -1708,7 +1712,7 @@ def claim_persistent_rollover(
 def claim_persistent_rollover_recovery(
     job_id: str,
     *,
-    expected_completed: int,
+    expected_successful_runs: int,
     expected_owner: str,
     lease_ttl_seconds: float = 900.0,
 ) -> Optional[Dict[str, Any]]:
@@ -1717,12 +1721,12 @@ def claim_persistent_rollover_recovery(
     A fresh lease returns ``busy``. An expired (or absent after a pre-bootstrap
     crash) lease is atomically replaced and the update token is rotated so the
     former owner cannot persist stale state. ``stale`` means the caller's job
-    snapshot no longer matches the live lease/completed boundary.
+    snapshot no longer matches the live lease/success boundary.
     """
     try:
-        completed = max(0, int(expected_completed))
+        successful_runs = max(0, int(expected_successful_runs))
     except (TypeError, ValueError) as exc:
-        raise ValueError("expected completed count must be a non-negative integer") from exc
+        raise ValueError("expected successful-run count must be non-negative") from exc
     try:
         ttl = max(0.0, float(lease_ttl_seconds))
     except (TypeError, ValueError) as exc:
@@ -1741,16 +1745,13 @@ def claim_persistent_rollover_recovery(
                     "persistent rollover recovery requires a persistent job"
                 )
             updated = dict(job)
-            repeat = updated.get("repeat")
             try:
-                live_completed = max(
+                live_successful_runs = max(
                     0,
-                    int((repeat or {}).get("completed") or 0)
-                    if isinstance(repeat, dict)
-                    else 0,
+                    int(updated.get("persistent_successful_runs") or 0),
                 )
             except (TypeError, ValueError):
-                live_completed = 0
+                live_successful_runs = 0
             try:
                 checkpoint = max(
                     0,
@@ -1765,9 +1766,9 @@ def claim_persistent_rollover_recovery(
                 updated.get("persistent_contract_update_pending") or ""
             ).strip()
             rollover_pending = bool(
-                completed > 0
-                and live_completed == completed
-                and checkpoint == completed
+                successful_runs > 0
+                and live_successful_runs == successful_runs
+                and checkpoint == successful_runs
                 and (live_owner or update_token)
             )
             new_owner = ""
@@ -2121,10 +2122,23 @@ def mark_job_run(
                 if job.get("run_claim") is not None:
                     job["run_claim"] = None
 
-                workspace_scoped_persistent = (
+                persistent_agent_job = (
                     normalize_session_mode(job.get("session_mode"), strict=False)
                     == SESSION_MODE_PERSISTENT
                     and not bool(job.get("no_agent"))
+                )
+                if persistent_agent_job and success:
+                    try:
+                        successful_runs = max(
+                            0,
+                            int(job.get("persistent_successful_runs") or 0),
+                        ) + 1
+                    except (TypeError, ValueError):
+                        successful_runs = 1
+                    job["persistent_successful_runs"] = successful_runs
+
+                workspace_scoped_persistent = (
+                    persistent_agent_job
                     and bool(str(job.get("workdir") or "").strip())
                 )
                 if workspace_scoped_persistent and success and persistent_no_progress:

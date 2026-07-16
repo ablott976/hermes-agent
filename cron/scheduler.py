@@ -3535,16 +3535,13 @@ def run_job(
                 job_id,
             )
     if _persistent_job:
-        repeat = job.get("repeat")
         try:
-            _completed_runs = max(
+            _successful_runs = max(
                 0,
-                int((repeat or {}).get("completed") or 0)
-                if isinstance(repeat, dict)
-                else 0,
+                int(job.get("persistent_successful_runs") or 0),
             )
         except (TypeError, ValueError):
-            _completed_runs = 0
+            _successful_runs = 0
         try:
             _rollover_checkpoint = max(
                 0,
@@ -3560,14 +3557,14 @@ def run_job(
             _rollover_lease.get("owner") or ""
         ).strip()
         _pending_rollover_recovery = bool(
-            _completed_runs > 0
-            and _rollover_checkpoint == _completed_runs
+            _successful_runs > 0
+            and _rollover_checkpoint == _successful_runs
             and (_snapshot_rollover_owner or _contract_update_token)
         )
         if _pending_rollover_recovery:
             _recovery = claim_persistent_rollover_recovery(
                 job_id,
-                expected_completed=_completed_runs,
+                expected_successful_runs=_successful_runs,
                 expected_owner=_snapshot_rollover_owner,
             )
             if _recovery is None:
@@ -3610,15 +3607,15 @@ def run_job(
             _rollover_runs = _resolve_persistent_rollover_runs(_rollover_cfg)
             _rollover_due = bool(
                 _rollover_runs
-                and _completed_runs > 0
-                and _completed_runs % _rollover_runs == 0
-                and _rollover_checkpoint != _completed_runs
+                and _successful_runs > 0
+                and _successful_runs % _rollover_runs == 0
+                and _rollover_checkpoint != _successful_runs
             )
             if _rollover_due:
                 _claimed_rollover = claim_persistent_rollover(
                     job_id,
                     expected_root_id=_persistent_root,
-                    expected_completed=_completed_runs,
+                    expected_successful_runs=_successful_runs,
                     rollover_runs=_rollover_runs,
                 )
                 if _claimed_rollover is None:
@@ -3655,9 +3652,9 @@ def run_job(
                         run_metadata["planned_rollover"] = True
                     logger.info(
                         "Job '%s': claimed planned persistent rollover after %d "
-                        "completed runs; bootstrapping one bounded root",
+                        "successful runs; bootstrapping one bounded root",
                         job_id,
-                        _completed_runs,
+                        _successful_runs,
                     )
     _persistent_resume_matched = False
     _persistent_tip = None

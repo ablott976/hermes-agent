@@ -79,7 +79,7 @@ Jobs are stored in `~/.hermes/cron/jobs.json` with atomic write semantics (write
 
 Older jobs may have a single `skill` field instead of the `skills` array. The scheduler normalizes this at load time — single `skill` is promoted to `skills: [skill]`.
 
-`session_mode` is also optional on disk. A missing or invalid value normalizes to `fresh`, preserving historical behavior and the compact legacy record shape. `session_root_id`, `session_runtime_fingerprint`, `session_runtime_contract`, `persistent_contract_forks`, `persistent_contract_update_pending`, `persistent_rollover_lease`, `persistent_rollover_checkpoint`, `persistent_planned_rollovers`, and `persistent_silent_ticks` are scheduler-owned and cannot be changed through public update surfaces.
+`session_mode` is also optional on disk. A missing or invalid value normalizes to `fresh`, preserving historical behavior and the compact legacy record shape. `session_root_id`, `session_runtime_fingerprint`, `session_runtime_contract`, `persistent_contract_forks`, `persistent_contract_update_pending`, `persistent_rollover_lease`, `persistent_rollover_checkpoint`, `persistent_planned_rollovers`, `persistent_successful_runs`, and `persistent_silent_ticks` are scheduler-owned and cannot be changed through public update surfaces.
 
 ## Scheduler Runtime
 

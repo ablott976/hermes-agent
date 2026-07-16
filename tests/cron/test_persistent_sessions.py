@@ -569,6 +569,7 @@ def test_planned_rollover_bootstraps_once_then_resumes_new_root(
     original_root = original["session_root_id"]
     jobs = load_jobs()
     jobs[0]["repeat"]["completed"] = 5
+    jobs[0]["persistent_successful_runs"] = 5
     jobs[0]["persistent_contract_forks"] = 1
     save_jobs(jobs)
 
@@ -615,6 +616,7 @@ def test_planned_rollover_preserves_armed_fork_fuse(
     assert run_job(job)[0] is True
     jobs = load_jobs()
     jobs[0]["repeat"]["completed"] = 5
+    jobs[0]["persistent_successful_runs"] = 5
     jobs[0]["persistent_contract_forks"] = 1
     save_jobs(jobs)
     candidate = get_job(job["id"])
@@ -653,11 +655,12 @@ def test_crash_after_rollover_claim_recovers_with_one_bootstrap(
     assert stored is not None
     jobs = load_jobs()
     jobs[0]["repeat"]["completed"] = 5
+    jobs[0]["persistent_successful_runs"] = 5
     save_jobs(jobs)
     claimed = claim_persistent_rollover(
         job["id"],
         expected_root_id=stored["session_root_id"],
-        expected_completed=5,
+        expected_successful_runs=5,
         rollover_runs=5,
     )
     assert claimed is not None
@@ -699,13 +702,14 @@ def test_stale_rollover_runner_defers_without_model_or_repeat_increment(
     assert run_job(job)[0] is True
     jobs = load_jobs()
     jobs[0]["repeat"]["completed"] = 5
+    jobs[0]["persistent_successful_runs"] = 5
     save_jobs(jobs)
     stale_snapshot = get_job(job["id"])
     assert stale_snapshot is not None
     claimed = claim_persistent_rollover(
         job["id"],
         expected_root_id=stale_snapshot["session_root_id"],
-        expected_completed=5,
+        expected_successful_runs=5,
         rollover_runs=5,
     )
     assert claimed is not None
@@ -718,6 +722,7 @@ def test_stale_rollover_runner_defers_without_model_or_repeat_increment(
     assert current is not None
     assert len(FakeAgent.calls) == calls_before
     assert current["repeat"]["completed"] == 5
+    assert current["persistent_successful_runs"] == 5
     assert "session_root_id" not in current
     assert current["persistent_rollover_checkpoint"] == 5
     stale_write = set_persistent_session_state(
@@ -747,13 +752,14 @@ def test_concurrent_rootless_recovery_snapshots_allow_one_model_bootstrap(
     assert run_job(job)[0] is True
     jobs = load_jobs()
     jobs[0]["repeat"]["completed"] = 5
+    jobs[0]["persistent_successful_runs"] = 5
     save_jobs(jobs)
     stored = get_job(job["id"])
     assert stored is not None
     claimed = claim_persistent_rollover(
         job["id"],
         expected_root_id=stored["session_root_id"],
-        expected_completed=5,
+        expected_successful_runs=5,
         rollover_runs=5,
     )
     assert claimed is not None
@@ -796,6 +802,7 @@ def test_rollover_lease_is_revalidated_immediately_before_model(
     assert run_job(job)[0] is True
     jobs = load_jobs()
     jobs[0]["repeat"]["completed"] = 5
+    jobs[0]["persistent_successful_runs"] = 5
     save_jobs(jobs)
     candidate = get_job(job["id"])
     assert candidate is not None
@@ -804,7 +811,7 @@ def test_rollover_lease_is_revalidated_immediately_before_model(
     def _lose_lease(job_id, *, expected_owner):
         takeover = claim_persistent_rollover_recovery(
             job_id,
-            expected_completed=5,
+            expected_successful_runs=5,
             expected_owner=expected_owner,
             lease_ttl_seconds=0,
         )
