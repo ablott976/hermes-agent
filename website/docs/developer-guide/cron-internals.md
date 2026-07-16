@@ -79,7 +79,7 @@ Jobs are stored in `~/.hermes/cron/jobs.json` with atomic write semantics (write
 
 Older jobs may have a single `skill` field instead of the `skills` array. The scheduler normalizes this at load time — single `skill` is promoted to `skills: [skill]`.
 
-`session_mode` is also optional on disk. A missing or invalid value normalizes to `fresh`, preserving historical behavior and the compact legacy record shape. `session_root_id`, `session_runtime_fingerprint`, `session_runtime_contract`, `persistent_contract_forks`, `persistent_contract_update_pending`, and `persistent_silent_ticks` are scheduler-owned and cannot be changed through public update surfaces.
+`session_mode` is also optional on disk. A missing or invalid value normalizes to `fresh`, preserving historical behavior and the compact legacy record shape. `session_root_id`, `session_runtime_fingerprint`, `session_runtime_contract`, `persistent_contract_forks`, `persistent_contract_update_pending`, `persistent_rollover_lease`, `persistent_rollover_checkpoint`, `persistent_planned_rollovers`, `persistent_successful_runs`, and `persistent_silent_ticks` are scheduler-owned and cannot be changed through public update surfaces.
 
 ## Scheduler Runtime
 
@@ -96,8 +96,9 @@ tick()
      a. Set state to "running"
      b. Create a new in-memory AIAgent for the tick
      c. Fresh: start a new session and load prompt/skills
-        Persistent: resolve root → active compression tip, sanitize replay,
-        validate the runtime fingerprint, and restore persisted history/prompt
+        Persistent: atomically claim any configured planned rollover, then
+        resolve root → active compression tip, sanitize replay, validate the
+        runtime fingerprint, and restore persisted history/prompt
      d. Run the job prompt or compact continuation turn through the agent
      e. Deliver the response to the configured target
      f. Persist per-tick usage and update run_count / next_run

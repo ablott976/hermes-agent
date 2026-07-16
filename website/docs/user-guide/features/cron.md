@@ -102,9 +102,25 @@ Persistent ticks use at most 12 agent turns by default, or a lower profile-wide 
 ```yaml
 cron:
   persistent_max_turns: 12
+  # Optional: start one planned fresh root after every 5 successful ticks.
+  # 0 (the default) keeps one root until normal compression or contract drift.
+  persistent_rollover_runs: 5
 ```
 
 Each saved run includes input, cache-read and output token counts, model/tool call counts, and elapsed time.
+
+`persistent_rollover_runs` is profile-wide and opt-in. It is intended for finite
+project jobs whose prompt points to a durable plan/state checkpoint. Hermes keeps
+one cache-stable root for the configured number of successful ticks, then claims
+a planned rollover before the next model call and loads the full job prompt once
+into a new root. The following ticks use compact continuation prompts again.
+Planned rollovers preserve the runtime contract and do not consume the unexplained
+feature. Invalid, fractional, negative, boolean, or zero values disable the
+feature. Changing the value affects the next successful-run boundary. Failed
+attempts still advance the historical `repeat.completed` counter used for repeat
+limits, but they do not advance `persistent_successful_runs` or trigger a
+rollover. Existing persistent jobs without that internal counter begin their
+first configured rollover cycle from zero successful runs after deployment.
 
 Loaded skill text is part of that durable conversation snapshot. Editing the skill file while the job is running does not restart the conversation or inject the new body mid-lineage; changing the configured skill identity/list still starts a compatible new root. To deliberately reload an edited skill body, switch the job to `fresh` and then back to `persistent` before resuming.
 
