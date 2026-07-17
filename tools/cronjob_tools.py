@@ -1095,7 +1095,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             "session_mode": {
                 "type": "string",
                 "enum": ["fresh", "persistent"],
-                "description": "Internal agent conversation lifecycle. 'fresh' (default) starts an independent conversation on every run and is appropriate for watchdogs, digests, and recurring checks. 'persistent' resumes one durable conversation across ticks, including compressed history, and is intended for finite continuable development. Existing jobs remain fresh. This is separate from attach_to_session, which only controls whether a user can reply to delivered output. Not available with no_agent=True."
+                "description": "Internal agent conversation lifecycle. 'fresh' (default) starts an independent conversation on every run and is appropriate for watchdogs, digests, and recurring checks. 'persistent' resumes one durable conversation across ticks, including compressed history, and is intended for finite continuable development. Define persistent jobs for prompt-cache stability: keep mutable phase/SHA/PR/next-action values in a current-only durable state (target 5-10 KB, maximum 20 KB), archive append-only history outside that hot state, use targeted reads, pass skills=[] unless preloading is indispensable, and expose only phase-required toolsets. Existing jobs remain fresh. This is separate from attach_to_session, which only controls whether a user can reply to delivered output. Not available with no_agent=True."
             },
             "attach_to_session": {
                 "type": "boolean",

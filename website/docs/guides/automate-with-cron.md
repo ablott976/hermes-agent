@@ -12,6 +12,12 @@ For the full feature reference, see [Scheduled Tasks (Cron)](/user-guide/feature
 
 :::info Key Concept
 Cron jobs use fresh agent conversations by default. Prompts must be **completely self-contained** for monitors, reports, and other recurring jobs. For finite work that must advance across several ticks, opt in to `session_mode="persistent"` (or `--session-mode persistent`) so Hermes resumes one durable conversation instead.
+
+For persistent project work, keep the prompt immutable and the hot state
+current-only (5–10 KB target, 20 KB maximum). Archive append-only history,
+read large files by relevant section, avoid preloaded skills unless required,
+and expose only the toolsets needed for the current phase. See the full cron
+reference for the complete economy contract.
 :::
 
 :::tip Don't need the LLM? You have two zero-token options.

@@ -97,6 +97,15 @@ cronjob(
 
 A persistent job loads its full prompt and skills on the first run. Later runs add a compact continuation turn plus any new script or upstream-job data, which keeps the stable conversation prefix available for provider prompt caching. Each tick is limited to one bounded milestone and ends with a compact `changed` / `checks` / `next_action` / `blockers` handoff for the following tick. Automatic memory/skill background reviews are disabled for cron agents so they do not add hidden model calls after the milestone finishes.
 
+Define the job so that this cache stays useful. Keep mutable phase, SHA, PR,
+checkpoint and `next_action` values in a **current-only** durable state rather
+than in the job prompt. Target 5–10 KB for that hot state and keep it below
+20 KB: archive completed checks, old checkpoints and append-only history in a
+separate file that the agent does not read by default. Read large plans,
+registries and logs by relevant section/range, skip green checks whose source
+fingerprint did not change, use `skills=[]` unless bootstrap preloading is
+indispensable, and restrict `enabled_toolsets` to the current phase.
+
 Persistent ticks use at most 12 agent turns by default, or a lower profile-wide `agent.max_turns` value. On the Codex app-server runtime, Hermes enforces the same budget against completed tool iterations inside the otherwise opaque Codex turn. Change the milestone budget globally when needed:
 
 ```yaml
