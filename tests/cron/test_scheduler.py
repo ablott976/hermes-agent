@@ -2722,6 +2722,40 @@ class TestBuildJobPromptSilentHint:
         prompt_pos = result.index("My custom prompt")
         assert system_pos < prompt_pos
 
+    def test_persistent_bootstrap_carries_context_economy_contract(self):
+        job = {
+            "prompt": "Continue from the durable checkpoint.",
+            "session_mode": "persistent",
+        }
+
+        result = _build_job_prompt(job)
+
+        assert "PERSISTENT CONTEXT ECONOMY" in result
+        assert "current snapshot" in result
+        assert "append-only history" in result
+        assert "phase, SHA, PR" in result
+        assert "Continue from the durable checkpoint." in result
+
+    def test_persistent_continuation_keeps_only_compact_economy_reminder(self):
+        job = {
+            "prompt": "Bootstrap contract that must not be repeated.",
+            "session_mode": "persistent",
+        }
+
+        result = _build_job_prompt(job, continuation=True)
+
+        assert "PERSISTENT TICK CONTRACT" in result
+        assert "current-only" in result
+        assert "source fingerprint" in result
+        assert "PERSISTENT CONTEXT ECONOMY" not in result
+        assert "Bootstrap contract that must not be repeated." not in result
+
+    def test_fresh_bootstrap_does_not_receive_persistent_economy_contract(self):
+        result = _build_job_prompt({"prompt": "Run a fresh report."})
+
+        assert "PERSISTENT CONTEXT ECONOMY" not in result
+        assert "PERSISTENT TICK CONTRACT" not in result
+
 
 class TestParseWakeGate:
     """Unit tests for _parse_wake_gate — pure function, no side effects."""

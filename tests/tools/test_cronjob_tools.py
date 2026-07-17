@@ -292,6 +292,10 @@ class TestUnifiedCronjobTool:
         props = CRONJOB_SCHEMA["parameters"]["properties"]
         assert props["session_mode"]["enum"] == ["fresh", "persistent"]
         assert "attach_to_session" in props["session_mode"]["description"]
+        description = props["session_mode"]["description"]
+        assert "current-only durable state" in description
+        assert "skills=[]" in description
+        assert "phase-required toolsets" in description
 
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs

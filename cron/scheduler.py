@@ -2790,15 +2790,32 @@ def _build_job_prompt(
                 # silent skip — do not pollute the prompt with error messages
 
     persistent_tick_hint = ""
+    persistent_bootstrap_hint = ""
     if normalize_session_mode(job.get("session_mode"), strict=False) == SESSION_MODE_PERSISTENT:
         persistent_tick_hint = (
             "[PERSISTENT TICK CONTRACT: Execute exactly one bounded milestone "
-            "from the current plan or handoff, then stop. Run only the focused "
-            "verification needed for that milestone. Before responding, update "
-            "any existing durable plan/state checkpoint; do not invent a new "
-            "state file when none is configured. Do not begin another milestone "
-            "in this tick. End with a compact handoff covering changed, checks, "
-            "next_action, and blockers.]\n\n"
+            "from the current plan or handoff, then stop. Read only the current "
+            "state and file ranges needed for that milestone, and rerun checks "
+            "only when their source fingerprint changed. Keep any configured hot "
+            "state current-only and archive history outside it. Before responding, "
+            "update the existing checkpoint; do not invent a new state file. End "
+            "with a compact changed/checks/next_action/blockers handoff.]\n\n"
+        )
+        # The full economy contract is bootstrap-only. Persistent continuations
+        # already retain it in their cache-stable history, so repeating it every
+        # tick would spend the tokens this guidance is meant to save.
+        persistent_bootstrap_hint = (
+            "[PERSISTENT CONTEXT ECONOMY: Keep this job prompt stable. Mutable "
+            "phase, SHA, PR, checkpoint, and next-action values belong only in "
+            "the durable state. Keep the hot state as a current snapshot (target "
+            "5-10 KB, never above 20 KB); move completed checks, checkpoints, and "
+            "other append-only history to an archive that is not read by default, "
+            "while retaining only active/recent loop guards. Read large plans, "
+            "registries, and logs by relevant section or range instead of in full. "
+            "Do not repeat a green check when neither its source fingerprint nor "
+            "its environment changed. Job definitions should preload no skills "
+            "unless indispensable and expose only the toolsets needed for the "
+            "current phase.]\n\n"
         )
 
     # Keep the complete delivery contract in the bootstrap turn. Later turns
@@ -2836,7 +2853,7 @@ def _build_job_prompt(
     )
     prompt = cron_hint + prompt
     if persistent_tick_hint:
-        prompt += "\n\n" + persistent_tick_hint
+        prompt += "\n\n" + persistent_bootstrap_hint + persistent_tick_hint
     if skills is None:
         legacy = job.get("skill")
         skills = [legacy] if legacy else []
