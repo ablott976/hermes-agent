@@ -524,12 +524,15 @@ def test_second_tick_resumes_same_conversation_with_compact_prompt(persistent_en
     first_call, second_call = FakeAgent.calls
     assert first_call["session_id"] == second_call["session_id"]
     assert "Implement the next verified milestone." in first_call["prompt"]
-    assert "exactly one bounded milestone" in first_call["prompt"]
-    assert "changed, checks, next_action, and blockers" in first_call["prompt"]
+    for prompt in (first_call["prompt"], second_call["prompt"]):
+        assert "exactly one bounded milestone" in prompt
+        assert "handoff" in prompt
+        for field in ("changed", "checks", "next_action", "blockers"):
+            assert field in prompt
     assert "CRON CONTINUATION" in second_call["prompt"]
     assert "Implement the next verified milestone." not in second_call["prompt"]
-    assert "exactly one bounded milestone" in second_call["prompt"]
-    assert "Do not begin another milestone in this tick" in second_call["prompt"]
+    assert "current-only" in second_call["prompt"]
+    assert "source fingerprint" in second_call["prompt"]
     assert [message["role"] for message in second_call["history"]] == [
         "user",
         "assistant",
