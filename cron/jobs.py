@@ -322,6 +322,7 @@ _IMMUTABLE_JOB_FIELDS = frozenset({
     "id",
     "persistent_contract_forks",
     "persistent_contract_update_pending",
+    "persistent_prompt_contract_version",
     "persistent_rollover_lease",
     "persistent_planned_rollovers",
     "persistent_rollover_checkpoint",
@@ -334,6 +335,7 @@ _IMMUTABLE_JOB_FIELDS = frozenset({
 _INTERNAL_JOB_FIELDS = frozenset({
     "persistent_contract_forks",
     "persistent_contract_update_pending",
+    "persistent_prompt_contract_version",
     "persistent_rollover_lease",
     "persistent_planned_rollovers",
     "persistent_rollover_checkpoint",
@@ -346,6 +348,7 @@ _INTERNAL_JOB_FIELDS = frozenset({
 
 _PERSISTENT_SILENT_PAUSE_THRESHOLD = 2
 _PERSISTENT_CONTRACT_FORK_PAUSE_THRESHOLD = 2
+_PERSISTENT_PROMPT_CONTRACT_VERSION = 1
 _PERSISTENT_CONTRACT_UPDATE_FIELDS = frozenset({
     "base_url",
     "context_from",
@@ -513,6 +516,7 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
         session_mode = SESSION_MODE_FRESH
         normalized.pop("persistent_contract_forks", None)
         normalized.pop("persistent_contract_update_pending", None)
+        normalized.pop("persistent_prompt_contract_version", None)
         normalized.pop("persistent_rollover_lease", None)
         normalized.pop("persistent_planned_rollovers", None)
         normalized.pop("persistent_rollover_checkpoint", None)
@@ -1502,6 +1506,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updated.pop("session_mode", None)
                 updated.pop("persistent_contract_forks", None)
                 updated.pop("persistent_contract_update_pending", None)
+                updated.pop("persistent_prompt_contract_version", None)
                 updated.pop("persistent_rollover_lease", None)
                 updated.pop("persistent_planned_rollovers", None)
                 updated.pop("persistent_rollover_checkpoint", None)
@@ -1946,6 +1951,51 @@ def set_persistent_session_state(
             persisted["_persistent_state_write_applied"] = True
             return persisted
     return None
+
+
+def mark_persistent_prompt_contract_delivered(
+    job_id: str,
+    *,
+    expected_root_id: str,
+    version: int = _PERSISTENT_PROMPT_CONTRACT_VERSION,
+) -> bool:
+    """Record a bootstrap-only prompt contract after a successful model turn.
+
+    The root compare-and-set prevents a stale runner from marking guidance as
+    delivered to a newer conversation that never received it.
+    """
+    root = str(expected_root_id or "").strip()
+    if not root:
+        return False
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        raise ValueError("persistent prompt contract version must be a positive integer")
+
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job.get("id") != job_id:
+                continue
+            if normalize_session_mode(
+                job.get("session_mode"), strict=False
+            ) != SESSION_MODE_PERSISTENT:
+                return False
+            if str(job.get("session_root_id") or "").strip() != root:
+                return False
+            try:
+                current = max(
+                    0,
+                    int(job.get("persistent_prompt_contract_version") or 0),
+                )
+            except (TypeError, ValueError):
+                current = 0
+            if current >= version:
+                return True
+            updated = dict(job)
+            updated["persistent_prompt_contract_version"] = version
+            jobs[i] = updated
+            save_jobs(jobs)
+            return True
+    return False
 
 
 def reset_persistent_contract_fork_state(
