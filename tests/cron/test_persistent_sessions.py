@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -527,9 +528,10 @@ def test_second_tick_resumes_same_conversation_with_compact_prompt(persistent_en
     assert "Implement the next verified milestone." in first_call["prompt"]
     for prompt in (first_call["prompt"], second_call["prompt"]):
         assert "exactly one bounded milestone" in prompt
-        assert "handoff" in prompt
+        handoff_clause = re.search(r"\bcompact\b(?P<schema>[^.\]\n]*)\bhandoff\b", prompt)
+        assert handoff_clause is not None
         for field in ("changed", "checks", "next_action", "blockers"):
-            assert field in prompt
+            assert field in handoff_clause.group("schema")
     assert "CRON CONTINUATION" in second_call["prompt"]
     assert "Implement the next verified milestone." not in second_call["prompt"]
     assert "current-only" in second_call["prompt"]
