@@ -246,6 +246,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import (
+    _PERSISTENT_PROMPT_CONTRACT_VERSION,
     SESSION_MODE_PERSISTENT,
     advance_next_run,
     claim_dispatch,
@@ -254,6 +255,7 @@ from cron.jobs import (
     get_due_jobs,
     heartbeat_run_claim,
     heartbeat_persistent_rollover_lease,
+    mark_persistent_prompt_contract_delivered,
     mark_job_run,
     normalize_session_mode,
     reset_persistent_contract_fork_state,
@@ -2684,6 +2686,7 @@ def _build_job_prompt(
     prerun_script: Optional[tuple] = None,
     *,
     continuation: bool = False,
+    persistent_prompt_contract_migration: bool = False,
 ) -> str:
     """Build the effective prompt for a cron job.
 
@@ -2700,6 +2703,8 @@ def _build_job_prompt(
             (if any) runs inline as before.
         continuation: Build a compact next-turn instruction without loading
             the original prompt or attached skills again.
+        persistent_prompt_contract_migration: Include the bootstrap-only
+            persistent guidance once for a durable root created by older code.
     """
     user_prompt = "" if continuation else str(job.get("prompt") or "")
     prompt = user_prompt
@@ -2830,6 +2835,8 @@ def _build_job_prompt(
         )
         prompt = continuation_hint + prompt
         if persistent_tick_hint:
+            if persistent_prompt_contract_migration:
+                prompt += "\n\n" + persistent_bootstrap_hint
             prompt += "\n\n" + persistent_tick_hint
         return _scan_assembled_cron_prompt(
             prompt,
@@ -3673,6 +3680,17 @@ def run_job(
                         job_id,
                         _successful_runs,
                     )
+    try:
+        _prompt_contract_version = max(
+            0,
+            int(job.get("persistent_prompt_contract_version") or 0),
+        )
+    except (TypeError, ValueError):
+        _prompt_contract_version = 0
+    _needs_prompt_contract_migration = bool(
+        _persistent_job
+        and _prompt_contract_version < _PERSISTENT_PROMPT_CONTRACT_VERSION
+    )
     _persistent_resume_matched = False
     _persistent_tip = None
     _conversation_history = []
@@ -3740,6 +3758,9 @@ def run_job(
                 job,
                 prerun_script=prerun_script,
                 continuation=True,
+                persistent_prompt_contract_migration=(
+                    _needs_prompt_contract_migration
+                ),
             )
         else:
             # Preserve the historical call shape for fresh/bootstrap runs.
@@ -4611,6 +4632,17 @@ def run_job(
             )
             if run_metadata is not None:
                 run_metadata.update({"agent_ran": True, "tool_calls": tool_calls})
+            if _needs_prompt_contract_migration:
+                if not mark_persistent_prompt_contract_delivered(
+                    job_id,
+                    expected_root_id=_persistent_root,
+                ):
+                    logger.warning(
+                        "Job '%s': persistent prompt contract was delivered to "
+                        "stale root %s; leaving migration pending for the active root",
+                        job_id,
+                        _persistent_root,
+                    )
             if _persistent_resume_matched and not _rollover_lease_owner:
                 reset_persistent_contract_fork_state(
                     job_id,

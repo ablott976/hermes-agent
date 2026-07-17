@@ -706,6 +706,7 @@ class TestJobCRUD:
         [
             "persistent_contract_forks",
             "persistent_contract_update_pending",
+            "persistent_prompt_contract_version",
             "session_runtime_contract",
         ],
     )

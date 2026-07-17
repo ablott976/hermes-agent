@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from cron.jobs import (
+    _PERSISTENT_PROMPT_CONTRACT_VERSION,
     claim_persistent_rollover,
     claim_persistent_rollover_recovery,
     create_job,
@@ -541,6 +542,51 @@ def test_second_tick_resumes_same_conversation_with_compact_prompt(persistent_en
     assert stored["session_runtime_fingerprint"]
     assert persistent_env.reopened == [first_call["session_id"]]
     assert persistent_env.ended[-1][1] == "cron_waiting"
+
+
+def test_existing_root_receives_prompt_contract_migration_once(
+    persistent_env,
+):
+    job = _create_persistent_job()
+    assert run_job(job)[0] is True
+    original = get_job(job["id"])
+    assert original is not None
+    original_root = original["session_root_id"]
+    assert original["persistent_prompt_contract_version"] == (
+        _PERSISTENT_PROMPT_CONTRACT_VERSION
+    )
+
+    jobs = load_jobs()
+    jobs[0].pop("persistent_prompt_contract_version", None)
+    save_jobs(jobs)
+    persistent_env.messages[original_root][0]["content"] = (
+        "Legacy bootstrap without the context economy contract."
+    )
+
+    migration_candidate = get_job(job["id"])
+    assert migration_candidate is not None
+    assert run_job(migration_candidate)[0] is True
+    migrated = get_job(job["id"])
+    assert migrated is not None
+    assert migrated["session_root_id"] == original_root
+    assert migrated["persistent_prompt_contract_version"] == (
+        _PERSISTENT_PROMPT_CONTRACT_VERSION
+    )
+    migration_call = FakeAgent.calls[-1]
+    assert [message["role"] for message in migration_call["history"]] == [
+        "user",
+        "assistant",
+    ]
+    assert "PERSISTENT CONTEXT ECONOMY" in migration_call["prompt"]
+    assert "CRON CONTINUATION" in migration_call["prompt"]
+
+    assert run_job(migrated)[0] is True
+    resumed = get_job(job["id"])
+    assert resumed is not None
+    assert resumed["session_root_id"] == original_root
+    continuation_call = FakeAgent.calls[-1]
+    assert "CRON CONTINUATION" in continuation_call["prompt"]
+    assert "PERSISTENT CONTEXT ECONOMY" not in continuation_call["prompt"]
 
 
 @pytest.mark.parametrize(
