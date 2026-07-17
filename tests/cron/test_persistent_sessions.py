@@ -530,8 +530,8 @@ def test_second_tick_resumes_same_conversation_with_compact_prompt(persistent_en
         assert "exactly one bounded milestone" in prompt
         handoff_clause = re.search(r"\bcompact\b(?P<schema>[^.\]\n]*)\bhandoff\b", prompt)
         assert handoff_clause is not None
-        for field in ("changed", "checks", "next_action", "blockers"):
-            assert field in handoff_clause.group("schema")
+        schema_fields = [field.strip() for field in handoff_clause.group("schema").split("/")]
+        assert schema_fields == ["changed", "checks", "next_action", "blockers"]
     assert "CRON CONTINUATION" in second_call["prompt"]
     assert "Implement the next verified milestone." not in second_call["prompt"]
     assert "current-only" in second_call["prompt"]
