@@ -80,6 +80,12 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "across ticks for finite continuable work."
         ),
     )
+    cron_create.add_argument(
+        "--toolset",
+        dest="enabled_toolsets",
+        action="append",
+        help="Restrict the job to one toolset. Repeat to add multiple toolsets.",
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -152,6 +158,12 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "Change the agent conversation lifecycle. Switching to fresh "
             "clears stored continuation state."
         ),
+    )
+    cron_edit.add_argument(
+        "--toolset",
+        dest="enabled_toolsets",
+        action="append",
+        help="Replace enabled toolsets. Repeat to add multiple toolsets.",
     )
 
     # lifecycle actions

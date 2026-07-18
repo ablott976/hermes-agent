@@ -252,6 +252,7 @@ from cron.jobs import (
     claim_dispatch,
     claim_persistent_rollover,
     claim_persistent_rollover_recovery,
+    get_cron_owner_home,
     get_due_jobs,
     heartbeat_run_claim,
     heartbeat_persistent_rollover_lease,
@@ -4972,8 +4973,21 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     store CAS). This function only fires the given job once.
 
     Returns True if the job was processed (even if the job itself failed —
-    failure is recorded via ``mark_job_run``), False only if processing raised.
+    failure is recorded via ``mark_job_run``). Returns False when validation
+    blocks execution before accounting or when processing raises.
     """
+    try:
+        from cron.creation_guard import ensure_job_activatable
+
+        ensure_job_activatable(job, owner_home=get_cron_owner_home())
+    except ValueError as exc:
+        logger.warning(
+            "Job '%s' execution blocked without run accounting: %s",
+            job.get("id", "unknown"),
+            exc,
+        )
+        return False
+
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies

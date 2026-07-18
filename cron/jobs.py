@@ -36,6 +36,8 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Optional, Dict, List, Any, Set, Tuple, Union
 
+from cron import creation_guard as cron_creation_guard
+
 logger = logging.getLogger(__name__)
 
 from hermes_time import now as _hermes_now
@@ -143,6 +145,11 @@ def use_cron_store(home: Union[str, Path]):
 def get_cron_output_dir() -> Path:
     """Return the output directory for the active cron store context."""
     return _current_cron_store().output_dir
+
+
+def get_cron_owner_home() -> Path:
+    """Return the profile home that owns the active cron store context."""
+    return _current_cron_store().cron_dir.parent
 
 
 # Fallback stale-recovery window for a one-shot's running-claim (#59229) when
@@ -320,6 +327,7 @@ def _jobs_lock():
 # caller to rewrite them could make one job resume another job's conversation.
 _IMMUTABLE_JOB_FIELDS = frozenset({
     "id",
+    "validation",
     "persistent_contract_forks",
     "persistent_contract_update_pending",
     "persistent_prompt_contract_version",
@@ -357,6 +365,20 @@ _PERSISTENT_CONTRACT_UPDATE_FIELDS = frozenset({
     "prompt",
     "provider",
     "script",
+    "skill",
+    "skills",
+    "workdir",
+})
+_CRON_VALIDATION_FIELDS = frozenset({
+    "base_url",
+    "enabled_toolsets",
+    "model",
+    "no_agent",
+    "prompt",
+    "provider",
+    "schedule",
+    "script",
+    "session_mode",
     "skill",
     "skills",
     "workdir",
@@ -488,6 +510,10 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     ensure consumers never crash while formatting or running those records.
     """
     normalized = _apply_skill_fields(job)
+    normalized["validation"] = cron_creation_guard.validation_readback(
+        normalized,
+        owner_home=get_cron_owner_home(),
+    )
     job_id = _coerce_job_text(normalized.get("id"), "unknown")
     prompt = _coerce_job_text(normalized.get("prompt"))
     normalized["id"] = job_id
@@ -1273,7 +1299,10 @@ def create_job(
         deliver = "origin" if origin else "local"
 
     job_id = uuid.uuid4().hex[:12]
-    now = _hermes_now().isoformat()
+    now_dt = _hermes_now()
+    now = now_dt.isoformat()
+    owner_home = get_cron_owner_home()
+    owner_profile = cron_creation_guard.owner_profile_for_home(owner_home)
 
     normalized_skills = _normalize_skill_list(skill, skills)
     normalized_model = _normalize_job_optional_text(model)
@@ -1283,22 +1312,54 @@ def create_job(
     normalized_script = normalized_script or None
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
     normalized_toolsets = normalized_toolsets or None
-    normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_session_mode = normalize_session_mode(session_mode)
     normalized_progress = _normalize_progress(progress)
 
+    prompt_text = cron_creation_guard.substitute_job_placeholders(
+        _coerce_job_text(prompt),
+        job_id=job_id,
+        owner_profile=owner_profile,
+    )
+    normalized_script = cron_creation_guard.substitute_job_placeholders(
+        normalized_script,
+        job_id=job_id,
+        owner_profile=owner_profile,
+    )
+    raw_workdir = cron_creation_guard.substitute_job_placeholders(
+        workdir,
+        job_id=job_id,
+        owner_profile=owner_profile,
+    )
+    try:
+        normalized_workdir = _normalize_workdir(raw_workdir)
+    except ValueError:
+        if normalized_session_mode != SESSION_MODE_PERSISTENT:
+            raise
+        normalized_workdir = str(raw_workdir or "").strip() or None
+
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
     # reach the scheduler.
-    if normalized_no_agent and not normalized_script:
+    if (
+        normalized_no_agent
+        and not normalized_script
+        and normalized_session_mode != SESSION_MODE_PERSISTENT
+    ):
         raise ValueError(
             "no_agent=True requires a script — with no agent and no script "
             "there is nothing for the job to run."
         )
     if normalized_no_agent and normalized_session_mode == SESSION_MODE_PERSISTENT:
-        raise ValueError("session_mode='persistent' cannot be used with no_agent=True")
+        raise cron_creation_guard.CronValidationBlocked(
+            (
+                cron_creation_guard.ValidationIssue(
+                    "E_NO_AGENT_PERSISTENT",
+                    "session_mode='persistent' cannot be used with no_agent=True.",
+                ),
+            )
+        )
 
     # Normalize context_from: accept str or list of str, store as list or None
     if isinstance(context_from, str):
@@ -1307,8 +1368,6 @@ def create_job(
         context_from = [str(j).strip() for j in context_from if str(j).strip()] or None
     else:
         context_from = None
-
-    prompt_text = _coerce_job_text(prompt)
 
     # Reject cron jobs that schedule gateway-lifecycle commands. Prevents
     # agent-driven SIGTERM-respawn loops under launchd/systemd KeepAlive
@@ -1391,8 +1450,49 @@ def create_job(
     if normalized_session_mode == SESSION_MODE_PERSISTENT:
         job["session_mode"] = SESSION_MODE_PERSISTENT
 
+    job = cron_creation_guard.substitute_job_placeholders(
+        job,
+        job_id=job_id,
+        owner_profile=owner_profile,
+    )
+    validation_result = cron_creation_guard.validate_job(
+        job,
+        owner_home=owner_home,
+        owner_profile=owner_profile,
+    )
+    if validation_result.valid:
+        job["validation"] = cron_creation_guard.validation_record(
+            validation_result,
+            status=cron_creation_guard.VALIDATION_VALID,
+            now=now_dt,
+            contract_kind=cron_creation_guard.contract_kind(job),
+        )
+    elif normalized_session_mode == SESSION_MODE_PERSISTENT:
+        job.update(
+            {
+                "enabled": False,
+                "state": "paused",
+                "paused_at": now,
+                "paused_reason": "cron validation failed",
+                "next_run_at": None,
+                "validation": cron_creation_guard.invalid_draft_record(
+                    validation_result,
+                    now=now_dt,
+                    contract_kind=cron_creation_guard.contract_kind(job),
+                ),
+            }
+        )
+    else:
+        raise cron_creation_guard.CronValidationBlocked(validation_result.issues)
+
     with _jobs_lock():
         jobs = load_jobs()
+        cron_creation_guard.register_post_rollout_job(
+            job_id,
+            owner_home,
+            contract_kind=cron_creation_guard.contract_kind(job),
+            validation_status=str(job["validation"]["status"]),
+        )
         jobs.append(job)
         save_jobs(jobs)
 
@@ -1454,6 +1554,128 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     return jobs
 
 
+def _activation_requested(updates: Dict[str, Any]) -> bool:
+    return bool(
+        ("enabled" in updates and bool(updates.get("enabled")))
+        or (
+            "state" in updates
+            and updates.get("state") == "scheduled"
+            and updates.get("enabled", True) is not False
+        )
+    )
+
+
+def _apply_creation_contract_update(
+    original: Dict[str, Any],
+    updated: Dict[str, Any],
+    updates: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Apply the central contract to an explicit update without touching legacy reads."""
+    owner_home = get_cron_owner_home()
+    owner_profile = cron_creation_guard.owner_profile_for_home(owner_home)
+    updated = cron_creation_guard.substitute_job_placeholders(
+        updated,
+        job_id=str(updated.get("id") or ""),
+        owner_profile=owner_profile,
+    )
+
+    from cron.lifecycle_guard import check_gateway_lifecycle
+
+    check_gateway_lifecycle(updated.get("prompt"), updated.get("script"))
+
+    post_rollout = cron_creation_guard.is_post_rollout_job(
+        original,
+        owner_home=owner_home,
+    )
+    enroll_legacy = (
+        not post_rollout
+        and "session_mode" in updates
+        and normalize_session_mode(updated.get("session_mode"), strict=False)
+        == SESSION_MODE_PERSISTENT
+    )
+    activation = _activation_requested(updates)
+    if not (post_rollout or enroll_legacy):
+        return updated
+    if not activation and not _CRON_VALIDATION_FIELDS.intersection(updates):
+        return updated
+
+    now_dt = _hermes_now()
+    validation_result = cron_creation_guard.validate_job(
+        updated,
+        owner_home=owner_home,
+        owner_profile=owner_profile,
+        allow_contract_kind_change=bool({"session_mode", "no_agent"}.intersection(updates)),
+    )
+    if activation and not validation_result.valid:
+        raise cron_creation_guard.CronValidationBlocked(
+            validation_result.issues,
+            prefix="Cron activation blocked",
+        )
+
+    session_mode = normalize_session_mode(updated.get("session_mode"), strict=False)
+    if not validation_result.valid:
+        if session_mode != SESSION_MODE_PERSISTENT:
+            raise cron_creation_guard.CronValidationBlocked(validation_result.issues)
+        updated.update(
+            {
+                "enabled": False,
+                "state": "paused",
+                "paused_at": now_dt.isoformat(),
+                "paused_reason": "cron validation failed",
+                "next_run_at": None,
+                "validation": cron_creation_guard.invalid_draft_record(
+                    validation_result,
+                    now=now_dt,
+                    contract_kind=cron_creation_guard.contract_kind(updated),
+                ),
+            }
+        )
+        return updated
+
+    previous_validation = original.get("validation")
+    previous_status = (
+        previous_validation.get("status")
+        if isinstance(previous_validation, dict)
+        else None
+    )
+    remains_draft = (
+        previous_status
+        in {
+            cron_creation_guard.VALIDATION_INVALID_DRAFT,
+            cron_creation_guard.VALIDATION_VALID_DRAFT,
+        }
+        and not activation
+    )
+    status = (
+        cron_creation_guard.VALIDATION_VALID_DRAFT
+        if remains_draft
+        else cron_creation_guard.VALIDATION_VALID
+    )
+    updated["validation"] = cron_creation_guard.validation_record(
+        validation_result,
+        status=status,
+        now=now_dt,
+        contract_kind=cron_creation_guard.contract_kind(updated),
+    )
+    if remains_draft:
+        updated.update({"enabled": False, "state": "paused", "next_run_at": None})
+    elif activation:
+        updated.update(
+            {
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+            }
+        )
+        if not updated.get("next_run_at"):
+            next_run = compute_next_run(updated["schedule"])
+            if next_run is None and updated["schedule"].get("kind") == "once":
+                raise ValueError("Cannot activate a one-shot cron whose run time is in the past.")
+            updated["next_run_at"] = next_run
+    return updated
+
+
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
     updates = dict(updates or {})
@@ -1481,7 +1703,26 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 if _wd in {None, "", False}:
                     updates["workdir"] = None
                 else:
-                    updates["workdir"] = _normalize_workdir(_wd)
+                    try:
+                        updates["workdir"] = _normalize_workdir(_wd)
+                    except ValueError:
+                        target_mode = normalize_session_mode(
+                            updates.get("session_mode", job.get("session_mode")),
+                            strict=False,
+                        )
+                        managed_persistent = (
+                            target_mode == SESSION_MODE_PERSISTENT
+                            and (
+                                cron_creation_guard.is_post_rollout_job(
+                                    job,
+                                    owner_home=get_cron_owner_home(),
+                                )
+                                or "session_mode" in updates
+                            )
+                        )
+                        if not managed_persistent:
+                            raise
+                        updates["workdir"] = str(_wd).strip() or None
 
             previous_inference_axes = _normalized_inference_axes(job)
             if "progress" in updates:
@@ -1498,7 +1739,15 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updated["skill"] = normalized_skills[0] if normalized_skills else None
 
             session_mode = normalize_session_mode(updated.get("session_mode"))
-            if bool(updated.get("no_agent")) and session_mode == SESSION_MODE_PERSISTENT:
+            if (
+                bool(updated.get("no_agent"))
+                and session_mode == SESSION_MODE_PERSISTENT
+                and not cron_creation_guard.is_post_rollout_job(
+                    job,
+                    owner_home=get_cron_owner_home(),
+                )
+                and "session_mode" not in updates
+            ):
                 raise ValueError("session_mode='persistent' cannot be used with no_agent=True")
             if session_mode == SESSION_MODE_FRESH:
                 # Fresh is the historical default. Remove persistent continuation
@@ -1587,6 +1836,19 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     )
                 updated["next_run_at"] = next_run
 
+            updated = _apply_creation_contract_update(job, updated, updates)
+            validation = updated.get("validation")
+            if (
+                isinstance(validation, dict)
+                and validation.get("contract_version")
+                == cron_creation_guard.CONTRACT_VERSION
+            ):
+                cron_creation_guard.register_post_rollout_job(
+                    str(updated.get("id") or job_id),
+                    get_cron_owner_home(),
+                    contract_kind=cron_creation_guard.contract_kind(updated),
+                    validation_status=str(validation["status"]),
+                )
             jobs[i] = updated
             save_jobs(jobs)
             return _normalize_job_record(jobs[i])
@@ -2504,6 +2766,18 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
                 continue
             if not job.get("enabled", True) or job.get("state") == "paused":
                 return False
+            try:
+                cron_creation_guard.ensure_job_activatable(
+                    job,
+                    owner_home=get_cron_owner_home(),
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "Job '%s' activation blocked without mutating storage: %s",
+                    job_id,
+                    exc,
+                )
+                return False
             now = _hermes_now()
             existing = job.get("fire_claim")
             if existing:
@@ -2659,6 +2933,18 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
         # state still reaches save_jobs() below.
         try:
             if not job.get("enabled", True):
+                continue
+            try:
+                cron_creation_guard.ensure_job_activatable(
+                    job,
+                    owner_home=get_cron_owner_home(),
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "Job '%s' skipped due to cron validation drift: %s",
+                    job.get("id", "unknown"),
+                    exc,
+                )
                 continue
 
             # Cross-process running-claim guard (#59229): if another scheduler

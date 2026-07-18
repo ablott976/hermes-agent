@@ -23,6 +23,7 @@ from cron.jobs import (
     AmbiguousJobReference,
     claim_job_for_fire,
     create_job,
+    get_cron_owner_home,
     get_job,
     list_jobs,
     mark_job_run,
@@ -601,6 +602,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["workdir"] = job["workdir"]
     if job.get("progress"):
         result["progress"] = job["progress"]
+    if job.get("validation"):
+        result["validation"] = job["validation"]
     return result
 
 
@@ -622,7 +625,13 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     """
     job_id = job["id"]
     try:
+        from cron.creation_guard import ensure_job_activatable
         from cron.scheduler import run_one_job
+
+        try:
+            ensure_job_activatable(job, owner_home=get_cron_owner_home())
+        except ValueError as exc:
+            return {"claimed": False, "success": False, "error": str(exc)}
 
         # At-most-once claim: bail without running if a tick/other fire owns it.
         if not claim_job_for_fire(job_id):
@@ -759,7 +768,15 @@ def cronjob(
                 progress=progress,
             )
             _notify_provider_jobs_changed_safe()
-            _create_message = f"Cron job '{job['name']}' created."
+            validation = job.get("validation") or {}
+            if validation.get("status") == "invalid_draft":
+                codes = ", ".join(validation.get("codes") or [])
+                _create_message = (
+                    f"Cron job '{job['name']}' created as a paused invalid draft"
+                    f" ({codes})."
+                )
+            else:
+                _create_message = f"Cron job '{job['name']}' created."
             _local_notice = _local_delivery_notice(job, _normalize_deliver_param(deliver))
             if _local_notice:
                 _create_message = f"{_create_message} {_local_notice}"

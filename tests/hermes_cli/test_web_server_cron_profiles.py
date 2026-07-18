@@ -293,7 +293,7 @@ async def test_create_cron_job_normalizes_representative_core_fields(
             name="full-core-mapping",
             base_url="https://example.invalid/v1/",
             script=str(scripts_dir / "collect-status.py"),
-            no_agent=True,
+            no_agent=False,
         ),
         profile="worker_alpha",
     )
@@ -301,7 +301,28 @@ async def test_create_cron_job_normalizes_representative_core_fields(
     assert job["name"] == "full-core-mapping"
     assert job["base_url"] == "https://example.invalid/v1"
     assert job["script"] == "collect-status.py"
-    assert job["no_agent"] is True
+    assert job["no_agent"] is False
+
+
+@pytest.mark.asyncio
+async def test_create_cron_job_rejects_no_agent_model_config(isolated_profiles):
+    from hermes_cli import web_server
+
+    scripts_dir = isolated_profiles["worker_alpha"] / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "watchdog.py").write_text("print('ok')\n", encoding="utf-8")
+
+    with pytest.raises(HTTPException, match="E_NO_AGENT_MODEL_CONFIG") as exc:
+        await web_server.create_cron_job(
+            web_server.CronJobCreate(
+                schedule="every 1h",
+                script="watchdog.py",
+                no_agent=True,
+                model="must-not-run",
+            ),
+            profile="worker_alpha",
+        )
+    assert exc.value.status_code == 400
 
 
 @pytest.mark.asyncio
@@ -413,7 +434,7 @@ async def test_update_cron_job_normalizes_dashboard_core_fields(isolated_profile
                 "base_url": "https://example.invalid/v1/",
                 "script": str(scripts_dir / "collect.py"),
                 "context_from": "",
-                "no_agent": True,
+                "no_agent": False,
                 "session_mode": "fresh",
             }
         ),
@@ -423,7 +444,7 @@ async def test_update_cron_job_normalizes_dashboard_core_fields(isolated_profile
     assert updated["base_url"] == "https://example.invalid/v1"
     assert updated["script"] == "collect.py"
     assert updated["context_from"] is None
-    assert updated["no_agent"] is True
+    assert updated["no_agent"] is False
     assert updated["session_mode"] == "fresh"
     raw_jobs = json.loads(
         (isolated_profiles["worker_alpha"] / "cron" / "jobs.json").read_text(

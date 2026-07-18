@@ -260,6 +260,34 @@ def tmp_cron_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
+def _as_enabled_legacy_job(job):
+    """Keep pre-rollout persistent-runtime tests focused on their old contract."""
+    import json
+
+    from cron.creation_guard import registry_path
+    from cron.jobs import get_cron_owner_home
+
+    stored = load_jobs()
+    raw = next(item for item in stored if item["id"] == job["id"])
+    raw.pop("validation", None)
+    raw.update(
+        {
+            "enabled": True,
+            "state": "scheduled",
+            "paused_at": None,
+            "paused_reason": None,
+            "next_run_at": compute_next_run(raw["schedule"]),
+        }
+    )
+    save_jobs(stored)
+    contract_registry = registry_path(get_cron_owner_home())
+    registry = json.loads(contract_registry.read_text())
+    registry["job_kinds"].pop(job["id"], None)
+    registry["job_statuses"].pop(job["id"], None)
+    contract_registry.write_text(json.dumps(registry))
+    return get_job(job["id"])
+
+
 class TestJobCRUD:
     def test_create_and_get(self, tmp_cron_dir):
         job = create_job(prompt="Check server status", schedule="30m")
@@ -613,6 +641,7 @@ class TestJobCRUD:
             schedule="every 1m",
             session_mode="persistent",
         )
+        job = _as_enabled_legacy_job(job)
         digest = hashlib.sha256(b"component").hexdigest()
         contract = {
             "version": 4,
@@ -746,6 +775,7 @@ class TestJobCRUD:
             schedule="every 1m",
             session_mode="persistent",
         )
+        job = _as_enabled_legacy_job(job)
         legacy = set_persistent_session_state(job["id"], "legacy-root", "legacy-v3")
         assert legacy is not None
         digest = hashlib.sha256(b"migration").hexdigest()
@@ -848,6 +878,9 @@ class TestJobCRUD:
             )
 
     def test_legacy_no_agent_record_forces_fresh_view(self, tmp_cron_dir):
+        scripts_dir = tmp_cron_dir / "scripts"
+        scripts_dir.mkdir()
+        (scripts_dir / "watchdog.py").write_text("print('ok')\n")
         job = create_job(
             prompt="",
             schedule="every 1h",
@@ -1083,6 +1116,7 @@ class TestPauseResumeJob:
             session_mode="persistent",
             workdir=str(tmp_cron_dir),
         )
+        job = _as_enabled_legacy_job(job)
         mark_job_run(job["id"], success=True, persistent_no_progress=True)
         before_trigger = get_job(job["id"])
         assert before_trigger is not None
@@ -1219,6 +1253,7 @@ class TestMarkJobRun:
             session_mode="persistent",
             workdir=str(tmp_cron_dir),
         )
+        job = _as_enabled_legacy_job(job)
         set_persistent_session_state(job["id"], "root", "fingerprint-v3")
 
         mark_job_run(job["id"], success=True, persistent_no_progress=True)
@@ -1258,6 +1293,7 @@ class TestMarkJobRun:
             session_mode="persistent",
             workdir=str(tmp_cron_dir),
         )
+        job = _as_enabled_legacy_job(job)
 
         mark_job_run(job["id"], success=True, persistent_no_progress=True)
         first_silent = get_job(job["id"])
@@ -1323,6 +1359,7 @@ class TestMarkJobRun:
             schedule="every 1m",
             session_mode="persistent",
         )
+        job = _as_enabled_legacy_job(job)
 
         mark_job_run(job["id"], success=True, persistent_no_progress=True)
         mark_job_run(job["id"], success=True, persistent_no_progress=True)
