@@ -2526,6 +2526,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     scripts_dir = _get_hermes_home() / "scripts"
     scripts_dir.mkdir(parents=True, exist_ok=True)
     scripts_dir_resolved = scripts_dir.resolve()
+    from cron.creation_guard import script_path_is_within_sandbox
 
     raw = Path(script_path).expanduser()
     if raw.is_absolute():
@@ -2535,9 +2536,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
 
     # Guard against path traversal, absolute path injection, and symlink
     # escape — scripts MUST reside within HERMES_HOME/scripts/.
-    try:
-        path.relative_to(scripts_dir_resolved)
-    except ValueError:
+    if not script_path_is_within_sandbox(path, _get_hermes_home()):
         return False, (
             f"Blocked: script path resolves outside the scripts directory "
             f"({scripts_dir_resolved}): {script_path!r}"

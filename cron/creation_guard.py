@@ -46,6 +46,7 @@ _VALIDATION_CODE_ORDER = (
     "E_CONTRACT_KIND_DRIFT",
     "E_EXECUTABLE_CONTENT_MISSING",
     "E_SCRIPT_REQUIRED",
+    "E_SCRIPT_OUTSIDE_SANDBOX",
     "E_SCRIPT_NOT_READABLE",
     "E_NO_AGENT_PERSISTENT",
     "E_NO_AGENT_MODEL_CONFIG",
@@ -283,6 +284,17 @@ def resolved_script_path(script: Any, owner_home: Path) -> Path | None:
     return path.resolve()
 
 
+def script_path_is_within_sandbox(path: Path | None, owner_home: Path) -> bool:
+    """Return whether a resolved cron script stays under ``scripts/``."""
+    if path is None:
+        return False
+    try:
+        path.relative_to((Path(owner_home) / "scripts").resolve())
+    except ValueError:
+        return False
+    return True
+
+
 def validate_job(
     job: Mapping[str, Any],
     *,
@@ -348,6 +360,7 @@ def validate_job(
     session_mode = str(job.get("session_mode") or "fresh").strip().lower()
 
     script_path = resolved_script_path(script, owner_home) if script else None
+    script_in_sandbox = script_path_is_within_sandbox(script_path, owner_home)
     script_readable = bool(
         script_path
         and script_path.is_file()
@@ -357,6 +370,11 @@ def validate_job(
     if no_agent:
         if not script:
             add("E_SCRIPT_REQUIRED", "A no-agent cron requires a script.")
+        elif not script_in_sandbox:
+            add(
+                "E_SCRIPT_OUTSIDE_SANDBOX",
+                "The resolved cron script must stay inside the profile scripts directory.",
+            )
         elif not script_readable:
             add("E_SCRIPT_NOT_READABLE", "The resolved cron script is missing or unreadable.")
         if session_mode == "persistent":
