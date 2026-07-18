@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 import stat
+import sys
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -450,3 +451,40 @@ def test_no_agent_requires_readable_script_and_rejects_model_or_persistent_modes
             session_mode="persistent",
             deliver="local",
         )
+
+
+def test_no_agent_rejects_traversal_and_absolute_scripts_outside_sandbox(contract_env):
+    jobs = contract_env["jobs"]
+    outside = contract_env["home"] / "outside.py"
+    outside.write_text("print('outside')\n")
+
+    for script in ("../outside.py", str(outside)):
+        with pytest.raises(ValueError, match="E_SCRIPT_OUTSIDE_SANDBOX"):
+            jobs.create_job(
+                prompt=None,
+                schedule="every 5m",
+                script=script,
+                no_agent=True,
+                deliver="local",
+            )
+
+    assert jobs.list_jobs(include_disabled=True) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Symlinks require elevated privileges on Windows")
+def test_no_agent_rejects_script_symlink_that_escapes_sandbox(contract_env):
+    jobs = contract_env["jobs"]
+    outside = contract_env["home"] / "outside.py"
+    outside.write_text("print('outside')\n")
+    (contract_env["home"] / "scripts" / "escape.py").symlink_to(outside)
+
+    with pytest.raises(ValueError, match="E_SCRIPT_OUTSIDE_SANDBOX"):
+        jobs.create_job(
+            prompt=None,
+            schedule="every 5m",
+            script="escape.py",
+            no_agent=True,
+            deliver="local",
+        )
+
+    assert jobs.list_jobs(include_disabled=True) == []
