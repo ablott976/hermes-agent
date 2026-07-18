@@ -66,9 +66,12 @@ Usage:
     content = skill_view("axolotl", "references/dataset-formats.md")
 """
 
+from collections import OrderedDict
+import hashlib
 import json
 import logging
 import time
+import threading
 
 from hermes_constants import get_hermes_home, display_hermes_home
 import os
@@ -101,6 +104,82 @@ _SKILLS_CACHE: dict = {}          # {cache_key: (signature, timestamp, skills_li
 _SKILLS_CACHE_TTL_SECONDS = 30.0
 _SKILLS_CACHE_KEY_DISABLED = "with_disabled"
 _SKILLS_CACHE_KEY_FILTERED = "filtered"
+
+# Exact skill bodies already present in a cron conversation do not need to be
+# injected again.  Keep only response digests (never skill content), scope the
+# cache to the cron session/root, and bound it so a long-lived gateway cannot
+# grow without limit.  Non-cron/inline calls deliberately fail open to the
+# historical full response.
+_CRON_SKILL_VIEW_CACHE_MAX = 512
+_CRON_SKILL_VIEW_CACHE: OrderedDict[tuple[str, str, str], str] = OrderedDict()
+_CRON_SKILL_VIEW_CACHE_LOCK = threading.Lock()
+
+
+def _dedupe_cron_skill_view(
+    result: str,
+    *,
+    session_id: str,
+    requested_name: str,
+    file_path: str | None,
+) -> str:
+    """Return a compact receipt for an exact repeat in one cron session.
+
+    The full ``skill_view`` call is still evaluated first, so content changes,
+    readiness changes, and dynamic preprocessing invalidate the digest.  The
+    cache is an injection guard, not a source-content cache.
+    """
+    if not session_id.startswith("cron_"):
+        return result
+    try:
+        parsed = json.loads(result)
+    except (TypeError, ValueError):
+        return result
+    if not isinstance(parsed, dict) or not parsed.get("success"):
+        return result
+
+    resolved_name = str(parsed.get("name") or requested_name)
+    normalized_file = str(file_path or "")
+    key = (session_id, resolved_name, normalized_file)
+    digest = hashlib.sha256(result.encode("utf-8")).hexdigest()
+
+    with _CRON_SKILL_VIEW_CACHE_LOCK:
+        previous = _CRON_SKILL_VIEW_CACHE.get(key)
+        _CRON_SKILL_VIEW_CACHE[key] = digest
+        _CRON_SKILL_VIEW_CACHE.move_to_end(key)
+        while len(_CRON_SKILL_VIEW_CACHE) > _CRON_SKILL_VIEW_CACHE_MAX:
+            _CRON_SKILL_VIEW_CACHE.popitem(last=False)
+
+    if previous != digest:
+        return result
+    return json.dumps(
+        {
+            "success": True,
+            "name": resolved_name,
+            "file_path": file_path,
+            "already_loaded": True,
+            "content_digest": digest,
+            "message": (
+                "This exact skill content is already present in this cron "
+                "conversation. Reuse the previously loaded instructions."
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+
+def reset_cron_skill_view_dedup(session_id: str | None = None) -> None:
+    """Clear cron skill receipts after compression or for process cleanup."""
+    with _CRON_SKILL_VIEW_CACHE_LOCK:
+        if not session_id:
+            _CRON_SKILL_VIEW_CACHE.clear()
+            return
+        for key in [key for key in _CRON_SKILL_VIEW_CACHE if key[0] == session_id]:
+            _CRON_SKILL_VIEW_CACHE.pop(key, None)
+
+
+def _reset_cron_skill_view_cache_for_tests() -> None:
+    """Clear process-local dedupe state between focused tests."""
+    reset_cron_skill_view_dedup()
 
 
 def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
@@ -1729,8 +1808,15 @@ def _skill_view_with_bump(args, **kw):
     """Invoke skill_view, then bump view_count on success. Best-effort: a
     telemetry failure never breaks the tool call."""
     name = args.get("name", "")
+    file_path = args.get("file_path")
     result = skill_view(
-        name, file_path=args.get("file_path"), task_id=kw.get("task_id")
+        name, file_path=file_path, task_id=kw.get("task_id")
+    )
+    result = _dedupe_cron_skill_view(
+        result,
+        session_id=str(kw.get("session_id") or ""),
+        requested_name=str(name),
+        file_path=file_path,
     )
     try:
         parsed = json.loads(result)

@@ -426,6 +426,39 @@ def test_scheduler_applies_persistent_budget_and_disables_background_review(
     assert agent._skill_nudge_interval == 0
 
 
+def test_progress_snapshot_uses_active_agent_session_after_compression_rotation(
+    persistent_env,
+    monkeypatch,
+):
+    original_run_conversation = FakeAgent.run_conversation
+    seen_session_ids = []
+
+    def rotating_run_conversation(self, *args, **kwargs):
+        result = original_run_conversation(self, *args, **kwargs)
+        self.session_id = "compressed-active-tip"
+        return result
+
+    def capture_snapshot(_job, *, session_id=None):
+        seen_session_ids.append(session_id)
+        return {
+            "fingerprint": f"snapshot-{len(seen_session_ids)}",
+            "local_artifact_edit": "",
+        }
+
+    monkeypatch.setattr(FakeAgent, "run_conversation", rotating_run_conversation)
+    monkeypatch.setattr(
+        "cron.scheduler._persistent_workspace_progress_snapshot", capture_snapshot
+    )
+    run_metadata = {}
+
+    assert run_job(_create_persistent_job(), run_metadata=run_metadata)[0] is True
+
+    assert len(seen_session_ids) == 2
+    assert str(seen_session_ids[0]).startswith("cron_")
+    assert seen_session_ids[1] == "compressed-active-tip"
+    assert run_metadata["meaningful_progress"] is True
+
+
 def test_scheduler_reads_persistent_budget_override_from_config(
     persistent_env,
     tmp_path,

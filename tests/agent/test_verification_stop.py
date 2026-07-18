@@ -385,3 +385,64 @@ def test_is_non_code_path_classification():
     assert _is_non_code_path("src/app.ts") is False
     assert _is_non_code_path("config.yaml") is False
     assert _is_non_code_path("run_agent.py") is False
+    assert (
+        _is_non_code_path(
+            "/repo/.hermes/plans/feature-state.json", project_root="/repo"
+        )
+        is True
+    )
+    assert (
+        _is_non_code_path(
+            "/repo/.hermes/plans/check-cache.jsonl", project_root="/repo"
+        )
+        is True
+    )
+    assert (
+        _is_non_code_path(".hermes/plans/repro.py", project_root="/repo") is False
+    )
+    assert _is_non_code_path("config/app.json", project_root="/repo") is False
+
+
+def test_local_agent_data_path_is_root_bound_and_normalized():
+    from agent.verification_stop import _is_local_agent_data_path
+
+    assert _is_local_agent_data_path(
+        "/repo/.hermes/plans/state.json", project_root="/repo"
+    )
+    assert _is_local_agent_data_path(
+        ".hermes/plans/state.json", project_root="/repo"
+    )
+    assert not _is_local_agent_data_path(
+        "/repo/src/.hermes/plans/state.json", project_root="/repo"
+    )
+    assert not _is_local_agent_data_path(
+        "/repo/.hermes/plans/../../config/app.json", project_root="/repo"
+    )
+    assert _is_local_agent_data_path(
+        r"C:\repo\.hermes\plans\state.JSON", project_root=r"C:\repo"
+    )
+    assert not _is_local_agent_data_path(
+        r"C:\repo\.hermes\plans\..\..\config\app.json",
+        project_root=r"C:\repo",
+    )
+
+
+def test_local_plan_state_json_does_not_nudge(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes-home"))
+    _node_project(tmp_path)
+    state = str(tmp_path / ".hermes" / "plans" / "feature-state.json")
+    mark_workspace_edited(session_id="s1", cwd=tmp_path, paths=[state])
+
+    assert build_verify_on_stop_nudge(session_id="s1", changed_paths=[state]) is None
+
+
+def test_real_json_config_outside_local_plans_still_nudges(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes-home"))
+    _node_project(tmp_path)
+    config = str(tmp_path / "config" / "app.json")
+    mark_workspace_edited(session_id="s1", cwd=tmp_path, paths=[config])
+
+    nudge = build_verify_on_stop_nudge(session_id="s1", changed_paths=[config])
+
+    assert nudge is not None
+    assert config in nudge
