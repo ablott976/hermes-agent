@@ -1374,8 +1374,12 @@ def create_job(
     # (#30719). Enforced here (not only in the CLI layer) so the agent's
     # `cronjob` model tool — which calls create_job directly — is also
     # covered, not just `hermes cron create`.
-    from cron.lifecycle_guard import check_gateway_lifecycle
-    check_gateway_lifecycle(prompt_text, normalized_script)
+    cron_creation_guard.check_job_lifecycle(
+        prompt_text,
+        normalized_script,
+        no_agent=normalized_no_agent,
+        owner_home=owner_home,
+    )
 
     label_source = (prompt_text or (normalized_skills[0] if normalized_skills else None) or (normalized_script if normalized_no_agent else None)) or "cron job"
 
@@ -1579,9 +1583,12 @@ def _apply_creation_contract_update(
         owner_profile=owner_profile,
     )
 
-    from cron.lifecycle_guard import check_gateway_lifecycle
-
-    check_gateway_lifecycle(updated.get("prompt"), updated.get("script"))
+    cron_creation_guard.check_job_lifecycle(
+        updated.get("prompt"),
+        updated.get("script"),
+        no_agent=bool(updated.get("no_agent")),
+        owner_home=owner_home,
+    )
 
     post_rollout = cron_creation_guard.is_post_rollout_job(
         original,

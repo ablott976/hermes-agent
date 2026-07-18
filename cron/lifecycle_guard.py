@@ -33,13 +33,24 @@ only fail (silently) when it fires.
 
 from __future__ import annotations
 
+import errno
+import os
 import re
+import stat
 from pathlib import Path
 from typing import Optional
 
 
 class GatewayLifecycleBlocked(ValueError):
     """Raised when a cron job spec contains a gateway-lifecycle command."""
+
+
+class ScriptSandboxBlocked(ValueError):
+    """Raised when a no-agent script path escapes or races the sandbox."""
+
+
+class ScriptUnreadable(ValueError):
+    """Raised when an in-sandbox script cannot be opened as a regular file."""
 
 
 # Shell-level command shapes that target the gateway lifecycle. Each branch
@@ -92,7 +103,110 @@ def _resolve_script_path(script_path: str) -> Path:
     return get_hermes_home() / "scripts" / raw
 
 
-def _read_script_for_scanning(script_path: str) -> str:
+def _lexical_script_relative(script_path: str, sandbox_root: Path) -> tuple[Path, Path]:
+    """Return a lexical sandbox-relative path without touching the filesystem."""
+    root = Path(os.path.abspath(os.fspath(Path(sandbox_root).expanduser())))
+    raw = Path(script_path).expanduser()
+    candidate = raw if raw.is_absolute() else root / raw
+    candidate = Path(os.path.abspath(os.fspath(candidate)))
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as exc:
+        raise ScriptSandboxBlocked("E_SCRIPT_OUTSIDE_SANDBOX") from exc
+    if not relative.parts:
+        raise ScriptSandboxBlocked("E_SCRIPT_OUTSIDE_SANDBOX")
+    return root, relative
+
+
+def _classify_open_error(exc: OSError) -> ValueError:
+    if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+        return ScriptSandboxBlocked("E_SCRIPT_OUTSIDE_SANDBOX")
+    return ScriptUnreadable("E_SCRIPT_NOT_READABLE")
+
+
+def _open_script_from_sandbox(script_path: str, sandbox_root: Path) -> int:
+    """Open one regular in-sandbox file without following path-component links."""
+    root, relative = _lexical_script_relative(script_path, sandbox_root)
+    if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
+        current = root
+        try:
+            before = None
+            for index, part in enumerate(relative.parts):
+                current /= part
+                before = current.lstat()
+                if stat.S_ISLNK(before.st_mode):
+                    raise ScriptSandboxBlocked("E_SCRIPT_OUTSIDE_SANDBOX")
+                if index < len(relative.parts) - 1 and not stat.S_ISDIR(before.st_mode):
+                    raise ScriptSandboxBlocked("E_SCRIPT_OUTSIDE_SANDBOX")
+            if before is None or not stat.S_ISREG(before.st_mode):
+                raise ScriptUnreadable("E_SCRIPT_NOT_READABLE")
+            file_fd = os.open(current, os.O_RDONLY)
+            try:
+                after = os.fstat(file_fd)
+            except OSError:
+                os.close(file_fd)
+                raise
+            if not stat.S_ISREG(after.st_mode) or (
+                before.st_dev,
+                before.st_ino,
+            ) != (after.st_dev, after.st_ino):
+                os.close(file_fd)
+                raise ScriptSandboxBlocked("E_SCRIPT_OUTSIDE_SANDBOX")
+            return file_fd
+        except (ScriptSandboxBlocked, ScriptUnreadable):
+            raise
+        except OSError as exc:
+            raise _classify_open_error(exc) from exc
+
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    directory_fds: list[int] = []
+    try:
+        directory_fds.append(os.open(root, directory_flags))
+        for part in relative.parts[:-1]:
+            directory_fds.append(
+                os.open(part, directory_flags, dir_fd=directory_fds[-1])
+            )
+        file_fd = os.open(relative.parts[-1], file_flags, dir_fd=directory_fds[-1])
+        try:
+            metadata = os.fstat(file_fd)
+        except OSError:
+            os.close(file_fd)
+            raise
+        if not stat.S_ISREG(metadata.st_mode):
+            os.close(file_fd)
+            raise ScriptSandboxBlocked("E_SCRIPT_OUTSIDE_SANDBOX")
+        return file_fd
+    except (ScriptSandboxBlocked, ScriptUnreadable):
+        raise
+    except OSError as exc:
+        raise _classify_open_error(exc) from exc
+    finally:
+        for directory_fd in reversed(directory_fds):
+            os.close(directory_fd)
+
+
+def probe_script_from_sandbox(script_path: str, sandbox_root: Path) -> None:
+    """Verify that a script can be opened safely without reading its content."""
+    os.close(_open_script_from_sandbox(script_path, sandbox_root))
+
+
+def _read_script_from_sandbox(script_path: str, sandbox_root: Path) -> str:
+    """Read a regular file beneath *sandbox_root* without following symlinks."""
+    with os.fdopen(_open_script_from_sandbox(script_path, sandbox_root), "rb") as handle:
+        return handle.read().decode("utf-8", errors="replace")
+
+
+def _read_script_for_scanning(
+    script_path: str,
+    *,
+    sandbox_root: Optional[Path] = None,
+) -> str:
     """Read a script file for lifecycle-pattern scanning.
 
     Decodes with ``errors="replace"`` so binary or non-UTF-8 content does not
@@ -101,6 +215,8 @@ def _read_script_for_scanning(script_path: str) -> str:
     an attacker hide the command in binary noise.  Returns an empty string
     only when the file cannot be read at all.
     """
+    if sandbox_root is not None:
+        return _read_script_from_sandbox(script_path, sandbox_root)
     try:
         return _resolve_script_path(script_path).read_bytes().decode(
             "utf-8", errors="replace"
@@ -112,6 +228,8 @@ def _read_script_for_scanning(script_path: str) -> str:
 def check_gateway_lifecycle(
     prompt: Optional[str],
     script: Optional[str] = None,
+    *,
+    script_sandbox: Optional[Path] = None,
 ) -> None:
     """Raise ``GatewayLifecycleBlocked`` if *prompt* or *script* contains a
     gateway-lifecycle command pattern.
@@ -127,7 +245,7 @@ def check_gateway_lifecycle(
     """
     combined = prompt or ""
     if script:
-        script_text = _read_script_for_scanning(script)
+        script_text = _read_script_for_scanning(script, sandbox_root=script_sandbox)
         if script_text:
             combined = f"{combined}\n{script_text}"
 

@@ -295,6 +295,93 @@ def script_path_is_within_sandbox(path: Path | None, owner_home: Path) -> bool:
     return True
 
 
+def lexical_script_path(script: Any, owner_home: Path) -> Path | None:
+    """Normalize a script path lexically, without resolving or probing it."""
+    raw = str(script or "").strip()
+    if not raw:
+        return None
+    root = Path(os.path.abspath(os.fspath(Path(owner_home).expanduser() / "scripts")))
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    candidate = Path(os.path.abspath(os.fspath(candidate)))
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError:
+        return None
+    if not relative.parts:
+        return None
+    return candidate
+
+
+def ensure_no_agent_script_within_sandbox(
+    script: Any,
+    *,
+    no_agent: bool,
+    owner_home: Path,
+) -> Path | None:
+    """Reject lexical escapes without reading, resolving, or probing the path."""
+    raw = str(script or "").strip()
+    if not no_agent or not raw:
+        return None
+    path = lexical_script_path(raw, owner_home)
+    if path is not None:
+        return path
+    raise CronValidationBlocked(
+        (
+            ValidationIssue(
+                "E_SCRIPT_OUTSIDE_SANDBOX",
+                "The cron script path must stay inside the profile scripts directory.",
+            ),
+        )
+    )
+
+
+def check_job_lifecycle(
+    prompt: Any,
+    script: Any,
+    *,
+    no_agent: bool,
+    owner_home: Path,
+) -> None:
+    """Scan lifecycle commands after fail-closed no-agent sandbox validation."""
+    from cron.lifecycle_guard import (
+        ScriptSandboxBlocked,
+        ScriptUnreadable,
+        check_gateway_lifecycle,
+    )
+
+    safe_script = ensure_no_agent_script_within_sandbox(
+        script,
+        no_agent=no_agent,
+        owner_home=owner_home,
+    )
+    try:
+        check_gateway_lifecycle(
+            prompt,
+            str(safe_script) if safe_script else script,
+            script_sandbox=(Path(owner_home) / "scripts") if safe_script else None,
+        )
+    except ScriptSandboxBlocked as exc:
+        raise CronValidationBlocked(
+            (
+                ValidationIssue(
+                    "E_SCRIPT_OUTSIDE_SANDBOX",
+                    "The cron script path must stay inside the profile scripts directory.",
+                ),
+            )
+        ) from exc
+    except ScriptUnreadable as exc:
+        raise CronValidationBlocked(
+            (
+                ValidationIssue(
+                    "E_SCRIPT_NOT_READABLE",
+                    "The in-sandbox cron script is missing or unreadable.",
+                ),
+            )
+        ) from exc
+
+
 def validate_job(
     job: Mapping[str, Any],
     *,
@@ -359,13 +446,26 @@ def validate_job(
     no_agent = bool(job.get("no_agent"))
     session_mode = str(job.get("session_mode") or "fresh").strip().lower()
 
-    script_path = resolved_script_path(script, owner_home) if script else None
-    script_in_sandbox = script_path_is_within_sandbox(script_path, owner_home)
-    script_readable = bool(
-        script_path
-        and script_path.is_file()
-        and _is_readable_file(script_path)
-    )
+    script_path: Path | None = None
+    script_in_sandbox = False
+    script_readable = False
+    if script and no_agent:
+        from cron.lifecycle_guard import (
+            ScriptSandboxBlocked,
+            ScriptUnreadable,
+            probe_script_from_sandbox,
+        )
+
+        script_path = lexical_script_path(script, owner_home)
+        script_in_sandbox = script_path is not None
+        if script_path is not None:
+            try:
+                probe_script_from_sandbox(str(script_path), Path(owner_home) / "scripts")
+                script_readable = True
+            except ScriptSandboxBlocked:
+                script_in_sandbox = False
+            except ScriptUnreadable:
+                pass
 
     if no_agent:
         if not script:
@@ -553,9 +653,12 @@ def validation_readback(job: Mapping[str, Any], *, owner_home: Path) -> dict[str
 
 def ensure_job_activatable(job: Mapping[str, Any], *, owner_home: Path) -> None:
     """Fail closed for invalid post-rollout jobs without rewriting storage."""
-    from cron.lifecycle_guard import check_gateway_lifecycle
-
-    check_gateway_lifecycle(job.get("prompt"), job.get("script"))
+    check_job_lifecycle(
+        job.get("prompt"),
+        job.get("script"),
+        no_agent=bool(job.get("no_agent")),
+        owner_home=owner_home,
+    )
     if not is_post_rollout_job(job, owner_home=owner_home):
         return
 
