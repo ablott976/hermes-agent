@@ -66,6 +66,31 @@ def _budget_for_agent(agent) -> BudgetConfig:
     except Exception:
         return DEFAULT_BUDGET
 
+
+def _record_contextualized_skill_view(
+    *,
+    tool_name: str,
+    tool_args: dict,
+    session_id: str,
+    raw_result: object,
+    tool_message: dict,
+) -> None:
+    """Record cron skill dedupe state only for the exact appended content."""
+    if tool_name != "skill_view" or not isinstance(raw_result, str):
+        return
+    try:
+        from tools.skills_tool import record_cron_skill_view_result
+
+        record_cron_skill_view_result(
+            raw_result,
+            contextualized_result=tool_message.get("content"),
+            session_id=session_id,
+            requested_name=str(tool_args.get("name") or ""),
+            file_path=tool_args.get("file_path"),
+        )
+    except Exception as exc:
+        logger.debug("Failed to record contextualized skill_view result: %s", exc)
+
 # Maximum number of concurrent worker threads for parallel tool execution.
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
 _MAX_TOOL_WORKERS = 8
@@ -943,6 +968,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool complete callback error: {cb_err}")
 
+        raw_function_result = function_result
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=name,
@@ -976,6 +1002,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             effect_disposition=effect_disposition,
         )
         messages.append(tool_message)
+        _record_contextualized_skill_view(
+            tool_name=name,
+            tool_args=args,
+            session_id=agent.session_id or "",
+            raw_result=raw_function_result,
+            tool_message=tool_message,
+        )
         risk_metadata = tool_message.get("_tool_output_risk")
         if (
             risk_metadata is not None
@@ -1634,6 +1667,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool complete callback error: {cb_err}")
 
+        raw_function_result = function_result
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=function_name,
@@ -1655,6 +1689,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
         tool_message = make_tool_result_message(function_name, _tool_content, tool_call.id)
         messages.append(tool_message)
+        _record_contextualized_skill_view(
+            tool_name=function_name,
+            tool_args=function_args,
+            session_id=agent.session_id or "",
+            raw_result=raw_function_result,
+            tool_message=tool_message,
+        )
         risk_metadata = tool_message.get("_tool_output_risk")
         if (
             risk_metadata is not None

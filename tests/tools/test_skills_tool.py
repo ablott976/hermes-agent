@@ -28,14 +28,30 @@ def clear_cron_skill_view_dedupe():
     skills_tool_module._reset_cron_skill_view_cache_for_tests()
 
 
-def _tool_skill_view(name: str, *, session_id: str, **args):
-    return json.loads(
-        skills_tool_module._skill_view_with_bump(
-            {"name": name, **args},
-            task_id=session_id,
-            session_id=session_id,
-        )
+def _tool_skill_view(
+    name: str,
+    *,
+    session_id: str,
+    record: bool = False,
+    contextualized_result=None,
+    **args,
+):
+    raw_result = skills_tool_module._skill_view_with_bump(
+        {"name": name, **args},
+        task_id=session_id,
+        session_id=session_id,
     )
+    if record:
+        skills_tool_module.record_cron_skill_view_result(
+            raw_result,
+            contextualized_result=(
+                raw_result if contextualized_result is None else contextualized_result
+            ),
+            session_id=session_id,
+            requested_name=name,
+            file_path=args.get("file_path"),
+        )
+    return json.loads(raw_result)
 
 
 def _make_skill(
@@ -1393,7 +1409,9 @@ class TestCronSkillViewDedupe:
     def test_exact_repeat_in_same_cron_session_returns_compact_receipt(self, tmp_path):
         _make_skill(tmp_path, "large", body="critical instructions " * 200)
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-            first = _tool_skill_view("large", session_id="cron_job_root_a")
+            first = _tool_skill_view(
+                "large", session_id="cron_job_root_a", record=True
+            )
             repeated = _tool_skill_view("large", session_id="cron_job_root_a")
 
         assert "critical instructions" in first["content"]
@@ -1404,7 +1422,9 @@ class TestCronSkillViewDedupe:
     def test_compression_reset_returns_full_content_after_repeat(self, tmp_path):
         _make_skill(tmp_path, "compressible")
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-            _tool_skill_view("compressible", session_id="cron_job_root_a")
+            _tool_skill_view(
+                "compressible", session_id="cron_job_root_a", record=True
+            )
             receipt = _tool_skill_view("compressible", session_id="cron_job_root_a")
             skills_tool_module.reset_cron_skill_view_dedup("cron_job_root_a")
             after_compression = _tool_skill_view(
@@ -1413,6 +1433,21 @@ class TestCronSkillViewDedupe:
 
         assert receipt["already_loaded"] is True
         assert "Step 1" in after_compression["content"]
+
+    def test_transformed_result_is_not_cached_as_loaded(self, tmp_path):
+        _make_skill(tmp_path, "oversized", body="important body " * 200)
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            first = _tool_skill_view(
+                "oversized",
+                session_id="cron_job_root_a",
+                record=True,
+                contextualized_result="<persisted-output>preview only</persisted-output>",
+            )
+            repeated = _tool_skill_view("oversized", session_id="cron_job_root_a")
+
+        assert "important body" in first["content"]
+        assert "important body" in repeated["content"]
+        assert "already_loaded" not in repeated
 
     def test_new_root_and_inline_sessions_keep_full_content(self, tmp_path):
         _make_skill(tmp_path, "portable")
@@ -1433,7 +1468,9 @@ class TestCronSkillViewDedupe:
         (references / "details.md").write_text("reference body")
 
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-            first = _tool_skill_view("changing", session_id="cron_job_root_a")
+            first = _tool_skill_view(
+                "changing", session_id="cron_job_root_a", record=True
+            )
             reference = _tool_skill_view(
                 "changing",
                 session_id="cron_job_root_a",

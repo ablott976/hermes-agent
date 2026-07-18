@@ -46,13 +46,14 @@ def _make_tool_defs(*names: str) -> list:
     ]
 
 
-def _make_agent():
+def _make_agent(*tool_names: str):
+    tool_names = tool_names or ("web_search",)
     hermes_home = Path(tempfile.mkdtemp(prefix="hermes-test-home-"))
     (hermes_home / "logs").mkdir(parents=True, exist_ok=True)
     with (
         patch(
             "run_agent.get_tool_definitions",
-            return_value=_make_tool_defs("web_search"),
+            return_value=_make_tool_defs(*tool_names),
         ),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
@@ -196,6 +197,37 @@ def test_execute_tool_calls_sequential_flushes_each_tool_result_before_next_disp
         ("dispatch", "c2"),
         ("flush", "tool", "c2"),
     ]
+
+
+def test_skill_view_receipt_records_the_final_appended_content():
+    agent = _make_agent("skill_view")
+    setattr(agent, "session_id", "cron_job_root_a")
+    tool_call = _mock_tool_call(
+        name="skill_view", arguments='{"name":"large"}', call_id="skill-1"
+    )
+    messages: list = []
+    assistant_message = SimpleNamespace(content="", tool_calls=[tool_call])
+    raw_result = '{"success":true,"name":"large","content":"full body"}'
+    agent._flush_messages_to_session_db = MagicMock()
+
+    with (
+        patch("run_agent.handle_function_call", return_value=raw_result),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+        patch("tools.skills_tool.record_cron_skill_view_result") as recorder,
+    ):
+        agent._execute_tool_calls_sequential(assistant_message, messages, "task-1")
+
+    assert messages[0]["content"] == raw_result
+    recorder.assert_called_once_with(
+        raw_result,
+        contextualized_result=messages[0]["content"],
+        session_id="cron_job_root_a",
+        requested_name="large",
+        file_path=None,
+    )
 
 
 # ---------------------------------------------------------------------------
