@@ -144,10 +144,8 @@ def _dedupe_cron_skill_view(
 
     with _CRON_SKILL_VIEW_CACHE_LOCK:
         previous = _CRON_SKILL_VIEW_CACHE.get(key)
-        _CRON_SKILL_VIEW_CACHE[key] = digest
-        _CRON_SKILL_VIEW_CACHE.move_to_end(key)
-        while len(_CRON_SKILL_VIEW_CACHE) > _CRON_SKILL_VIEW_CACHE_MAX:
-            _CRON_SKILL_VIEW_CACHE.popitem(last=False)
+        if previous == digest:
+            _CRON_SKILL_VIEW_CACHE.move_to_end(key)
 
     if previous != digest:
         return result
@@ -165,6 +163,38 @@ def _dedupe_cron_skill_view(
         },
         ensure_ascii=False,
     )
+
+
+def record_cron_skill_view_result(
+    result: str,
+    *,
+    contextualized_result: object,
+    session_id: str,
+    requested_name: str,
+    file_path: str | None,
+) -> None:
+    """Record a full skill response only after it reached model context intact."""
+    if not session_id.startswith("cron_") or contextualized_result != result:
+        return
+    try:
+        parsed = json.loads(result)
+    except (TypeError, ValueError):
+        return
+    if (
+        not isinstance(parsed, dict)
+        or not parsed.get("success")
+        or parsed.get("already_loaded")
+    ):
+        return
+
+    resolved_name = str(parsed.get("name") or requested_name)
+    key = (session_id, resolved_name, str(file_path or ""))
+    digest = hashlib.sha256(result.encode("utf-8")).hexdigest()
+    with _CRON_SKILL_VIEW_CACHE_LOCK:
+        _CRON_SKILL_VIEW_CACHE[key] = digest
+        _CRON_SKILL_VIEW_CACHE.move_to_end(key)
+        while len(_CRON_SKILL_VIEW_CACHE) > _CRON_SKILL_VIEW_CACHE_MAX:
+            _CRON_SKILL_VIEW_CACHE.popitem(last=False)
 
 
 def reset_cron_skill_view_dedup(session_id: str | None = None) -> None:
