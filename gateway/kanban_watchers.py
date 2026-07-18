@@ -197,10 +197,11 @@ class GatewayKanbanWatchersMixin:
         # task is genuinely done lets the cursor (advanced atomically by
         # claim_unseen_events_for_sub) handle dedup, and any retry-loop
         # event reaches the user.
-        # Per-subscription send-failure counter. Adapter.send raising
-        # means the chat is dead (deleted, bot kicked, etc.) — after N
-        # consecutive send failures the sub is dropped so we don't spin
-        # against a dead chat every 5 seconds forever.
+        # Per-subscription terminal/status send-failure counter. Progress is
+        # best-effort: failed rows stay claimed so they neither spend this
+        # budget nor retry indefinitely before completed/blocked. After N
+        # consecutive non-progress failures the sub is dropped so we don't
+        # spin against a dead chat every 5 seconds forever.
         MAX_SEND_FAILURES = 3
         sub_fail_counts: dict[tuple, int] = getattr(
             self, "_kanban_sub_fail_counts", {}
@@ -557,6 +558,17 @@ class GatewayKanbanWatchersMixin:
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
+                            if kind == "progress":
+                                # Progress is best-effort: leave its cursor
+                                # claimed so a dead chat does not retry it on
+                                # every tick. The subscription and terminal
+                                # failure budget remain untouched, allowing a
+                                # later completed/blocked event to be claimed.
+                                logger.warning(
+                                    "kanban notifier: dropping failed progress send for %s on %s: %s",
+                                    sub["task_id"], platform_str, exc,
+                                )
+                                break
                             fails = sub_fail_counts.get(sub_key, 0) + 1
                             sub_fail_counts[sub_key] = fails
                             logger.warning(
