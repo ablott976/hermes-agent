@@ -552,6 +552,37 @@ def test_failed_progress_send_cannot_delay_later_terminal_event(tmp_path, monkey
     assert "Kanban update" not in recording.sent[0]["text"]
 
 
+def test_progress_failure_does_not_retry_or_drop_terminal_subscription(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "progress-failures.db"))
+    kb.init_db()
+    tid, _ = _create_running_progress_subscription()
+
+    failing = FailingAdapter()
+    runner = _make_runner(failing)
+    for _ in range(3):
+        runner._running = True
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert failing.attempts == 1
+    assert runner._kanban_sub_fail_counts == {}
+    conn = kb.connect()
+    try:
+        assert len(kb.list_notify_subs(conn, tid)) == 1
+        assert kb.complete_task(conn, tid, summary="Entrega completada")
+    finally:
+        conn.close()
+
+    recording = RecordingAdapter()
+    runner.adapters = {Platform.TELEGRAM: recording}  # type: ignore[assignment]
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(recording.sent) == 1
+    assert "done" in recording.sent[0]["text"].lower()
+
+
 def test_multiplexer_routes_progress_through_owning_profile_adapter(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "progress-multiplexer.db"))
     kb.init_db()
