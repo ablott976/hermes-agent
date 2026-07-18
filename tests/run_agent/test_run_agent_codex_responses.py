@@ -2029,6 +2029,53 @@ def test_interim_commentary_uses_codex_commentary_items_when_content_is_empty(mo
     }
 
 
+def test_kanban_interim_commentary_is_captured_without_ui_callback(monkeypatch):
+    """CLI workers must persist human progress even without a display callback."""
+    from tools import kanban_tools as kt
+
+    agent = _build_agent(monkeypatch)
+    setattr(agent, "interim_assistant_callback", None)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_progress")
+    observed = []
+    monkeypatch.setattr(kt, "set_current_worker_progress", observed.append)
+
+    agent._emit_interim_assistant_message(
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [
+                        {"type": "output_text", "text": "Terminado: el reconocimiento."},
+                        {"type": "output_text", "text": "Ahora: valido el flujo completo."},
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert observed == ["Terminado: el reconocimiento.\nAhora: valido el flujo completo."]
+
+
+def test_non_kanban_interim_without_callback_does_not_capture_progress(monkeypatch):
+    from tools import kanban_tools as kt
+
+    agent = _build_agent(monkeypatch)
+    setattr(agent, "interim_assistant_callback", None)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    observed = []
+    monkeypatch.setattr(kt, "set_current_worker_progress", observed.append)
+
+    agent._emit_interim_assistant_message(
+        {"role": "assistant", "content": "ordinary CLI progress"}
+    )
+
+    assert observed == []
+
+
 def test_interim_codex_commentary_force_redacts_secrets_before_callback(monkeypatch):
     import agent.redact as redact_module
 

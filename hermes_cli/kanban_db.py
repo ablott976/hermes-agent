@@ -6255,6 +6255,62 @@ def _defer_reclaim_for_live_worker(
         _append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
 
 
+def record_worker_progress(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    text: str,
+    expected_run_id: Optional[int],
+) -> str:
+    """Atomically append one human progress event for the active worker run.
+
+    The task/run/subscription guard and insert intentionally share the same
+    ``BEGIN IMMEDIATE`` transaction.  A reclaimed or completed run therefore
+    cannot append progress after its terminal transition.  The small status
+    vocabulary lets the worker publisher decide whether to keep waiting or
+    exit without leaking board internals into user-facing copy.
+    """
+    # The worker edge already force-redacts and bounds this text. Keep a DB-layer
+    # cap too so future internal callers cannot create unbounded event payloads.
+    progress_text = str(text or "").strip()[:600].rstrip()
+    if not progress_text:
+        return "empty"
+    if expected_run_id is None:
+        return "stale"
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return "stale"
+        if row["status"] != "running":
+            return "terminal"
+        current_run_id = row["current_run_id"]
+        if current_run_id is None or int(current_run_id) != int(expected_run_id):
+            return "stale"
+        run = conn.execute(
+            "SELECT status, ended_at FROM task_runs WHERE id = ? AND task_id = ?",
+            (int(expected_run_id), task_id),
+        ).fetchone()
+        if run is None or run["status"] != "running" or run["ended_at"] is not None:
+            return "stale"
+        subscribed = conn.execute(
+            "SELECT 1 FROM kanban_notify_subs WHERE task_id = ? LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if subscribed is None:
+            return "unsubscribed"
+        _append_event(
+            conn,
+            task_id,
+            "progress",
+            {"text": progress_text},
+            run_id=int(expected_run_id),
+        )
+    return "recorded"
+
+
 def heartbeat_worker(
     conn: sqlite3.Connection,
     task_id: str,

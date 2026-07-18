@@ -2246,3 +2246,185 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
     d = json.loads(out)
     assert d["ok"] is True, d
     assert d["subscribed"] is False, d
+
+
+# ---------------------------------------------------------------------------
+# Human progress publisher
+# ---------------------------------------------------------------------------
+
+
+def _subscribe_worker_and_export_run(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None and task.current_run_id is not None
+        kb.add_notify_sub(
+            conn,
+            task_id=worker_env,
+            platform="telegram",
+            chat_id="owner-chat",
+            notifier_profile="test-worker",
+        )
+        run_id = int(task.current_run_id)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    return run_id
+
+
+def test_progress_publisher_records_redacted_run_scoped_event(monkeypatch, worker_env):
+    import agent.redact as redact_module
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    run_id = _subscribe_worker_and_export_run(monkeypatch, worker_env)
+    monkeypatch.setattr(redact_module, "_REDACT_ENABLED", False)
+    secret = "ghp_" + "1234567890abcdefghijklmnop"
+
+    kt.set_current_worker_progress(f"Ahora: validando {secret}." + (" x" * 1000))
+    assert kt.publish_current_worker_progress_once() == "recorded"
+
+    conn = kb.connect()
+    try:
+        progress = [e for e in kb.list_events(conn, worker_env) if e.kind == "progress"]
+    finally:
+        conn.close()
+    assert len(progress) == 1
+    assert progress[0].run_id == run_id
+    text = progress[0].payload["text"]
+    assert secret not in text
+    assert len(text) <= kt.KANBAN_PROGRESS_MAX_CHARS
+
+
+def test_progress_publisher_skips_unsubscribed_task(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    finally:
+        conn.close()
+
+    kt.set_current_worker_progress("Ahora: sigo con la validación.")
+    assert kt.publish_current_worker_progress_once() == "unsubscribed"
+    conn = kb.connect()
+    try:
+        assert [e for e in kb.list_events(conn, worker_env) if e.kind == "progress"] == []
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("state", ["stale", "terminal"])
+def test_progress_publisher_stops_for_inactive_run(monkeypatch, worker_env, state):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    run_id = _subscribe_worker_and_export_run(monkeypatch, worker_env)
+    if state == "stale":
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id + 999))
+    else:
+        conn = kb.connect()
+        try:
+            assert kb.complete_task(conn, worker_env, summary="done")
+        finally:
+            conn.close()
+
+    kt.set_current_worker_progress("Ahora: esto no debe enviarse.")
+    assert kt.publish_current_worker_progress_once() == state
+    conn = kb.connect()
+    try:
+        assert [e for e in kb.list_events(conn, worker_env) if e.kind == "progress"] == []
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (0, 0.0),
+        (-1, 0.0),
+        (1, 30.0),
+        (30, 30.0),
+        (60, 60.0),
+        (float("nan"), 0.0),
+        (float("inf"), 0.0),
+        (float("-inf"), 0.0),
+        ("bad", 0.0),
+    ],
+)
+def test_progress_notification_interval_is_disabled_or_safely_clamped(
+    monkeypatch, raw, expected
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(
+        kt,
+        "load_config",
+        lambda: {"kanban": {"progress_notification_interval_seconds": raw}},
+    )
+    assert kt.progress_notification_interval_seconds() == expected
+
+
+def test_progress_publisher_loop_repeats_each_interval_until_run_is_stale(monkeypatch):
+    from tools import kanban_tools as kt
+
+    waits = []
+    outcomes = iter(["recorded", "recorded", "stale"])
+
+    class ImmediateEvent:
+        def wait(self, interval):
+            waits.append(interval)
+            return False
+
+    monkeypatch.setattr(kt.threading, "Event", ImmediateEvent)
+    monkeypatch.setattr(kt, "publish_current_worker_progress_once", lambda: next(outcomes))
+
+    kt._current_worker_progress_publisher_loop(60.0)
+
+    assert waits == [60.0, 60.0, 60.0]
+
+
+def test_disabled_progress_config_never_starts_thread(monkeypatch):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_disabled")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "1")
+    monkeypatch.setattr(kt, "load_config", lambda: {"kanban": {}})
+
+    def unexpected_thread(*args, **kwargs):
+        raise AssertionError("disabled progress must not construct a thread")
+
+    monkeypatch.setattr(kt.threading, "Thread", unexpected_thread)
+    assert kt.ensure_current_worker_progress_publisher() is False
+
+
+def test_progress_publisher_constructs_only_one_thread(monkeypatch):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_single")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "7")
+    monkeypatch.setattr(
+        kt,
+        "load_config",
+        lambda: {"kanban": {"progress_notification_interval_seconds": 60}},
+    )
+    created = []
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(kt.threading, "Thread", FakeThread)
+    monkeypatch.setattr(kt, "_progress_publisher_thread", None)
+    monkeypatch.setattr(kt, "_progress_publisher_identity", None)
+
+    assert kt.ensure_current_worker_progress_publisher() is True
+    assert kt.ensure_current_worker_progress_publisher() is True
+    assert len(created) == 1
