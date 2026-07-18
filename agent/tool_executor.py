@@ -91,6 +91,27 @@ def _record_contextualized_skill_view(
     except Exception as exc:
         logger.debug("Failed to record contextualized skill_view result: %s", exc)
 
+
+def _record_contextualized_skill_views(
+    candidates: dict[str, tuple[dict, str]],
+    tool_messages: list[dict],
+    *,
+    session_id: str,
+) -> None:
+    """Record skill receipts after aggregate turn-budget enforcement."""
+    for tool_message in tool_messages:
+        candidate = candidates.get(str(tool_message.get("tool_call_id") or ""))
+        if candidate is None:
+            continue
+        tool_args, raw_result = candidate
+        _record_contextualized_skill_view(
+            tool_name="skill_view",
+            tool_args=tool_args,
+            session_id=session_id,
+            raw_result=raw_result,
+            tool_message=tool_message,
+        )
+
 # Maximum number of concurrent worker threads for parallel tool execution.
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
 _MAX_TOOL_WORKERS = 8
@@ -359,6 +380,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # Resolve the context-scaled tool-output budget once per turn (cheap, but
     # avoids rebuilding it per result inside the loop below).
     _tool_budget = _budget_for_agent(agent)
+    skill_view_receipt_candidates: dict[str, tuple[dict, str]] = {}
 
     # ── Pre-flight: interrupt check ──────────────────────────────────
     if agent._interrupt_requested:
@@ -1002,13 +1024,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             effect_disposition=effect_disposition,
         )
         messages.append(tool_message)
-        _record_contextualized_skill_view(
-            tool_name=name,
-            tool_args=args,
-            session_id=agent.session_id or "",
-            raw_result=raw_function_result,
-            tool_message=tool_message,
-        )
+        if name == "skill_view" and isinstance(raw_function_result, str):
+            skill_view_receipt_candidates[str(tc.id)] = (args, raw_function_result)
         risk_metadata = tool_message.get("_tool_output_risk")
         if (
             risk_metadata is not None
@@ -1042,6 +1059,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     if num_tools > 0:
         turn_tool_msgs = messages[-num_tools:]
         enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id), config=_tool_budget)
+        _record_contextualized_skill_views(
+            skill_view_receipt_candidates,
+            turn_tool_msgs,
+            session_id=agent.session_id or "",
+        )
 
     # ── /steer injection ──────────────────────────────────────────────
     # Append any pending user steer text to the last tool result so the
@@ -1056,6 +1078,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools."""
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
+    skill_view_receipt_candidates: dict[str, tuple[dict, str]] = {}
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         # SAFETY: check interrupt BEFORE starting each tool.
         # If the user sent "stop" during a previous tool's execution,
@@ -1689,13 +1712,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
         tool_message = make_tool_result_message(function_name, _tool_content, tool_call.id)
         messages.append(tool_message)
-        _record_contextualized_skill_view(
-            tool_name=function_name,
-            tool_args=function_args,
-            session_id=agent.session_id or "",
-            raw_result=raw_function_result,
-            tool_message=tool_message,
-        )
+        if function_name == "skill_view" and isinstance(raw_function_result, str):
+            skill_view_receipt_candidates[str(tool_call.id)] = (
+                function_args,
+                raw_function_result,
+            )
         risk_metadata = tool_message.get("_tool_output_risk")
         if (
             risk_metadata is not None
@@ -1758,7 +1779,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # ── Per-turn aggregate budget enforcement ─────────────────────────
     num_tools_seq = len(assistant_message.tool_calls)
     if num_tools_seq > 0:
-        enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id), config=_tool_budget)
+        turn_tool_msgs = messages[-num_tools_seq:]
+        enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id), config=_tool_budget)
+        _record_contextualized_skill_views(
+            skill_view_receipt_candidates,
+            turn_tool_msgs,
+            session_id=agent.session_id or "",
+        )
 
     # ── /steer injection ──────────────────────────────────────────────
     # See _execute_tool_calls_parallel for the rationale. Same hook,

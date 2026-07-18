@@ -230,6 +230,46 @@ def test_skill_view_receipt_records_the_final_appended_content():
     )
 
 
+def test_skill_view_receipt_observes_aggregate_budget_transformation():
+    agent = _make_agent("skill_view")
+    setattr(agent, "session_id", "cron_job_root_a")
+    tool_call = _mock_tool_call(
+        name="skill_view", arguments='{"name":"large"}', call_id="skill-1"
+    )
+    messages: list = []
+    assistant_message = SimpleNamespace(content="", tool_calls=[tool_call])
+    raw_result = '{"success":true,"name":"large","content":"full body"}'
+    persisted_preview = "<persisted-output>preview only</persisted-output>"
+    agent._flush_messages_to_session_db = MagicMock()
+
+    def _replace_during_turn_budget(tool_messages, **_kwargs):
+        tool_messages[0]["content"] = persisted_preview
+        return tool_messages
+
+    with (
+        patch("run_agent.handle_function_call", return_value=raw_result),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+        patch(
+            "agent.tool_executor.enforce_turn_budget",
+            side_effect=_replace_during_turn_budget,
+        ),
+        patch("tools.skills_tool.record_cron_skill_view_result") as recorder,
+    ):
+        agent._execute_tool_calls_sequential(assistant_message, messages, "task-1")
+
+    assert messages[0]["content"] == persisted_preview
+    recorder.assert_called_once_with(
+        raw_result,
+        contextualized_result=persisted_preview,
+        session_id="cron_job_root_a",
+        requested_name="large",
+        file_path=None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Contract 3: the CONCURRENT path flushes each collected tool result in append
 # order.  Dispatch goes through agent._invoke_tool (the real concurrent
