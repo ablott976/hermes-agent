@@ -271,13 +271,35 @@ def persistent_env(tmp_path, monkeypatch):
 
 
 def _create_persistent_job():
-    return create_job(
+    from cron.creation_guard import registry_path
+    from cron.jobs import compute_next_run, get_cron_owner_home
+
+    job = create_job(
         prompt="Implement the next verified milestone.",
         schedule="every 1m",
         model="test-model",
         provider="openrouter",
         session_mode="persistent",
     )
+    stored = load_jobs()
+    raw = next(item for item in stored if item["id"] == job["id"])
+    raw.pop("validation", None)
+    raw.update(
+        {
+            "enabled": True,
+            "state": "scheduled",
+            "paused_at": None,
+            "paused_reason": None,
+            "next_run_at": compute_next_run(raw["schedule"]),
+        }
+    )
+    save_jobs(stored)
+    contract_registry = registry_path(get_cron_owner_home())
+    registry = json.loads(contract_registry.read_text())
+    registry["job_kinds"].pop(job["id"], None)
+    registry["job_statuses"].pop(job["id"], None)
+    contract_registry.write_text(json.dumps(registry))
+    return get_job(job["id"])
 
 
 def test_base_url_contract_excludes_embedded_credentials_and_query():

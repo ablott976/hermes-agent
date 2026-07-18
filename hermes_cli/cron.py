@@ -313,6 +313,7 @@ def cron_create(args):
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", False) or None,
         session_mode=getattr(args, "session_mode", "fresh"),
+        enabled_toolsets=getattr(args, "enabled_toolsets", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -331,6 +332,10 @@ def cron_create(args):
         print("  Mode: persistent (continues across runs)")
     if job_data.get("workdir"):
         print(f"  Workdir: {job_data['workdir']}")
+    validation = job_data.get("validation") or {}
+    if validation.get("status") == "invalid_draft":
+        print(color("  State: paused invalid draft", Colors.YELLOW))
+        print(f"  Validation: {', '.join(validation.get('codes') or [])}")
     print(f"  Next run: {result['next_run_at']}")
     _warn_if_gateway_not_running()
     return 0
@@ -379,6 +384,7 @@ def cron_edit(args):
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", None),
         session_mode=getattr(args, "session_mode", None),
+        enabled_toolsets=getattr(args, "enabled_toolsets", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
