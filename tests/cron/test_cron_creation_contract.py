@@ -453,10 +453,19 @@ def test_no_agent_requires_readable_script_and_rejects_model_or_persistent_modes
         )
 
 
-def test_no_agent_rejects_traversal_and_absolute_scripts_outside_sandbox(contract_env):
+def test_no_agent_rejects_outside_scripts_before_any_file_read(contract_env, monkeypatch):
     jobs = contract_env["jobs"]
+    from cron import creation_guard, lifecycle_guard
+
     outside = contract_env["home"] / "outside.py"
     outside.write_text("print('outside')\n")
+
+    def fail_probe(*_args, **_kwargs):
+        pytest.fail("outside script was probed before sandbox rejection")
+
+    monkeypatch.setattr(creation_guard, "resolved_script_path", fail_probe)
+    monkeypatch.setattr(creation_guard, "_is_readable_file", fail_probe)
+    monkeypatch.setattr(lifecycle_guard, "_read_script_for_scanning", fail_probe)
 
     for script in ("../outside.py", str(outside)):
         with pytest.raises(ValueError, match="E_SCRIPT_OUTSIDE_SANDBOX"):
@@ -469,6 +478,147 @@ def test_no_agent_rejects_traversal_and_absolute_scripts_outside_sandbox(contrac
             )
 
     assert jobs.list_jobs(include_disabled=True) == []
+
+
+def test_no_agent_update_rejects_outside_script_before_any_file_read(contract_env, monkeypatch):
+    jobs = contract_env["jobs"]
+    from cron import creation_guard, lifecycle_guard
+
+    safe = contract_env["home"] / "scripts" / "watchdog.py"
+    safe.write_text("print('safe')\n")
+    outside = contract_env["home"] / "outside.py"
+    outside.write_text("print('outside')\n")
+    job = jobs.create_job(
+        prompt=None,
+        schedule="every 5m",
+        script="watchdog.py",
+        no_agent=True,
+        deliver="local",
+    )
+
+    def fail_probe(*_args, **_kwargs):
+        pytest.fail("outside script was probed before sandbox rejection")
+
+    monkeypatch.setattr(creation_guard, "resolved_script_path", fail_probe)
+    monkeypatch.setattr(creation_guard, "_is_readable_file", fail_probe)
+    monkeypatch.setattr(lifecycle_guard, "_read_script_for_scanning", fail_probe)
+
+    for script in ("../outside.py", str(outside)):
+        with pytest.raises(ValueError, match="E_SCRIPT_OUTSIDE_SANDBOX"):
+            jobs.update_job(job["id"], {"script": script})
+
+    assert _raw_store(contract_env)["jobs"][0]["script"] == "watchdog.py"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Symlinks require elevated privileges on Windows")
+def test_no_agent_symlink_swap_cannot_escape_before_lifecycle_scan(contract_env, monkeypatch):
+    jobs = contract_env["jobs"]
+    from cron import creation_guard
+
+    script = contract_env["home"] / "scripts" / "watchdog.py"
+    script.write_text("print('safe')\n")
+    outside = contract_env["home"] / "outside.py"
+    outside.write_text("hermes gateway restart\n")
+    original_preflight = creation_guard.ensure_no_agent_script_within_sandbox
+
+    def swap_after_preflight(*args, **kwargs):
+        resolved = original_preflight(*args, **kwargs)
+        script.unlink()
+        script.symlink_to(outside)
+        return resolved
+
+    monkeypatch.setattr(
+        creation_guard,
+        "ensure_no_agent_script_within_sandbox",
+        swap_after_preflight,
+    )
+
+    with pytest.raises(creation_guard.CronValidationBlocked) as exc_info:
+        jobs.create_job(
+            prompt=None,
+            schedule="every 5m",
+            script="watchdog.py",
+            no_agent=True,
+            deliver="local",
+        )
+
+    assert exc_info.value.codes == ("E_SCRIPT_OUTSIDE_SANDBOX",)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Symlinks require elevated privileges on Windows")
+def test_no_agent_update_symlink_swap_is_rejected_without_storage_change(contract_env, monkeypatch):
+    jobs = contract_env["jobs"]
+    from cron import creation_guard
+
+    script = contract_env["home"] / "scripts" / "watchdog.py"
+    script.write_text("print('safe')\n")
+    outside = contract_env["home"] / "outside.py"
+    outside.write_text("print('outside')\n")
+    job = jobs.create_job(
+        prompt=None,
+        schedule="every 5m",
+        script="watchdog.py",
+        no_agent=True,
+        deliver="local",
+    )
+    before = _raw_store(contract_env)
+    original_preflight = creation_guard.ensure_no_agent_script_within_sandbox
+
+    def swap_after_preflight(*args, **kwargs):
+        lexical = original_preflight(*args, **kwargs)
+        script.unlink()
+        script.symlink_to(outside)
+        return lexical
+
+    monkeypatch.setattr(
+        creation_guard,
+        "ensure_no_agent_script_within_sandbox",
+        swap_after_preflight,
+    )
+    with pytest.raises(creation_guard.CronValidationBlocked) as exc_info:
+        jobs.update_job(job["id"], {"name": "must-not-persist"})
+
+    assert exc_info.value.codes == ("E_SCRIPT_OUTSIDE_SANDBOX",)
+    assert _raw_store(contract_env) == before
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Symlinks require elevated privileges on Windows")
+def test_no_agent_activation_symlink_swap_stays_paused(contract_env, monkeypatch):
+    jobs = contract_env["jobs"]
+    from cron import creation_guard
+
+    script = contract_env["home"] / "scripts" / "watchdog.py"
+    script.write_text("print('safe')\n")
+    outside = contract_env["home"] / "outside.py"
+    outside.write_text("print('outside')\n")
+    job = jobs.create_job(
+        prompt=None,
+        schedule="every 5m",
+        script="watchdog.py",
+        no_agent=True,
+        deliver="local",
+    )
+    jobs.pause_job(job["id"])
+    original_preflight = creation_guard.ensure_no_agent_script_within_sandbox
+
+    def swap_after_preflight(*args, **kwargs):
+        lexical = original_preflight(*args, **kwargs)
+        script.unlink()
+        script.symlink_to(outside)
+        return lexical
+
+    monkeypatch.setattr(
+        creation_guard,
+        "ensure_no_agent_script_within_sandbox",
+        swap_after_preflight,
+    )
+    with pytest.raises(creation_guard.CronValidationBlocked) as exc_info:
+        jobs.resume_job(job["id"])
+
+    assert exc_info.value.codes == ("E_SCRIPT_OUTSIDE_SANDBOX",)
+    stored = _raw_store(contract_env)["jobs"][0]
+    assert stored["enabled"] is False
+    assert stored["state"] == "paused"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Symlinks require elevated privileges on Windows")

@@ -161,7 +161,10 @@ class TestCronCreateLifecycleBlock:
             profile=None,
             no_agent=True,
         )
-        rc = cron_command(args)
+        from cron.jobs import use_cron_store
+
+        with use_cron_store(tmp_path / ".hermes"):
+            rc = cron_command(args)
         assert rc == 1
         out = capsys.readouterr().out
         assert "Blocked" in out
