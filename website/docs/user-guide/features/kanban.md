@@ -509,6 +509,7 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = fall back to active default profile. |
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
 | `auto_subscribe_on_create` | `true` | When a worker calls `kanban_create` from inside a session with a persistent delivery channel (messaging gateway or TUI), the originating session is auto-subscribed to the new task's completion/block events. The dispatcher still drives the delivery — this only changes whether the caller's chat/key shows up in the notify-sub table. Set to `false` to require explicit `kanban_notify-subscribe` calls per task. |
+| `progress_notification_interval_seconds` | `0` | Periodic human progress for subscribed running tasks. `0` disables it; enabled values below 30 seconds are clamped to 30. A worker repeats its latest redacted interim update at this cadence, and the notifier sends it from the subscription's owning profile/bot. |
 
 And the two auxiliary LLM slots:
 
@@ -820,6 +821,8 @@ Workers receive `$HERMES_TENANT` and namespace their memory writes by prefix. Th
 ## Gateway notifications
 
 When you run `/kanban create …` from the gateway (Telegram, Discord, Slack, etc.), the originating chat is automatically subscribed to the new task. The gateway's background notifier polls `task_events` every few seconds and delivers one message per terminal event (`completed`, `blocked`, `gave_up`, `crashed`, `timed_out`) to that chat. Completed tasks also send the first line of the worker's `--result` so you see the outcome without having to `/kanban show`.
+
+Set `kanban.progress_notification_interval_seconds` to a positive interval to also receive a new **Kanban update** while the task remains running. The worker publishes only redacted, user-visible commentary; the notifier coalesces a backlog to the newest update and gives terminal events priority. Progress is emitted only for subscribed tasks and uses the exact profile/bot that owns the subscription—there is no fallback to another profile's adapter. No extra LLM call is made for these updates.
 
 You can manage subscriptions explicitly from the CLI — useful when a script / cron job wants to notify a chat it didn't originate from:
 

@@ -30,9 +30,15 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
+import threading
 from typing import Any, Optional
 
+from agent.progress_copy import (
+    DEFAULT_HUMAN_PROGRESS_TEXT,
+    sanitize_human_progress_text,
+)
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
@@ -182,6 +188,153 @@ def _connect(board: Optional[str] = None):
 _GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
 
 
+# ---------------------------------------------------------------------------
+# Human Kanban progress publisher
+# ---------------------------------------------------------------------------
+
+KANBAN_PROGRESS_MAX_CHARS = 600
+_KANBAN_PROGRESS_MIN_INTERVAL_SECONDS = 30.0
+_progress_state_lock = threading.Lock()
+_progress_latest_text = DEFAULT_HUMAN_PROGRESS_TEXT
+_progress_publisher_thread: Optional[threading.Thread] = None
+_progress_publisher_identity: Optional[tuple[str, int]] = None
+
+
+def progress_notification_interval_seconds() -> float:
+    """Return the worker-profile progress cadence; zero means disabled."""
+    try:
+        cfg = load_config()
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        raw = kanban_cfg.get("progress_notification_interval_seconds", 0)
+        interval = float(raw or 0)
+    except (TypeError, ValueError):
+        logger.warning(
+            "kanban progress: invalid progress_notification_interval_seconds; disabled"
+        )
+        return 0.0
+    except Exception:
+        logger.debug("kanban progress: config unavailable; disabled", exc_info=True)
+        return 0.0
+    if not math.isfinite(interval) or interval <= 0:
+        return 0.0
+    if interval < _KANBAN_PROGRESS_MIN_INTERVAL_SECONDS:
+        logger.warning(
+            "kanban progress: interval %.1fs is too small; clamped to %.1fs",
+            interval,
+            _KANBAN_PROGRESS_MIN_INTERVAL_SECONDS,
+        )
+        return _KANBAN_PROGRESS_MIN_INTERVAL_SECONDS
+    return interval
+
+
+def _safe_progress_text(value: object) -> str:
+    """Force-redact and bound text before it can enter the durable board."""
+    return sanitize_human_progress_text(
+        value,
+        max_chars=KANBAN_PROGRESS_MAX_CHARS,
+    )
+
+
+def set_current_worker_progress(text: str) -> bool:
+    """Remember the latest real human commentary for this worker process."""
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return False
+    safe = _safe_progress_text(text)
+    if not safe:
+        return False
+    global _progress_latest_text
+    with _progress_state_lock:
+        _progress_latest_text = safe
+    ensure_current_worker_progress_publisher()
+    return True
+
+
+def publish_current_worker_progress_once() -> str:
+    """Append one run-scoped progress event using a thread-local connection."""
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    if not task_id:
+        return "not_worker"
+    try:
+        run_id = int(run_id_raw) if run_id_raw else None
+    except (TypeError, ValueError):
+        run_id = None
+    if run_id is None:
+        return "stale"
+    with _progress_state_lock:
+        latest = _progress_latest_text
+    safe = _safe_progress_text(latest or DEFAULT_HUMAN_PROGRESS_TEXT)
+    if not safe:
+        return "empty"
+    try:
+        kb, conn = _connect()
+        try:
+            return kb.record_worker_progress(
+                conn,
+                task_id,
+                text=safe,
+                expected_run_id=run_id,
+            )
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("kanban progress publisher tick failed", exc_info=True)
+        return "error"
+
+
+def _current_worker_progress_publisher_loop(interval: float) -> None:
+    global _progress_publisher_thread, _progress_publisher_identity
+    stop = threading.Event()
+    try:
+        while not stop.wait(interval):
+            outcome = publish_current_worker_progress_once()
+            if outcome in {"not_worker", "stale", "terminal"}:
+                return
+    finally:
+        with _progress_state_lock:
+            if _progress_publisher_thread is threading.current_thread():
+                _progress_publisher_thread = None
+                _progress_publisher_identity = None
+
+
+def ensure_current_worker_progress_publisher() -> bool:
+    """Start exactly one daemon cadence loop for the active task/run."""
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    interval = progress_notification_interval_seconds()
+    if not task_id or not run_id_raw or interval <= 0:
+        return False
+    try:
+        identity = (task_id, int(run_id_raw))
+    except (TypeError, ValueError):
+        return False
+    global _progress_publisher_thread, _progress_publisher_identity
+    with _progress_state_lock:
+        # Treat a constructed-but-not-yet-started thread as owned too. Checking
+        # only is_alive() leaves a small double-start race between assignment
+        # and Thread.start() when activity arrives from two callbacks.
+        if _progress_publisher_thread is not None:
+            return _progress_publisher_identity == identity
+        thread = threading.Thread(
+            target=_current_worker_progress_publisher_loop,
+            args=(interval,),
+            name=f"kanban-progress-{task_id[:12]}",
+            daemon=True,
+        )
+        _progress_publisher_thread = thread
+        _progress_publisher_identity = identity
+    try:
+        thread.start()
+    except Exception:
+        with _progress_state_lock:
+            if _progress_publisher_thread is thread:
+                _progress_publisher_thread = None
+                _progress_publisher_identity = None
+        logger.debug("kanban progress publisher could not start", exc_info=True)
+        return False
+    return True
+
+
 def _goal_judge_available() -> bool:
     """True when an auxiliary client is configured for the goal judge.
 
@@ -253,6 +406,9 @@ def heartbeat_current_worker_from_env() -> bool:
     tid = os.environ.get("HERMES_KANBAN_TASK")
     if not tid:
         return False
+    # The human progress cadence is independent from liveness writes, but this
+    # activity edge is the earliest reliable point shared by every worker.
+    ensure_current_worker_progress_publisher()
     import time as _time
     now = _time.monotonic()
     if (now - _auto_heartbeat_last_attempt) < _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS:

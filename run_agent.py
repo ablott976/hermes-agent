@@ -4725,9 +4725,12 @@ class AIAgent:
             return ""
 
     def _emit_interim_assistant_message(self, assistant_msg: Dict[str, Any]) -> None:
-        """Surface a real mid-turn assistant commentary message to the UI layer."""
+        """Surface real commentary and capture worker progress when applicable."""
+        if not isinstance(assistant_msg, dict):
+            return
         cb = getattr(self, "interim_assistant_callback", None)
-        if cb is None or not isinstance(assistant_msg, dict):
+        capture_kanban_progress = bool(os.environ.get("HERMES_KANBAN_TASK"))
+        if cb is None and not capture_kanban_progress:
             return
         content = assistant_msg.get("content")
         visible = self._strip_think_blocks(content or "").strip()
@@ -4736,6 +4739,17 @@ class AIAgent:
                 self._extract_codex_interim_commentary(assistant_msg)
             ).strip()
         if not visible or visible == "(empty)":
+            return
+        if capture_kanban_progress:
+            try:
+                from tools.kanban_tools import set_current_worker_progress
+
+                set_current_worker_progress(visible)
+            except Exception:
+                # Progress publication is best-effort and must never interrupt
+                # the worker's actual task. Keep the log free of model text.
+                logger.debug("kanban interim progress capture failed", exc_info=True)
+        if cb is None:
             return
         already_streamed = self._interim_content_was_streamed(visible)
         try:
