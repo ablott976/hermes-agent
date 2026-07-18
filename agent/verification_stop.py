@@ -7,9 +7,10 @@ finish immediately after editing code without fresh evidence.
 
 from __future__ import annotations
 
+import ntpath
 import os
 import tempfile
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Iterable
 
 
@@ -52,14 +53,79 @@ _NON_CODE_VERIFY_FILENAMES = frozenset(
     }
 )
 
+# Durable agent plans/state live beside a worktree but are not application
+# runtime inputs. JSON under this exact local-artifact directory only needs
+# the file tool's syntax validation; treating it as code creates a verify-on-
+# stop loop after every checkpoint. Executable files under the same directory
+# remain verifiable, as does JSON anywhere else in the project.
+_LOCAL_AGENT_DATA_EXTENSIONS = frozenset({".json", ".jsonl"})
 
-def _is_non_code_path(raw: str) -> bool:
+
+def _is_local_agent_data_path(
+    raw: str | Path,
+    *,
+    project_root: str | Path | None,
+) -> bool:
+    """Return true only for normalized ``<root>/.hermes/plans`` data files."""
+    if not project_root:
+        return False
+    raw_text = str(raw)
+    root_text = str(project_root)
+    try:
+        windows_path = bool(PureWindowsPath(raw_text).drive) or "\\" in (
+            raw_text + root_text
+        )
+        if windows_path:
+            root = PureWindowsPath(ntpath.normpath(root_text))
+            candidate = PureWindowsPath(raw_text)
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            candidate = PureWindowsPath(ntpath.normpath(str(candidate)))
+            plans = PureWindowsPath(ntpath.normpath(str(root / ".hermes" / "plans")))
+            candidate_parts = tuple(part.casefold() for part in candidate.parts)
+            plans_parts = tuple(part.casefold() for part in plans.parts)
+            inside = (
+                len(candidate_parts) > len(plans_parts)
+                and candidate_parts[: len(plans_parts)] == plans_parts
+            )
+        else:
+            root = Path(root_text).expanduser().resolve(strict=False)
+            candidate = Path(raw_text).expanduser()
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            candidate = candidate.resolve(strict=False)
+            plans = (root / ".hermes" / "plans").resolve(strict=False)
+            candidate.relative_to(plans)
+            inside = candidate != plans
+        return inside and candidate.suffix.casefold() in _LOCAL_AGENT_DATA_EXTENSIONS
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _project_root_for_changed_path(raw: str) -> str | None:
+    """Resolve the owning project for an absolute changed path, fail closed."""
+    try:
+        path = Path(raw)
+        if not path.is_absolute():
+            return None
+        from agent.coding_context import project_facts_for
+
+        facts = project_facts_for(path.parent)
+        root = (facts or {}).get("root")
+        return str(root) if root else None
+    except Exception:
+        return None
+
+
+def _is_non_code_path(raw: str, *, project_root: str | Path | None = None) -> bool:
     """Return True when a changed path is documentation/prose with nothing to verify."""
     try:
         p = Path(str(raw))
     except Exception:
         return False
     suffix = p.suffix.lower()
+    if _is_local_agent_data_path(raw, project_root=project_root):
+        return True
     if suffix in _NON_CODE_VERIFY_EXTENSIONS:
         return True
     if not suffix and p.name.lower() in _NON_CODE_VERIFY_FILENAMES:
@@ -67,9 +133,20 @@ def _is_non_code_path(raw: str) -> bool:
     return False
 
 
-def _filter_verifiable_paths(paths: Iterable[str]) -> list[str]:
+def _filter_verifiable_paths(
+    paths: Iterable[str],
+    *,
+    project_root: str | Path | None = None,
+) -> list[str]:
     """Drop documentation/prose paths; keep paths that could have verifiable behavior."""
-    return [p for p in paths if p and not _is_non_code_path(p)]
+    result = []
+    for path in paths:
+        if not path:
+            continue
+        root = project_root or _project_root_for_changed_path(str(path))
+        if not _is_non_code_path(str(path), project_root=root):
+            result.append(path)
+    return result
 
 
 # Session identities (platform or source) that are NOT human conversational

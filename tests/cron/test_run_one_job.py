@@ -10,6 +10,8 @@ The first test characterizes the sequence as driven through `tick()` (proving
 the extraction didn't change `tick`'s behavior); the rest unit-test the
 extracted helper directly.
 """
+import subprocess
+
 import cron.scheduler as s
 
 
@@ -130,6 +132,187 @@ def test_persistent_silence_with_tool_work_does_not_count(monkeypatch):
     ) is True
 
     assert marked[0][2]["persistent_no_progress"] is False
+
+
+def test_persistent_local_state_only_write_counts_as_no_progress(monkeypatch):
+    marked = []
+
+    def fake_run_job(job, *, defer_agent_teardown=None, run_metadata=None):
+        assert run_metadata is not None
+        run_metadata.update(
+            {
+                "persistent": True,
+                "agent_ran": True,
+                "tool_calls": 3,
+                "meaningful_progress": False,
+                "local_artifact_only_write": True,
+            }
+        )
+        return True, "output", "checkpoint updated", None
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "save_job_output", lambda _jid, _out: "/tmp/out")
+    monkeypatch.setattr(s, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda jid, ok, err=None, **kwargs: marked.append((jid, ok, kwargs)),
+    )
+
+    assert s.run_one_job(
+        {
+            "id": "persistent-state-loop",
+            "name": "t",
+            "session_mode": "persistent",
+            "session_root_id": "cron_root",
+            "workdir": "/tmp",
+        }
+    ) is True
+    assert marked[0][2]["persistent_no_progress"] is True
+
+
+def test_persistent_source_progress_resets_local_state_signal(monkeypatch):
+    marked = []
+
+    def fake_run_job(job, *, defer_agent_teardown=None, run_metadata=None):
+        assert run_metadata is not None
+        run_metadata.update(
+            {
+                "persistent": True,
+                "agent_ran": True,
+                "tool_calls": 4,
+                "meaningful_progress": True,
+                "local_artifact_only_write": True,
+            }
+        )
+        return True, "output", "source changed", None
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "save_job_output", lambda _jid, _out: "/tmp/out")
+    monkeypatch.setattr(s, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda jid, ok, err=None, **kwargs: marked.append((jid, ok, kwargs)),
+    )
+
+    assert s.run_one_job(
+        {
+            "id": "persistent-source-work",
+            "name": "t",
+            "session_mode": "persistent",
+            "session_root_id": "cron_root",
+            "workdir": "/tmp",
+        }
+    ) is True
+    assert marked[0][2]["persistent_no_progress"] is False
+
+
+def test_persistent_read_only_tick_is_not_inferred_as_no_progress(monkeypatch):
+    marked = []
+
+    def fake_run_job(job, *, defer_agent_teardown=None, run_metadata=None):
+        assert run_metadata is not None
+        run_metadata.update(
+            {
+                "persistent": True,
+                "agent_ran": True,
+                "tool_calls": 5,
+                "meaningful_progress": False,
+                "local_artifact_only_write": False,
+            }
+        )
+        return True, "output", "diagnosis completed", None
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "save_job_output", lambda _jid, _out: "/tmp/out")
+    monkeypatch.setattr(s, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda jid, ok, err=None, **kwargs: marked.append((jid, ok, kwargs)),
+    )
+
+    assert s.run_one_job(
+        {
+            "id": "persistent-recon",
+            "name": "t",
+            "session_mode": "persistent",
+            "session_root_id": "cron_root",
+            "workdir": "/tmp",
+        }
+    ) is True
+    assert marked[0][2]["persistent_no_progress"] is False
+
+
+def test_progress_snapshot_distinguishes_local_state_source_check_and_sidecar(
+    tmp_path, monkeypatch
+):
+    from agent.verification_evidence import (
+        mark_workspace_edited,
+        record_terminal_result,
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes-home"))
+    (tmp_path / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True
+    )
+    subprocess.run(["git", "add", "pyproject.toml"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "initial"], cwd=tmp_path, check=True
+    )
+    job = {
+        "id": "progress-snapshot",
+        "session_mode": "persistent",
+        "session_root_id": "cron_progress_root",
+        "workdir": str(tmp_path),
+    }
+
+    initial = s._persistent_workspace_progress_snapshot(job)
+    assert initial is not None
+
+    state = tmp_path / ".hermes" / "plans" / "feature-state.json"
+    state.parent.mkdir(parents=True)
+    state.write_text('{"phase":"recon"}')
+    mark_workspace_edited(
+        session_id="cron_progress_root", cwd=tmp_path, paths=[str(state)]
+    )
+    local_only = s._persistent_workspace_progress_snapshot(job)
+    assert local_only is not None
+    assert local_only["fingerprint"] == initial["fingerprint"]
+    assert local_only["local_artifact_edit"]
+
+    source = tmp_path / "feature.py"
+    source.write_text("VALUE = 1\n")
+    mark_workspace_edited(
+        session_id="cron_progress_root", cwd=tmp_path, paths=[str(source)]
+    )
+    source_edit = s._persistent_workspace_progress_snapshot(job)
+    assert source_edit is not None
+    assert source_edit["fingerprint"] != local_only["fingerprint"]
+    assert source_edit["local_artifact_edit"] == ""
+
+    record_terminal_result(
+        command="python -m pytest tests/test_feature.py -q",
+        cwd=tmp_path,
+        session_id="cron_progress_root",
+        exit_code=0,
+        output="1 passed",
+    )
+    verified = s._persistent_workspace_progress_snapshot(job)
+    assert verified is not None
+    assert verified["fingerprint"] != source_edit["fingerprint"]
+
+    sidecar = state.parent / ".feature-state.json.check-cache.json"
+    sidecar.write_text('{"fingerprint":"abc"}')
+    guarded = s._persistent_workspace_progress_snapshot(job)
+    assert guarded is not None
+    assert guarded["fingerprint"] != verified["fingerprint"]
 
 
 def test_interrupted_persistent_tick_resets_silence_without_marking(monkeypatch):

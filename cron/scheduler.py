@@ -3299,6 +3299,151 @@ def _persistent_cron_title(session_db, root_session_id: str, title_base: str) ->
     )
 
 
+def _persistent_workspace_progress_snapshot(
+    job: dict,
+    *,
+    session_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Capture conservative scheduler-owned evidence of persistent progress.
+
+    The snapshot intentionally ignores plan/STATE rewrites. It records only a
+    Git HEAD transition, verifiable source/config path metadata, a new terminal
+    verification event, or the deterministic check-guard sidecar. Any lookup
+    failure returns ``None`` so accounting fails open and never pauses work.
+    """
+    if normalize_session_mode(job.get("session_mode"), strict=False) != SESSION_MODE_PERSISTENT:
+        return None
+    session_id = str(session_id or job.get("session_root_id") or "").strip()
+    raw_workdir = str(job.get("workdir") or "").strip()
+    if not session_id or not raw_workdir:
+        return None
+    workdir = Path(raw_workdir).expanduser()
+    if not workdir.is_dir():
+        return None
+
+    try:
+        head_result = subprocess.run(
+            ["git", "-C", str(workdir), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            creationflags=windows_hide_flags(),
+        )
+        if head_result.returncode != 0:
+            return None
+        head = head_result.stdout.strip()
+        if not head:
+            return None
+
+        from agent.verification_evidence import verification_status
+        from agent.verification_stop import (
+            _filter_verifiable_paths,
+            _is_local_agent_data_path,
+        )
+
+        status = verification_status(session_id=session_id, cwd=workdir)
+        changed_paths = sorted(
+            {str(path) for path in (status.get("changed_paths") or []) if str(path)}
+        )
+        verifiable_paths = sorted(
+            set(_filter_verifiable_paths(changed_paths, project_root=workdir))
+        )
+        verifiable_stats: list[tuple[str, int | None, int | None]] = []
+        for raw_path in verifiable_paths:
+            path = Path(raw_path)
+            if not path.is_absolute():
+                path = workdir / path
+            try:
+                file_stat = path.stat()
+                verifiable_stats.append(
+                    (raw_path, int(file_stat.st_size), int(file_stat.st_mtime_ns))
+                )
+            except OSError:
+                verifiable_stats.append((raw_path, None, None))
+
+        evidence = status.get("evidence")
+        if isinstance(evidence, dict):
+            evidence_token = tuple(
+                evidence.get(field)
+                for field in (
+                    "id",
+                    "created_at",
+                    "canonical_command",
+                    "kind",
+                    "scope",
+                    "status",
+                    "exit_code",
+                )
+            )
+        else:
+            evidence_token = None
+
+        check_sidecars: list[tuple[str, int, int]] = []
+        plans_dir = workdir / ".hermes" / "plans"
+        if plans_dir.is_dir():
+            for sidecar in sorted(plans_dir.glob("*.check-cache.json")):
+                try:
+                    sidecar_stat = sidecar.stat()
+                except OSError:
+                    continue
+                check_sidecars.append(
+                    (
+                        sidecar.name,
+                        int(sidecar_stat.st_size),
+                        int(sidecar_stat.st_mtime_ns),
+                    )
+                )
+
+        fingerprint_payload = {
+            "head": head,
+            "verification_event": evidence_token,
+            "verifiable_paths": verifiable_stats,
+            "check_sidecars": check_sidecars,
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                fingerprint_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        local_artifact_only = bool(changed_paths) and all(
+            _is_local_agent_data_path(path, project_root=workdir)
+            for path in changed_paths
+        )
+        return {
+            "fingerprint": fingerprint,
+            "local_artifact_edit": (
+                str(status.get("last_edit_at") or "") if local_artifact_only else ""
+            ),
+        }
+    except Exception:
+        logger.debug(
+            "Job '%s': persistent progress snapshot unavailable",
+            job.get("id", "?"),
+            exc_info=True,
+        )
+        return None
+
+
+def _record_persistent_progress_delta(
+    run_metadata: dict[str, Any],
+    before: dict[str, Any] | None,
+    after: dict[str, Any] | None,
+) -> None:
+    """Attach a conservative progress decision to scheduler-owned metadata."""
+    if before is None or after is None or run_metadata.get("planned_rollover") is True:
+        return
+    run_metadata["meaningful_progress"] = (
+        before.get("fingerprint") != after.get("fingerprint")
+    )
+    run_metadata["local_artifact_only_write"] = bool(
+        after.get("local_artifact_edit")
+        and after.get("local_artifact_edit") != before.get("local_artifact_edit")
+    )
+
+
 def _new_cron_session_id(job_id: str, *, persistent: bool = False) -> str:
     base = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
     # Preserve the historical fresh-session shape. Persistent forks add entropy
@@ -4336,6 +4481,15 @@ def run_job(
                 )
                 _stored_runtime_fingerprint = _runtime_fingerprint
 
+        _progress_before = (
+            _persistent_workspace_progress_snapshot(
+                job,
+                session_id=str(getattr(agent, "session_id", "") or ""),
+            )
+            if _persistent_job and run_metadata is not None
+            else None
+        )
+
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
@@ -4632,6 +4786,14 @@ def run_job(
             )
             if run_metadata is not None:
                 run_metadata.update({"agent_ran": True, "tool_calls": tool_calls})
+                _record_persistent_progress_delta(
+                    run_metadata,
+                    _progress_before,
+                    _persistent_workspace_progress_snapshot(
+                        job,
+                        session_id=str(getattr(agent, "session_id", "") or ""),
+                    ),
+                )
             if _needs_prompt_contract_migration:
                 if not mark_persistent_prompt_contract_delivered(
                     job_id,
@@ -4852,9 +5014,13 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
         _run_metadata: dict[str, Any] = {}
+        _persistent_run = (
+            normalize_session_mode(job.get("session_mode"), strict=False)
+            == SESSION_MODE_PERSISTENT
+        )
         try:
             _run_job_kwargs: dict[str, Any] = {"defer_agent_teardown": _deferred_agents}
-            if normalize_session_mode(job.get("session_mode"), strict=False) == SESSION_MODE_PERSISTENT:
+            if _persistent_run:
                 _run_job_kwargs["run_metadata"] = _run_metadata
             if adapters is not None or loop is not None:
                 _run_job_kwargs.update({"adapters": adapters, "loop": loop})
@@ -4952,12 +5118,19 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             reset_persistent_silence_state(job["id"])
         else:
             _mark_kwargs: dict[str, Any] = {"delivery_error": delivery_error}
-            if normalize_session_mode(job.get("session_mode"), strict=False) == SESSION_MODE_PERSISTENT:
+            if _persistent_run:
+                silent_no_progress = bool(
+                    is_silence_response
+                    and int(_run_metadata.get("tool_calls") or 0) == 0
+                )
+                local_state_no_progress = bool(
+                    _run_metadata.get("meaningful_progress") is False
+                    and _run_metadata.get("local_artifact_only_write") is True
+                )
                 _mark_kwargs["persistent_no_progress"] = bool(
                     success
-                    and is_silence_response
                     and _run_metadata.get("agent_ran") is True
-                    and int(_run_metadata.get("tool_calls") or 0) == 0
+                    and (silent_no_progress or local_state_no_progress)
                 )
             mark_job_run(job["id"], success, error, **_mark_kwargs)
         return True

@@ -521,6 +521,7 @@ def compress_context(
         agent._compression_feasibility_checked = True
 
     _pre_msg_count = len(messages)
+    _pre_compression_session_id = str(agent.session_id or "")
     # In-place compaction (config: compression.in_place, see #38763). When True,
     # this compaction rewrites the message list + rebuilds the system prompt but
     # keeps the SAME session_id — no end_session, no parent_session_id child, no
@@ -1055,6 +1056,21 @@ def compress_context(
         try:
             from tools.file_tools import reset_file_dedup
             reset_file_dedup(task_id)
+        except Exception:
+            pass
+
+        # Skill bodies use a separate cron-session receipt cache. In-place
+        # compaction keeps the session id but can summarize the original body
+        # away, so the next identical skill_view must return full content.
+        try:
+            from tools.skills_tool import reset_cron_skill_view_dedup
+
+            for session_id in {
+                _pre_compression_session_id,
+                str(agent.session_id or ""),
+            }:
+                if session_id:
+                    reset_cron_skill_view_dedup(session_id)
         except Exception:
             pass
 

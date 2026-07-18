@@ -14,8 +14,6 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 
 def _make_agent(session_db, session_id, *, in_place):
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
@@ -72,9 +70,14 @@ class TestInPlaceCompaction:
             agent._last_flushed_db_idx = 5
 
             messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
-            compressed, _sp = compress_context(
-                agent, messages, approx_tokens=100_000, system_message="sys"
-            )
+            with patch(
+                "tools.skills_tool.reset_cron_skill_view_dedup"
+            ) as reset_skill_dedup:
+                compressed, _sp = compress_context(
+                    agent, messages, approx_tokens=100_000, system_message="sys"
+                )
+
+            reset_skill_dedup.assert_called_once_with(sid)
 
             # Identity never moved.
             assert agent.session_id == sid

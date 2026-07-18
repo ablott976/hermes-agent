@@ -560,7 +560,7 @@ def verification_status(
     except Exception:
         facts = None
     if not facts:
-        return {"status": "not_applicable", "evidence": None}
+        return {"status": "not_applicable", "evidence": None, "last_edit_at": None}
 
     sid = str(session_id or "default")
     root = str(facts.get("root") or Path(cwd or ".").resolve())
@@ -581,6 +581,7 @@ def verification_status(
                     "root": root,
                     "session_id": sid,
                     "changed_paths": [],
+                    "last_edit_at": None,
                 }
             event = None
             if state["last_event_id"] is not None:
@@ -602,6 +603,7 @@ def verification_status(
             "root": root,
             "session_id": sid,
             "changed_paths": changed_paths,
+            "last_edit_at": state["last_edit_at"],
         }
 
     evidence = dict(event)
@@ -615,4 +617,5 @@ def verification_status(
         "root": root,
         "session_id": sid,
         "changed_paths": changed_paths,
+        "last_edit_at": state["last_edit_at"],
     }

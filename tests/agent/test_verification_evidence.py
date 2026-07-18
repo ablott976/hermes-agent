@@ -88,6 +88,16 @@ def test_records_passed_then_marks_stale_after_edit(tmp_path, monkeypatch):
     status = verification_status(session_id="s1", cwd=tmp_path)
     assert status["status"] == "stale"
     assert status["changed_paths"] == [str(tmp_path / "src" / "app.ts")]
+    assert status["last_edit_at"] is not None
+
+    record_terminal_result(
+        command="scripts/run_tests.sh",
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+        output="green again",
+    )
+    assert verification_status(session_id="s1", cwd=tmp_path)["last_edit_at"] is None
 
 
 def test_lint_and_typecheck_are_not_reported_as_full_tests(tmp_path, monkeypatch):

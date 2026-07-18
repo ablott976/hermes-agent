@@ -21,6 +21,23 @@ from tools.skills_tool import (
 )
 
 
+@pytest.fixture(autouse=True)
+def clear_cron_skill_view_dedupe():
+    skills_tool_module._reset_cron_skill_view_cache_for_tests()
+    yield
+    skills_tool_module._reset_cron_skill_view_cache_for_tests()
+
+
+def _tool_skill_view(name: str, *, session_id: str, **args):
+    return json.loads(
+        skills_tool_module._skill_view_with_bump(
+            {"name": name, **args},
+            task_id=session_id,
+            session_id=session_id,
+        )
+    )
+
+
 def _make_skill(
     skills_dir, name, frontmatter_extra="", body="Step 1: Do the thing.", category=None
 ):
@@ -1370,3 +1387,63 @@ class TestSkillViewCollisionDetection:
         result = json.loads(raw)
         assert result["success"] is True
         assert "LOCAL BODY" in result["content"]
+
+
+class TestCronSkillViewDedupe:
+    def test_exact_repeat_in_same_cron_session_returns_compact_receipt(self, tmp_path):
+        _make_skill(tmp_path, "large", body="critical instructions " * 200)
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            first = _tool_skill_view("large", session_id="cron_job_root_a")
+            repeated = _tool_skill_view("large", session_id="cron_job_root_a")
+
+        assert "critical instructions" in first["content"]
+        assert repeated["already_loaded"] is True
+        assert "content" not in repeated
+        assert len(json.dumps(repeated)) < len(json.dumps(first)) / 4
+
+    def test_compression_reset_returns_full_content_after_repeat(self, tmp_path):
+        _make_skill(tmp_path, "compressible")
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _tool_skill_view("compressible", session_id="cron_job_root_a")
+            receipt = _tool_skill_view("compressible", session_id="cron_job_root_a")
+            skills_tool_module.reset_cron_skill_view_dedup("cron_job_root_a")
+            after_compression = _tool_skill_view(
+                "compressible", session_id="cron_job_root_a"
+            )
+
+        assert receipt["already_loaded"] is True
+        assert "Step 1" in after_compression["content"]
+
+    def test_new_root_and_inline_sessions_keep_full_content(self, tmp_path):
+        _make_skill(tmp_path, "portable")
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            first_root = _tool_skill_view("portable", session_id="cron_job_root_a")
+            second_root = _tool_skill_view("portable", session_id="cron_job_root_b")
+            inline_first = _tool_skill_view("portable", session_id="telegram_inline")
+            inline_second = _tool_skill_view("portable", session_id="telegram_inline")
+
+        for result in (first_root, second_root, inline_first, inline_second):
+            assert "Step 1" in result["content"]
+            assert "already_loaded" not in result
+
+    def test_reference_and_changed_content_invalidate_exact_repeat(self, tmp_path):
+        skill_dir = _make_skill(tmp_path, "changing", body="version one")
+        references = skill_dir / "references"
+        references.mkdir()
+        (references / "details.md").write_text("reference body")
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            first = _tool_skill_view("changing", session_id="cron_job_root_a")
+            reference = _tool_skill_view(
+                "changing",
+                session_id="cron_job_root_a",
+                file_path="references/details.md",
+            )
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: changing\ndescription: changed.\n---\n\nversion two\n"
+            )
+            changed = _tool_skill_view("changing", session_id="cron_job_root_a")
+
+        assert "version one" in first["content"]
+        assert "reference body" in reference["content"]
+        assert "version two" in changed["content"]
