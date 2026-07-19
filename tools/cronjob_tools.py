@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Union
 from hermes_constants import display_hermes_home
 
 logger = logging.getLogger(__name__)
+_UNSET = object()
 
 # Import from cron module (will be available when properly installed)
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -602,6 +603,10 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["workdir"] = job["workdir"]
     if job.get("progress"):
         result["progress"] = job["progress"]
+    if "persistent_silence_pause_threshold" in job:
+        result["persistent_silence_pause_threshold"] = job[
+            "persistent_silence_pause_threshold"
+        ]
     if job.get("validation"):
         result["validation"] = job["validation"]
     return result
@@ -691,6 +696,7 @@ def cronjob(
     attach_to_session: Optional[bool] = None,
     session_mode: Optional[str] = None,
     progress: Optional[Union[bool, str, Dict[str, Any]]] = None,
+    persistent_silence_pause_threshold: Any = _UNSET,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -765,6 +771,11 @@ def cronjob(
                 no_agent=_no_agent,
                 attach_to_session=attach_to_session,
                 session_mode=session_mode,
+                persistent_silence_pause_threshold=(
+                    None
+                    if persistent_silence_pause_threshold is _UNSET
+                    else persistent_silence_pause_threshold
+                ),
                 progress=progress,
             )
             _notify_provider_jobs_changed_safe()
@@ -949,6 +960,10 @@ def cronjob(
                 updates["attach_to_session"] = bool(attach_to_session)
             if session_mode is not None:
                 updates["session_mode"] = session_mode
+            if persistent_silence_pause_threshold is not _UNSET:
+                updates["persistent_silence_pause_threshold"] = (
+                    persistent_silence_pause_threshold
+                )
             if progress is not None:
                 updates["progress"] = progress
             if workdir is not None:
@@ -1114,6 +1129,11 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "enum": ["fresh", "persistent"],
                 "description": "Internal agent conversation lifecycle. 'fresh' (default) starts an independent conversation on every run and is appropriate for watchdogs, digests, and recurring checks. 'persistent' resumes one durable conversation across ticks, including compressed history, and is intended for finite continuable development. Define persistent jobs for prompt-cache stability: keep mutable phase/SHA/PR/next-action values in a current-only durable state (target 5-10 KB, maximum 20 KB), archive append-only history outside that hot state, use targeted reads, pass skills=[] unless preloading is indispensable, and expose only phase-required toolsets. Existing jobs remain fresh. This is separate from attach_to_session, which only controls whether a user can reply to delivered output. Not available with no_agent=True."
             },
+            "persistent_silence_pause_threshold": {
+                "type": ["integer", "null"],
+                "minimum": 0,
+                "description": "Optional per-job no-progress fuse for persistent jobs. Omit to keep the default of 2 consecutive no-progress ticks; set 0 only when the job has its own verified pause/advance-notice protocol; set a positive integer for a custom threshold. On update, pass null to remove the override and restore the default."
+            },
             "attach_to_session": {
                 "type": "boolean",
                 "description": "When True, this job becomes CONTINUABLE: the user can reply to its delivery and the agent has the brief in context instead of asking 'what is that?'. On thread-capable platforms (Telegram topics, Discord/Slack threads) a dedicated thread is opened for the job and its replies; on DM-only platforms (WhatsApp/Signal) the brief is mirrored into the origin DM session. Use this for conversational recurring jobs the user will reply to — daily briefings, reminders that kick off follow-up work. Leave unset for fire-and-forget alerts/watchdogs. Overrides the global cron.mirror_delivery config for this one job. Only the origin chat is touched (never fan-out targets); no effect when deliver='local'."
@@ -1192,6 +1212,11 @@ registry.register(
         no_agent=args.get("no_agent"),
         attach_to_session=args.get("attach_to_session"),
         session_mode=args.get("session_mode"),
+        persistent_silence_pause_threshold=(
+            args["persistent_silence_pause_threshold"]
+            if "persistent_silence_pause_threshold" in args
+            else _UNSET
+        ),
         progress=args.get("progress"),
         task_id=kw.get("task_id"),
     ))(),

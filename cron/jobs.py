@@ -436,6 +436,24 @@ def normalize_session_mode(value: Any, *, strict: bool = True) -> str:
     return SESSION_MODE_FRESH
 
 
+def normalize_persistent_silence_pause_threshold(
+    value: Any,
+    *,
+    strict: bool = True,
+) -> Optional[int]:
+    """Normalize a per-job silence fuse; ``0`` explicitly disables it."""
+    if value is None:
+        return None
+    if not isinstance(value, bool) and isinstance(value, int) and value >= 0:
+        return value
+    if strict:
+        raise ValueError(
+            "persistent_silence_pause_threshold must be a non-negative integer "
+            "(0 disables automatic silence pause)"
+        )
+    return None
+
+
 def _job_output_dir(job_id: str) -> Path:
     """Resolve a job's output directory, rejecting any path-escape attempt.
 
@@ -1230,6 +1248,7 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     session_mode: Optional[str] = None,
     progress: Optional[Any] = None,
+    persistent_silence_pause_threshold: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1277,6 +1296,9 @@ def create_job(
         session_mode: ``fresh`` (default) creates an independent conversation
                 per tick. ``persistent`` resumes one durable conversation across
                 ticks and is intended for finite continuable work.
+        persistent_silence_pause_threshold: Per-job no-progress fuse for persistent
+                jobs. Omit to keep the default of two ticks, set ``0`` to disable,
+                or set a positive integer to choose a custom threshold.
         progress: Optional per-job progress override. Mirrors ``cron.progress``
                 config; bool/string is shorthand for the ``enabled`` field.
                 None means inherit global config.
@@ -1315,6 +1337,9 @@ def create_job(
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_session_mode = normalize_session_mode(session_mode)
+    normalized_silence_threshold = normalize_persistent_silence_pause_threshold(
+        persistent_silence_pause_threshold
+    )
     normalized_progress = _normalize_progress(progress)
 
     prompt_text = cron_creation_guard.substitute_job_placeholders(
@@ -1453,6 +1478,8 @@ def create_job(
     # the same compact on-disk shape. Read paths normalize a missing key.
     if normalized_session_mode == SESSION_MODE_PERSISTENT:
         job["session_mode"] = SESSION_MODE_PERSISTENT
+    if normalized_silence_threshold is not None:
+        job["persistent_silence_pause_threshold"] = normalized_silence_threshold
 
     job = cron_creation_guard.substitute_job_placeholders(
         job,
@@ -1696,6 +1723,12 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         )
     if "session_mode" in updates:
         updates["session_mode"] = normalize_session_mode(updates["session_mode"])
+    if "persistent_silence_pause_threshold" in updates:
+        updates["persistent_silence_pause_threshold"] = (
+            normalize_persistent_silence_pause_threshold(
+                updates["persistent_silence_pause_threshold"]
+            )
+        )
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -1735,6 +1768,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             if "progress" in updates:
                 updates["progress"] = _normalize_progress(updates["progress"])
             updated = _apply_skill_fields({**job, **updates})
+            if (
+                "persistent_silence_pause_threshold" in updates
+                and updates["persistent_silence_pause_threshold"] is None
+            ):
+                updated.pop("persistent_silence_pause_threshold", None)
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)
@@ -1782,6 +1820,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 if (
                     "session_mode" in updates
                     or ("enabled" in updates and bool(updates.get("enabled")))
+                    or "persistent_silence_pause_threshold" in updates
                 ):
                     updated.pop("persistent_contract_forks", None)
                     updated.pop("persistent_silent_ticks", None)
@@ -2418,9 +2457,9 @@ def mark_job_run(
 
     ``persistent_no_progress`` is scheduler-owned and means a successful,
     workspace-scoped persistent agent tick returned the cron silence marker
-    without calling a tool. Two consecutive occurrences pause that finite job
-    atomically with the normal run accounting. Fresh, unscoped, and no-agent
-    jobs ignore the flag.
+    without calling a tool. The per-job threshold (default two) pauses that
+    finite job atomically with normal run accounting; ``0`` disables this fuse.
+    Fresh, unscoped, and no-agent jobs ignore the flag.
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -2460,7 +2499,23 @@ def mark_job_run(
                     persistent_agent_job
                     and bool(str(job.get("workdir") or "").strip())
                 )
-                if workspace_scoped_persistent and success and persistent_no_progress:
+                configured_silence_threshold = (
+                    normalize_persistent_silence_pause_threshold(
+                        job.get("persistent_silence_pause_threshold"),
+                        strict=False,
+                    )
+                )
+                effective_silence_threshold = (
+                    _PERSISTENT_SILENT_PAUSE_THRESHOLD
+                    if configured_silence_threshold is None
+                    else configured_silence_threshold
+                )
+                if (
+                    effective_silence_threshold > 0
+                    and workspace_scoped_persistent
+                    and success
+                    and persistent_no_progress
+                ):
                     try:
                         prior_silent_ticks = max(
                             0,
@@ -2501,12 +2556,16 @@ def mark_job_run(
                         save_jobs(jobs)
                         return
 
-                if silent_ticks >= _PERSISTENT_SILENT_PAUSE_THRESHOLD:
+                if (
+                    effective_silence_threshold > 0
+                    and silent_ticks >= effective_silence_threshold
+                ):
                     job["enabled"] = False
                     job["state"] = "paused"
                     job["paused_at"] = now
                     job["paused_reason"] = (
-                        "Paused automatically after two consecutive runs with no reported progress."
+                        "Paused automatically after "
+                        f"{effective_silence_threshold} consecutive runs with no reported progress."
                     )
                     job["next_run_at"] = None
                     save_jobs(jobs)

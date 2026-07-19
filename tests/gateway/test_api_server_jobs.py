@@ -175,6 +175,7 @@ class TestCreateJob:
                     "schedule": "*/5 * * * *",
                     "prompt": "do something",
                     "session_mode": "persistent",
+                    "persistent_silence_pause_threshold": 0,
                 }, headers={
                     "X-Forwarded-For": "203.0.113.11",
                     "User-Agent": "cron-client",
@@ -188,6 +189,7 @@ class TestCreateJob:
                 assert call_kwargs["schedule"] == "*/5 * * * *"
                 assert call_kwargs["prompt"] == "do something"
                 assert call_kwargs["session_mode"] == "persistent"
+                assert call_kwargs["persistent_silence_pause_threshold"] == 0
                 assert call_kwargs["origin"]["platform"] == "api_server"
                 assert call_kwargs["origin"]["chat_id"] == "api"
                 assert call_kwargs["origin"]["forwarded_for"] == "203.0.113.11"
@@ -210,6 +212,25 @@ class TestCreateJob:
 
         assert resp.status == 400
         assert "session_mode" in data["error"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", [True, -1, "0"])
+    async def test_create_job_rejects_invalid_silence_threshold(self, adapter, value):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.post(
+                    "/api/jobs",
+                    json={
+                        "name": "test-job",
+                        "schedule": "every 1h",
+                        "persistent_silence_pause_threshold": value,
+                    },
+                )
+                data = await resp.json()
+
+        assert resp.status == 400
+        assert "persistent_silence_pause_threshold" in data["error"]
 
     @pytest.mark.asyncio
     async def test_create_job_missing_name(self, adapter):
@@ -377,6 +398,7 @@ class TestUpdateJob:
                         "name": "updated-name",
                         "schedule": "0 * * * *",
                         "session_mode": "persistent",
+                        "persistent_silence_pause_threshold": 0,
                     },
                 )
                 assert resp.status == 200
@@ -389,6 +411,7 @@ class TestUpdateJob:
                 assert "name" in sanitized
                 assert "schedule" in sanitized
                 assert sanitized["session_mode"] == "persistent"
+                assert sanitized["persistent_silence_pause_threshold"] == 0
 
     @pytest.mark.asyncio
     async def test_update_job_rejects_unknown_fields(self, adapter):
@@ -430,6 +453,37 @@ class TestUpdateJob:
 
         assert resp.status == 400
         assert "session_mode" in data["error"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", [True, -1, "0"])
+    async def test_update_job_rejects_invalid_silence_threshold(self, adapter, value):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"persistent_silence_pause_threshold": value},
+                )
+                data = await resp.json()
+
+        assert resp.status == 400
+        assert "persistent_silence_pause_threshold" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_update_job_null_silence_threshold_resets_default(self, adapter):
+        app = _create_app(adapter)
+        mock_update = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_update", mock_update
+            ):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"persistent_silence_pause_threshold": None},
+                )
+
+        assert resp.status == 200
+        assert mock_update.call_args[0][1]["persistent_silence_pause_threshold"] is None
 
     @pytest.mark.asyncio
     async def test_update_job_no_valid_fields(self, adapter):

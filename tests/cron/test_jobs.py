@@ -1075,6 +1075,44 @@ class TestUpdateJob:
         with pytest.raises(ValueError, match="session_mode"):
             update_job(job["id"], {"session_mode": "resume"})
 
+    @pytest.mark.parametrize("value", [-1, True, "0"])
+    def test_rejects_invalid_persistent_silence_threshold(self, tmp_cron_dir, value):
+        with pytest.raises(ValueError, match="persistent_silence_pause_threshold"):
+            create_job(
+                prompt="Continue",
+                schedule="every 1m",
+                session_mode="persistent",
+                persistent_silence_pause_threshold=value,
+            )
+
+        job = create_job(prompt="Continue", schedule="every 1m")
+        with pytest.raises(ValueError, match="persistent_silence_pause_threshold"):
+            update_job(job["id"], {"persistent_silence_pause_threshold": value})
+
+    def test_clear_persistent_silence_threshold_restores_default_and_counter(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Continue",
+            schedule="every 1m",
+            session_mode="persistent",
+            persistent_silence_pause_threshold=3,
+            workdir=str(tmp_cron_dir),
+        )
+        job = _as_enabled_legacy_job(job)
+        assert job is not None
+        mark_job_run(job["id"], success=True, persistent_no_progress=True)
+        stored = get_job(job["id"])
+        assert stored is not None
+        assert stored["persistent_silent_ticks"] == 1
+
+        updated = update_job(
+            job["id"],
+            {"persistent_silence_pause_threshold": None},
+        )
+
+        assert updated is not None
+        assert "persistent_silence_pause_threshold" not in updated
+        assert "persistent_silent_ticks" not in updated
+
     def test_persistent_session_metadata_is_internal_only(self, tmp_cron_dir):
         job = create_job(
             prompt="Continue",
@@ -1285,6 +1323,52 @@ class TestMarkJobRun:
         assert resumed["enabled"] is True
         assert "persistent_silent_ticks" not in resumed
         assert resumed["session_root_id"] == "root"
+
+    def test_zero_threshold_disables_persistent_silence_autopause(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Continue with an explicit pause protocol",
+            schedule="every 1m",
+            session_mode="persistent",
+            persistent_silence_pause_threshold=0,
+            workdir=str(tmp_cron_dir),
+        )
+        job = _as_enabled_legacy_job(job)
+        assert job is not None
+
+        for _ in range(4):
+            mark_job_run(job["id"], success=True, persistent_no_progress=True)
+
+        stored = get_job(job["id"])
+        assert stored is not None
+        assert stored["enabled"] is True
+        assert stored["state"] == "scheduled"
+        assert stored["persistent_silence_pause_threshold"] == 0
+        assert "persistent_silent_ticks" not in stored
+
+    def test_custom_persistent_silence_threshold_pauses_exactly_at_limit(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Continue finite work",
+            schedule="every 1m",
+            session_mode="persistent",
+            persistent_silence_pause_threshold=3,
+            workdir=str(tmp_cron_dir),
+        )
+        job = _as_enabled_legacy_job(job)
+        assert job is not None
+
+        for expected in (1, 2):
+            mark_job_run(job["id"], success=True, persistent_no_progress=True)
+            running = get_job(job["id"])
+            assert running is not None
+            assert running["enabled"] is True
+            assert running["persistent_silent_ticks"] == expected
+
+        mark_job_run(job["id"], success=True, persistent_no_progress=True)
+        paused = get_job(job["id"])
+        assert paused is not None
+        assert paused["enabled"] is False
+        assert paused["persistent_silent_ticks"] == 3
+        assert "after 3 consecutive" in paused["paused_reason"]
 
     def test_useful_or_failed_tick_resets_persistent_no_progress(self, tmp_cron_dir):
         job = create_job(
