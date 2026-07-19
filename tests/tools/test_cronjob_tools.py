@@ -288,6 +288,39 @@ class TestUnifiedCronjobTool:
         assert updated["success"] is True
         assert updated["job"]["session_mode"] == "fresh"
 
+    def test_create_and_update_persistent_silence_threshold(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Continue the implementation",
+                schedule="every 1m",
+                session_mode="persistent",
+                persistent_silence_pause_threshold=0,
+            )
+        )
+        assert created["success"] is True
+        assert created["job"]["persistent_silence_pause_threshold"] == 0
+
+        updated = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                persistent_silence_pause_threshold=3,
+            )
+        )
+        assert updated["success"] is True
+        assert updated["job"]["persistent_silence_pause_threshold"] == 3
+
+        reset = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                persistent_silence_pause_threshold=None,
+            )
+        )
+        assert reset["success"] is True
+        assert "persistent_silence_pause_threshold" not in reset["job"]
+
     def test_schema_advertises_persistent_session_mode(self):
         props = CRONJOB_SCHEMA["parameters"]["properties"]
         assert props["session_mode"]["enum"] == ["fresh", "persistent"]
@@ -296,6 +329,12 @@ class TestUnifiedCronjobTool:
         assert "current-only durable state" in description
         assert "skills=[]" in description
         assert "phase-required toolsets" in description
+        threshold = props["persistent_silence_pause_threshold"]
+        assert threshold["type"] == ["integer", "null"]
+        assert threshold["minimum"] == 0
+        assert "default of 2" in threshold["description"]
+        assert "advance-notice protocol" in threshold["description"]
+        assert "pass null" in threshold["description"]
 
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs

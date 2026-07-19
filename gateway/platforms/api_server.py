@@ -3685,7 +3685,7 @@ class APIServerAdapter(BasePlatformAdapter):
     # Allowed fields for update — prevents clients injecting arbitrary keys
     _UPDATE_ALLOWED_FIELDS = {
         "name", "schedule", "prompt", "deliver", "skills", "skill",
-        "repeat", "enabled", "session_mode",
+        "repeat", "enabled", "session_mode", "persistent_silence_pause_threshold",
     }
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
@@ -3745,6 +3745,7 @@ class APIServerAdapter(BasePlatformAdapter):
             skills = body.get("skills")
             repeat = body.get("repeat")
             session_mode = body.get("session_mode")
+            silence_threshold = body.get("persistent_silence_pause_threshold")
 
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
@@ -3769,6 +3770,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     {"error": "session_mode must be 'fresh' or 'persistent'"},
                     status=400,
                 )
+            if silence_threshold is not None and (
+                isinstance(silence_threshold, bool)
+                or not isinstance(silence_threshold, int)
+                or silence_threshold < 0
+            ):
+                return web.json_response(
+                    {"error": "persistent_silence_pause_threshold must be a non-negative integer"},
+                    status=400,
+                )
 
             kwargs = {
                 "prompt": prompt,
@@ -3783,6 +3793,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["repeat"] = repeat
             if session_mode is not None:
                 kwargs["session_mode"] = session_mode
+            if silence_threshold is not None:
+                kwargs["persistent_silence_pause_threshold"] = silence_threshold
 
             job = _cron_create(**kwargs)
             _notify_cron_provider_jobs_changed()
@@ -3846,6 +3858,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     {"error": "session_mode must be 'fresh' or 'persistent'"},
                     status=400,
                 )
+            if "persistent_silence_pause_threshold" in sanitized:
+                silence_threshold = sanitized["persistent_silence_pause_threshold"]
+                if silence_threshold is not None and (
+                    isinstance(silence_threshold, bool)
+                    or not isinstance(silence_threshold, int)
+                    or silence_threshold < 0
+                ):
+                    return web.json_response(
+                        {"error": "persistent_silence_pause_threshold must be a non-negative integer"},
+                        status=400,
+                    )
             job = _cron_update(job_id, sanitized)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
