@@ -509,7 +509,20 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = fall back to active default profile. |
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
 | `auto_subscribe_on_create` | `true` | When a worker calls `kanban_create` from inside a session with a persistent delivery channel (messaging gateway or TUI), the originating session is auto-subscribed to the new task's completion/block events. The dispatcher still drives the delivery — this only changes whether the caller's chat/key shows up in the notify-sub table. Set to `false` to require explicit `kanban_notify-subscribe` calls per task. |
-| `progress_notification_interval_seconds` | `0` | Periodic human progress for subscribed running tasks. `0` disables it; enabled values below 30 seconds are clamped to 30. A worker repeats its latest redacted interim update at this cadence, and the notifier sends it from the subscription's owning profile/bot. |
+| `progress_notification_interval_seconds` | `0` | Cadence at which a running worker persists its latest redacted interim update. `0` disables persistence; enabled values below 30 seconds are clamped to 30. In `direct` delivery mode the gateway also sends this update immediately. In `cron_no_agent` mode it remains durable input for the temporary relay cron. |
+| `progress_delivery` | `direct` | `direct` preserves the gateway notifier behavior. `cron_no_agent` projects each owned notification subscription into one temporary profile-local script-only cron and suppresses duplicate direct text once that relay is ready. |
+| `progress_cron_interval_minutes` | `5` | Relay cadence for `cron_no_agent`; bounded to 1–60 minutes. Each tick reads the real task state and latest durable progress without constructing an agent or calling a model. The relay reports the final state, confirms successful delivery on its next silent tick, removes the subscription, and pauses itself. |
+
+Example — temporary no-agent reporting for every subscribed card owned by this profile:
+
+```yaml
+kanban:
+  progress_notification_interval_seconds: 60
+  progress_delivery: cron_no_agent
+  progress_cron_interval_minutes: 5
+```
+
+The relay script is generated inside the owning profile's existing `scripts/` sandbox. Creation is idempotent per board/task/chat/thread/profile subscription. If reconciliation cannot create or verify the cron, the shipped direct notifier remains active for that subscription rather than leaving it silent. Multiplexed subscriptions owned by another profile also stay on the direct notifier unless that profile owns the active cron store; Hermes never falls back to a different profile's bot.
 
 And the two auxiliary LLM slots:
 
