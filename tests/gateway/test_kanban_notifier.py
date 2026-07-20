@@ -717,13 +717,66 @@ def test_cron_mode_keeps_terminal_subscription_for_final_relay_delivery(
     runner._active_profile_name = lambda: "maker"
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    # Terminal bookkeeping is claimed, but visible text and final unsubscribe
-    # belong to the relay so there is no duplicate completion message.
+    # The final event remains pending until the relay confirms delivery. This
+    # preserves a direct fallback if mode/config changes before the next tick.
+    assert adapter.sent == []
+    assert [event.kind for event in _unseen_terminal_events_for(tid, "progress-chat")] == [
+        "completed"
+    ]
+    conn = kb.connect()
+    try:
+        assert len(kb.list_notify_subs(conn, tid)) == 1
+    finally:
+        conn.close()
+
+
+def test_cron_mode_claims_terminal_only_after_relay_confirmation(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "cron-confirmed.db"))
+    kb.init_db()
+    tid, _ = _create_running_progress_subscription(notifier_profile="maker")
+    conn = kb.connect()
+    try:
+        assert kb.complete_task(conn, tid, summary="Entrega completada")
+    finally:
+        conn.close()
+
+    key = progress_relay_key(
+        board=kb.DEFAULT_BOARD,
+        task_id=tid,
+        platform="telegram",
+        chat_id="progress-chat",
+        thread_id="",
+        notifier_profile="maker",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "progress_delivery": "cron_no_agent",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "gateway.kanban_watchers.reconcile_kanban_progress_crons",
+        lambda *args, **kwargs: RelayReconcileResult(
+            terminal_confirmed_keys=frozenset({key})
+        ),
+    )
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_notifier_profile = "maker"
+    runner._active_profile_name = lambda: "maker"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
     assert adapter.sent == []
     assert _unseen_terminal_events_for(tid, "progress-chat") == []
     conn = kb.connect()
     try:
-        assert len(kb.list_notify_subs(conn, tid)) == 1
+        assert kb.list_notify_subs(conn, tid) == []
     finally:
         conn.close()
 

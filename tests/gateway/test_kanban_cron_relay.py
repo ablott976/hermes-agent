@@ -314,18 +314,34 @@ def test_relay_renders_progress_then_confirms_final_delivery_before_pause(
     finally:
         conn.close()
 
-    # The first terminal tick prints the final report but deliberately stays
-    # enabled. Delivery happens only after the script returns.
+    # Blocked is reportable but recoverable: keep both relay and subscription.
     assert relay_script_main() == 0
-    final = capsys.readouterr().out
-    assert "Kanban bloqueado" in final
-    assert "Falta aprobación del owner" in final
+    blocked = capsys.readouterr().out
+    assert "Kanban bloqueado" in blocked
+    assert "Falta aprobación del owner" in blocked
     still_running = get_job(job["id"])
     assert still_running is not None
     assert still_running["enabled"] is True
+    conn = kb.connect()
+    try:
+        assert len(kb.list_notify_subs(conn, task_id)) == 1
+        assert kb.unblock_task(conn, task_id)
+        claimed = kb.claim_task(conn, task_id, claimer="worker-2")
+        assert claimed is not None
+        assert kb.complete_task(conn, task_id, summary="Entrega aprobada")
+    finally:
+        conn.close()
+
+    # The first truly terminal tick prints the final report but stays enabled;
+    # delivery happens only after the script returns.
+    assert relay_script_main() == 0
+    final = capsys.readouterr().out
+    assert "Kanban completado" in final
+    assert "Entrega aprobada" in final
 
     # Simulate the scheduler recording successful delivery for that terminal
-    # tick. The next silent tick may now remove the subscription and self-pause.
+    # tick. The next silent tick confirms delivery and self-pauses, but the
+    # notifier still owns terminal bookkeeping and subscription cleanup.
     update_job(
         job["id"],
         {
@@ -343,6 +359,11 @@ def test_relay_renders_progress_then_confirms_final_delivery_before_pause(
     assert stopped["paused_reason"] == "Kanban final update delivered"
     conn = kb.connect()
     try:
-        assert kb.list_notify_subs(conn, task_id) == []
+        assert len(kb.list_notify_subs(conn, task_id)) == 1
     finally:
         conn.close()
+    confirmed = reconcile_kanban_progress_crons("maker", interval_minutes=5)
+    assert confirmed.ready_keys == frozenset()
+    assert confirmed.terminal_confirmed_keys == frozenset(
+        {json.loads(job["prompt"])["relay_key"]}
+    )

@@ -34,7 +34,7 @@ _RELAY_VERSION = 1
 _RELAY_LOCK_NAME = ".kanban-progress-relay.lock"
 _RELAY_STATE_DIR = "kanban-progress-relays"
 _INVALID_RELAY_BUCKET = "__invalid_managed_relays__"
-_TERMINAL_STATUSES = frozenset({"done", "archived", "blocked"})
+_TERMINAL_STATUSES = frozenset({"done", "archived"})
 _PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _TASK_RE = re.compile(r"^t_[0-9a-f]+$")
 _JOB_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -46,13 +46,14 @@ class RelayReconcileResult:
     """Transport ownership decided by one reconciliation attempt.
 
     ``ready_keys`` have a fully verified active cron and may suppress direct
-    delivery. ``deferred_keys`` are in a concurrent create/update window; the
-    notifier skips only that tick so it cannot race the first relay delivery.
+    progress. ``deferred_keys`` are in a concurrent create/update window;
+    ``terminal_confirmed_keys`` may claim terminal bookkeeping only after the
+    relay's final message was delivered successfully.
     """
 
     ready_keys: frozenset[str] = frozenset()
     deferred_keys: frozenset[str] = frozenset()
-
+    terminal_confirmed_keys: frozenset[str] = frozenset()
 
 
 def _relay_script_source() -> str:
@@ -343,6 +344,8 @@ def _job_matches_spec(
     job: dict[str, Any],
     spec: dict[str, Any],
     interval: int,
+    *,
+    require_active: bool = True,
 ) -> bool:
     schedule = job.get("schedule") or {}
     try:
@@ -352,9 +355,9 @@ def _job_matches_spec(
         )
     except (TypeError, ValueError):
         schedule_matches = False
+    active_matches = bool(job.get("enabled") and job.get("state") != "paused")
     return bool(
-        job.get("enabled")
-        and job.get("state") != "paused"
+        (active_matches or not require_active)
         and job.get("no_agent") is True
         and job.get("script") == RELAY_SCRIPT_NAME
         and job.get("deliver") == "origin"
@@ -462,6 +465,7 @@ def reconcile_kanban_progress_crons(
                 _ensure_relay_script()
 
             ready: set[str] = set()
+            terminal_confirmed: set[str] = set()
             for relay_key, spec in desired_specs.items():
                 jobs = existing.get(relay_key, [])
                 primary = jobs[0] if jobs else None
@@ -516,9 +520,23 @@ def reconcile_kanban_progress_crons(
                         updates["schedule"] = f"every {interval}m"
                     if updates:
                         primary = update_job(primary["id"], updates) or primary
-                    if not primary.get("enabled") or primary.get("state") == "paused":
-                        _clear_relay_state(relay_key)
-                        primary = resume_job(primary["id"]) or primary
+                relay_state = _read_state(_relay_state_path(relay_key))
+                if relay_state.get("terminal_delivery_confirmed_at") and _job_matches_spec(
+                    primary,
+                    spec,
+                    interval,
+                    require_active=False,
+                ):
+                    if primary.get("enabled") or primary.get("state") != "paused":
+                        if not _pause_job_verified(
+                            primary["id"], reason="Kanban final update delivered"
+                        ):
+                            raise RuntimeError("could not pause delivered Kanban relay")
+                    terminal_confirmed.add(relay_key)
+                    continue
+                if not primary.get("enabled") or primary.get("state") == "paused":
+                    _clear_relay_state(relay_key)
+                    primary = resume_job(primary["id"]) or primary
                 if _job_matches_spec(primary, spec, interval):
                     ready.add(relay_key)
                 else:
@@ -538,7 +556,10 @@ def reconcile_kanban_progress_crons(
                         ):
                             raise RuntimeError("could not stop orphan Kanban relay")
                     _clear_relay_state(relay_key)
-            return RelayReconcileResult(ready_keys=frozenset(ready))
+            return RelayReconcileResult(
+                ready_keys=frozenset(ready),
+                terminal_confirmed_keys=frozenset(terminal_confirmed),
+            )
         except Exception:
             # Never let a partially-created or stale job suppress the direct
             # fallback. If cleanup itself cannot be verified, defer this tick
@@ -657,18 +678,6 @@ def _subscription_exists(conn: Any, spec: dict[str, Any]) -> bool:
     return False
 
 
-def _remove_subscription(conn: Any, spec: dict[str, Any]) -> None:
-    from hermes_cli import kanban_db as kb
-
-    kb.remove_notify_sub(
-        conn,
-        task_id=str(spec["task_id"]),
-        platform=str(spec["platform"]),
-        chat_id=str(spec["chat_id"]),
-        thread_id=str(spec.get("thread_id") or ""),
-    )
-
-
 def _render_task_report(task: Any, events: list[Any], conn: Any) -> tuple[str, bool]:
     now = time.time()
     title = _safe_title(task.title)
@@ -679,18 +688,23 @@ def _render_task_report(task: Any, events: list[Any], conn: Any) -> tuple[str, b
         headings = {
             "done": "Kanban completado",
             "archived": "Kanban archivado",
-            "blocked": "Kanban bloqueado",
         }
         labels = {
             "done": "Completado",
             "archived": "Archivado",
-            "blocked": "Bloqueado",
         }
         lines = [headings[status], title, f"Estado: {labels[status]} · {duration}"]
         detail = _latest_terminal_detail(task, events, conn)
         if detail:
-            lines.append(("Bloqueo: " if status == "blocked" else "Resultado: ") + detail)
+            lines.append("Resultado: " + detail)
         return "\n".join(lines), True
+
+    if status == "blocked":
+        lines = ["Kanban bloqueado", title, f"Estado: Bloqueado · {duration}"]
+        detail = _latest_terminal_detail(task, events, conn)
+        if detail:
+            lines.append("Bloqueo: " + detail)
+        return "\n".join(lines), False
 
     labels = {
         "ready": "Pendiente",
@@ -732,16 +746,13 @@ def _relay_script_run(job_id: str) -> str:
             and job.get("last_status") == "ok"
             and not job.get("last_delivery_error")
         ):
+            confirmed_state = dict(state)
+            confirmed_state["terminal_delivery_confirmed_at"] = time.time()
+            _write_state(state_path, confirmed_state)
             if not _pause_job_verified(
                 job_id, reason="Kanban final update delivered"
             ):
                 return _SILENT_WAKE_GATE
-            conn = kb.connect(board=str(spec["board"]))
-            try:
-                _remove_subscription(conn, spec)
-            finally:
-                conn.close()
-            _clear_relay_state(str(spec["relay_key"]))
             return ""
 
     conn = kb.connect(board=str(spec["board"]))

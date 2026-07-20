@@ -252,6 +252,9 @@ class GatewayKanbanWatchersMixin:
                     relay_result = RelayReconcileResult()
                 relay_ready_keys = set(relay_result.ready_keys)
                 relay_deferred_keys = set(relay_result.deferred_keys)
+                relay_terminal_confirmed_keys = set(
+                    relay_result.terminal_confirmed_keys
+                )
 
                 def _collect():
                     deliveries: list[dict] = []
@@ -340,12 +343,23 @@ class GatewayKanbanWatchersMixin:
                                     # this relay. Skip one tick rather than race
                                     # a direct send against its first cron run.
                                     continue
-                                cron_owned = relay_key in relay_ready_keys
+                                terminal_confirmed = (
+                                    relay_key in relay_terminal_confirmed_keys
+                                )
+                                cron_owned = (
+                                    relay_key in relay_ready_keys or terminal_confirmed
+                                )
                                 if platform not in active_platforms:
                                     logger.debug(
                                         "kanban notifier: subscription for %s on %s skipped; adapter not connected",
                                         sub.get("task_id"), platform or "<missing>",
                                     )
+                                    continue
+                                if cron_owned and not terminal_confirmed:
+                                    # Keep terminal/status events pending until
+                                    # the relay confirms its final delivery.
+                                    # A mode switch or relay failure can still
+                                    # fall back to the direct notifier.
                                     continue
                                 # Terminal/status transitions always win. Their
                                 # claim advances past older progress so a failed
@@ -406,6 +420,7 @@ class GatewayKanbanWatchersMixin:
                                     "task": task,
                                     "board": slug,
                                     "cron_owned": cron_owned,
+                                    "terminal_confirmed": terminal_confirmed,
                                 })
                         finally:
                             conn.close()
@@ -417,6 +432,7 @@ class GatewayKanbanWatchersMixin:
                     task = d["task"]
                     board_slug = d.get("board")
                     cron_owned = bool(d.get("cron_owned"))
+                    terminal_confirmed = bool(d.get("terminal_confirmed"))
                     platform_str = (sub["platform"] or "").lower()
                     try:
                         plat = _Platform(platform_str)
@@ -750,7 +766,7 @@ class GatewayKanbanWatchersMixin:
                                     "kanban notifier: wakeup injection failed for %s: %s",
                                     sub["task_id"], _wk_err, exc_info=True,
                                 )
-                        if task_terminal and not cron_owned:
+                        if task_terminal and (not cron_owned or terminal_confirmed):
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,
                             )
