@@ -386,6 +386,7 @@ def reconcile_kanban_progress_crons(
     *,
     interval_minutes: int = 5,
     enabled: bool = True,
+    defer_direct_on_contention: bool = True,
 ) -> RelayReconcileResult:
     """Project owned Kanban subscriptions into idempotent no-agent cron jobs.
 
@@ -403,10 +404,12 @@ def reconcile_kanban_progress_crons(
         # through the active profile's HERMES_HOME.
         return RelayReconcileResult()
     interval = min(60, max(1, int(interval_minutes)))
-    try:
-        subscription_specs = _owned_subscription_specs(profile)
-    except Exception:
-        subscription_specs = {}
+    subscription_specs: dict[str, dict[str, Any]] = {}
+    if enabled:
+        try:
+            subscription_specs = _owned_subscription_specs(profile)
+        except Exception:
+            subscription_specs = {}
     deferred = frozenset(subscription_specs)
     desired_specs = subscription_specs if enabled else {}
     lock_path = get_hermes_home() / "cron" / _RELAY_LOCK_NAME
@@ -414,11 +417,23 @@ def reconcile_kanban_progress_crons(
     try:
         handle = open(lock_path, "a+", encoding="utf-8")
     except OSError:
+        if not enabled and defer_direct_on_contention:
+            try:
+                subscription_specs = _owned_subscription_specs(profile)
+            except Exception:
+                subscription_specs = {}
+            deferred = frozenset(subscription_specs)
         return RelayReconcileResult(deferred_keys=deferred)
     try:
         from gateway.status import _release_file_lock, _try_acquire_file_lock
 
         if not _try_acquire_file_lock(handle):
+            if not enabled and defer_direct_on_contention:
+                try:
+                    subscription_specs = _owned_subscription_specs(profile)
+                except Exception:
+                    subscription_specs = {}
+                deferred = frozenset(subscription_specs)
             return RelayReconcileResult(deferred_keys=deferred)
         try:
             existing = _existing_relay_jobs(profile)

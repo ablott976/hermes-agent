@@ -176,6 +176,7 @@ class GatewayKanbanWatchersMixin:
                 reconcile_kanban_progress_crons,
                 notifier_profile,
                 enabled=False,
+                defer_direct_on_contention=False,
             )
             logger.info("kanban notifier: disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY env")
             return
@@ -190,6 +191,7 @@ class GatewayKanbanWatchersMixin:
                 reconcile_kanban_progress_crons,
                 notifier_profile,
                 enabled=False,
+                defer_direct_on_contention=False,
             )
             logger.info(
                 "kanban notifier: disabled via config kanban.dispatch_in_gateway=false"

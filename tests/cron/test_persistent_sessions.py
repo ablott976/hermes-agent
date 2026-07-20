@@ -511,7 +511,10 @@ def test_legacy_no_agent_persistent_record_never_opens_a_conversation(
     persistent_env,
     monkeypatch,
 ):
-    monkeypatch.setattr("cron.scheduler._run_job_script", lambda _path: (True, "healthy"))
+    monkeypatch.setattr(
+        "cron.scheduler._run_job_script",
+        lambda _path, *, job_id=None: (True, "healthy"),
+    )
     legacy = {
         "id": "legacy-no-agent",
         "name": "legacy watchdog",
