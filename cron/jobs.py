@@ -1610,12 +1610,20 @@ def _apply_creation_contract_update(
         owner_profile=owner_profile,
     )
 
-    cron_creation_guard.check_job_lifecycle(
-        updated.get("prompt"),
-        updated.get("script"),
-        no_agent=bool(updated.get("no_agent")),
-        owner_home=owner_home,
+    activation = _activation_requested(updates)
+    validation_fields_changed = bool(_CRON_VALIDATION_FIELDS.intersection(updates))
+    explicit_deactivation = (
+        not activation
+        and not validation_fields_changed
+        and (updates.get("enabled") is False or updates.get("state") == "paused")
     )
+    if not explicit_deactivation:
+        cron_creation_guard.check_job_lifecycle(
+            updated.get("prompt"),
+            updated.get("script"),
+            no_agent=bool(updated.get("no_agent")),
+            owner_home=owner_home,
+        )
 
     post_rollout = cron_creation_guard.is_post_rollout_job(
         original,
@@ -1627,10 +1635,9 @@ def _apply_creation_contract_update(
         and normalize_session_mode(updated.get("session_mode"), strict=False)
         == SESSION_MODE_PERSISTENT
     )
-    activation = _activation_requested(updates)
     if not (post_rollout or enroll_legacy):
         return updated
-    if not activation and not _CRON_VALIDATION_FIELDS.intersection(updates):
+    if not activation and not validation_fields_changed:
         return updated
 
     now_dt = _hermes_now()

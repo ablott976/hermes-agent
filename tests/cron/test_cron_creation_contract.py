@@ -453,6 +453,31 @@ def test_no_agent_requires_readable_script_and_rejects_model_or_persistent_modes
         )
 
 
+def test_no_agent_broken_script_can_be_paused_but_not_resumed(contract_env):
+    jobs = contract_env["jobs"]
+    script = contract_env["home"] / "scripts" / "watchdog.py"
+    script.write_text("print('safe')\n")
+    job = jobs.create_job(
+        prompt=None,
+        schedule="every 5m",
+        script="watchdog.py",
+        no_agent=True,
+        deliver="local",
+    )
+    script.unlink()
+
+    paused = jobs.pause_job(job["id"], reason="broken script")
+
+    assert paused["enabled"] is False
+    assert paused["state"] == "paused"
+    assert paused["paused_reason"] == "broken script"
+    with pytest.raises(ValueError, match="E_SCRIPT_NOT_READABLE"):
+        jobs.resume_job(job["id"])
+    stored = _raw_store(contract_env)["jobs"][0]
+    assert stored["enabled"] is False
+    assert stored["state"] == "paused"
+
+
 def test_no_agent_rejects_outside_scripts_before_any_file_read(contract_env, monkeypatch):
     jobs = contract_env["jobs"]
     from cron import creation_guard, lifecycle_guard
