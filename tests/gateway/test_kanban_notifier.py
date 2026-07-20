@@ -3,6 +3,7 @@ from pathlib import Path
 
 
 from gateway.config import Platform
+from gateway.kanban_cron_relay import RelayReconcileResult, progress_relay_key
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
 
@@ -437,6 +438,347 @@ def test_notifier_delivers_human_progress_without_task_id(tmp_path, monkeypatch)
     assert "Publicar vídeo" in text
     assert "Ahora: validando el flujo" in text
     assert tid not in text
+
+
+def test_cron_mode_suppresses_direct_progress_only_when_relay_is_ready(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "cron-progress.db"))
+    kb.init_db()
+    tid, _ = _create_running_progress_subscription(notifier_profile="maker")
+
+    key = progress_relay_key(
+        board=kb.DEFAULT_BOARD,
+        task_id=tid,
+        platform="telegram",
+        chat_id="progress-chat",
+        thread_id="",
+        notifier_profile="maker",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "progress_delivery": "cron_no_agent",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "gateway.kanban_watchers.reconcile_kanban_progress_crons",
+        lambda *args, **kwargs: RelayReconcileResult(
+            ready_keys=frozenset({key})
+        ),
+    )
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_notifier_profile = "maker"
+    runner._active_profile_name = lambda: "maker"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    conn = kb.connect()
+    try:
+        _, events = kb.unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="progress-chat",
+            kinds=["progress"],
+        )
+        assert [event.kind for event in events] == ["progress"]
+    finally:
+        conn.close()
+
+
+def test_cron_mode_defers_direct_delivery_during_reconcile_lock_window(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "cron-deferred.db"))
+    kb.init_db()
+    tid, _ = _create_running_progress_subscription(notifier_profile="maker")
+    key = progress_relay_key(
+        board=kb.DEFAULT_BOARD,
+        task_id=tid,
+        platform="telegram",
+        chat_id="progress-chat",
+        thread_id="",
+        notifier_profile="maker",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "progress_delivery": "cron_no_agent",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "gateway.kanban_watchers.reconcile_kanban_progress_crons",
+        lambda *args, **kwargs: RelayReconcileResult(
+            deferred_keys=frozenset({key})
+        ),
+    )
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_notifier_profile = "maker"
+    runner._active_profile_name = lambda: "maker"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    conn = kb.connect()
+    try:
+        _, events = kb.unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="progress-chat",
+            kinds=["progress"],
+        )
+        assert [event.kind for event in events] == ["progress"]
+    finally:
+        conn.close()
+
+
+def test_cron_mode_falls_back_to_direct_progress_if_relay_creation_failed(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "cron-fallback.db"))
+    kb.init_db()
+    _create_running_progress_subscription(notifier_profile="maker")
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "progress_delivery": "cron_no_agent",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "gateway.kanban_watchers.reconcile_kanban_progress_crons",
+        lambda *args, **kwargs: RelayReconcileResult(),
+    )
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_notifier_profile = "maker"
+    runner._active_profile_name = lambda: "maker"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["text"].startswith("Kanban update")
+
+
+def test_direct_mode_pauses_old_relay_before_resuming_direct_delivery(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "cron-to-direct.db"))
+    monkeypatch.setenv("HERMES_PROFILE", "maker")
+    kb.init_db()
+    _create_running_progress_subscription(notifier_profile="maker")
+    from cron.jobs import get_job, load_jobs
+    from gateway.kanban_cron_relay import reconcile_kanban_progress_crons
+
+    created = reconcile_kanban_progress_crons("maker", interval_minutes=5)
+    assert len(created.ready_keys) == 1
+    job_id = load_jobs()[0]["id"]
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "progress_delivery": "direct",
+            }
+        },
+    )
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_notifier_profile = "maker"
+    runner._active_profile_name = lambda: "maker"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["text"].startswith("Kanban update")
+    stopped = get_job(job_id)
+    assert stopped is not None
+    assert stopped["enabled"] is False
+    assert stopped["state"] == "paused"
+
+
+def test_invalid_relay_falls_back_to_one_direct_terminal_message(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "invalid-relay.db"))
+    monkeypatch.setenv("HERMES_PROFILE", "maker")
+    kb.init_db()
+    tid, _ = _create_running_progress_subscription(notifier_profile="maker")
+    from cron.jobs import get_job, load_jobs, update_job
+    from cron.scheduler import _run_job_script
+    from gateway.kanban_cron_relay import (
+        RELAY_SCRIPT_NAME,
+        reconcile_kanban_progress_crons,
+    )
+
+    created = reconcile_kanban_progress_crons("maker", interval_minutes=5)
+    assert len(created.ready_keys) == 1
+    job = load_jobs()[0]
+    update_job(
+        job["id"],
+        {"origin": {"platform": "telegram", "chat_id": "wrong-chat"}},
+    )
+    conn = kb.connect()
+    try:
+        assert kb.complete_task(conn, tid, summary="Entrega completada")
+    finally:
+        conn.close()
+
+    # Mutate the stored route after reconciliation. The execution-time guard
+    # must pause before stdout can be routed to that chat, and it must preserve
+    # the real subscription for the direct fallback.
+    success, output = _run_job_script(RELAY_SCRIPT_NAME, job_id=job["id"])
+    assert success is True
+    assert output == '{"wakeAgent":false}'
+    unsafe = get_job(job["id"])
+    assert unsafe is not None and unsafe["enabled"] is False
+    conn = kb.connect()
+    try:
+        assert len(kb.list_notify_subs(conn, tid)) == 1
+    finally:
+        conn.close()
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "progress_delivery": "direct",
+            }
+        },
+    )
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_notifier_profile = "maker"
+    runner._active_profile_name = lambda: "maker"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == "progress-chat"
+    assert "Entrega completada" in adapter.sent[0]["text"]
+    assert "wrong-chat" not in adapter.sent[0]["text"]
+    stopped = get_job(job["id"])
+    assert stopped is not None
+    assert stopped["enabled"] is False
+
+
+def test_cron_mode_keeps_terminal_subscription_for_final_relay_delivery(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "cron-terminal.db"))
+    kb.init_db()
+    tid, _ = _create_running_progress_subscription(notifier_profile="maker")
+    conn = kb.connect()
+    try:
+        assert kb.complete_task(conn, tid, summary="Entrega completada")
+    finally:
+        conn.close()
+
+    key = progress_relay_key(
+        board=kb.DEFAULT_BOARD,
+        task_id=tid,
+        platform="telegram",
+        chat_id="progress-chat",
+        thread_id="",
+        notifier_profile="maker",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "progress_delivery": "cron_no_agent",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "gateway.kanban_watchers.reconcile_kanban_progress_crons",
+        lambda *args, **kwargs: RelayReconcileResult(
+            ready_keys=frozenset({key})
+        ),
+    )
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_notifier_profile = "maker"
+    runner._active_profile_name = lambda: "maker"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # The final event remains pending until the relay confirms delivery. This
+    # preserves a direct fallback if mode/config changes before the next tick.
+    assert adapter.sent == []
+    assert [event.kind for event in _unseen_terminal_events_for(tid, "progress-chat")] == [
+        "completed"
+    ]
+    conn = kb.connect()
+    try:
+        assert len(kb.list_notify_subs(conn, tid)) == 1
+    finally:
+        conn.close()
+
+
+def test_cron_mode_claims_terminal_only_after_relay_confirmation(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "cron-confirmed.db"))
+    kb.init_db()
+    tid, _ = _create_running_progress_subscription(notifier_profile="maker")
+    conn = kb.connect()
+    try:
+        assert kb.complete_task(conn, tid, summary="Entrega completada")
+    finally:
+        conn.close()
+
+    key = progress_relay_key(
+        board=kb.DEFAULT_BOARD,
+        task_id=tid,
+        platform="telegram",
+        chat_id="progress-chat",
+        thread_id="",
+        notifier_profile="maker",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "progress_delivery": "cron_no_agent",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "gateway.kanban_watchers.reconcile_kanban_progress_crons",
+        lambda *args, **kwargs: RelayReconcileResult(
+            terminal_confirmed_keys=frozenset({key})
+        ),
+    )
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_notifier_profile = "maker"
+    runner._active_profile_name = lambda: "maker"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert _unseen_terminal_events_for(tid, "progress-chat") == []
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, tid) == []
+    finally:
+        conn.close()
 
 
 def test_notifier_force_redacts_progress_title(tmp_path, monkeypatch):

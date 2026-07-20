@@ -641,6 +641,31 @@ class TestDeliverResultWrapping:
         assert "Cronjob Response" not in sent_content
         assert "The agent cannot see" not in sent_content
 
+    def test_delivery_per_job_wrap_override_keeps_watchdog_copy_clean(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": True}}):
+            job = {
+                "id": "kanban-relay",
+                "name": "Progreso Kanban",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+                "wrap_response": False,
+            }
+            _deliver_result(job, "Kanban en curso\nValidando la entrega")
+
+        sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        assert sent_content == "Kanban en curso\nValidando la entrega"
+        assert "kanban-relay" not in sent_content
+        assert "Cronjob Response" not in sent_content
+
     def test_delivery_extracts_media_tags_before_send(self, tmp_path, monkeypatch):
         """Cron delivery should pass MEDIA attachments separately to the send helper."""
         from gateway.config import Platform
@@ -2904,9 +2929,12 @@ class TestRunJobWakeGate:
         import cron.scheduler as scheduler
 
         call_count = 0
-        def _script_stub(path):
+        seen_job_ids = []
+
+        def _script_stub(path, *, job_id=None):
             nonlocal call_count
             call_count += 1
+            seen_job_ids.append(job_id)
             return (True, "regular output")
 
         agent = MagicMock()
@@ -2918,6 +2946,7 @@ class TestRunJobWakeGate:
             scheduler.run_job(self._make_job())
 
         assert call_count == 1, f"script ran {call_count}x, expected exactly 1"
+        assert seen_job_ids == ["job_wake-gate-test"]
 
     def test_script_failure_does_not_trigger_gate(self):
         """If _run_job_script returns success=False, the gate is NOT evaluated

@@ -1526,9 +1526,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     user_cfg = None
     try:
         user_cfg = load_config()
-        wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
+        per_job_wrap = job.get("wrap_response")
+        if isinstance(per_job_wrap, bool):
+            wrap_response = per_job_wrap
+        else:
+            wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
     except Exception:
-        pass
+        per_job_wrap = job.get("wrap_response")
+        if isinstance(per_job_wrap, bool):
+            wrap_response = per_job_wrap
 
     if wrap_response:
         task_name = job.get("name", job["id"])
@@ -2492,7 +2498,11 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _run_job_script(
+    script_path: str,
+    *,
+    job_id: Optional[str] = None,
+) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -2518,6 +2528,9 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         script_path: Path to the script.  Relative paths are resolved
             against HERMES_HOME/scripts/.  Absolute and ~-prefixed paths
             are also validated to ensure they stay within the scripts dir.
+        job_id: Optional opaque scheduler identity exposed only to this child
+            process as ``HERMES_CRON_JOB_ID``. No prompt, job name, routing
+            metadata, or credential is added to the child environment.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -2577,13 +2590,16 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         from tools.environments.local import _sanitize_subprocess_env
 
         popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
+        child_env = _sanitize_subprocess_env(os.environ.copy())
+        if job_id is not None:
+            child_env["HERMES_CRON_JOB_ID"] = str(job_id)[:128]
         result = subprocess.run(
             argv,
             capture_output=True,
             text=True,
             timeout=script_timeout,
             cwd=str(path.parent),
-            env=_sanitize_subprocess_env(os.environ.copy()),
+            env=child_env,
             **popen_kwargs,
         )
         stdout = (result.stdout or "").strip()
@@ -2628,10 +2644,10 @@ def _run_job_script_with_progress(
 ) -> tuple[bool, str]:
     """Run a cron script while optionally sending generic progress heartbeats."""
     if not progress_cfg.get("enabled"):
-        return _run_job_script(script_path)
+        return _run_job_script(script_path, job_id=job.get("id"))
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = pool.submit(_run_job_script, script_path)
+    future = pool.submit(_run_job_script, script_path, job_id=job.get("id"))
     try:
         while True:
             done, _ = concurrent.futures.wait({future}, timeout=5.0)

@@ -25,6 +25,12 @@ from agent.progress_copy import (
     DEFAULT_HUMAN_PROGRESS_TITLE,
     sanitize_human_progress_text,
 )
+from gateway.kanban_cron_relay import (
+    RelayReconcileResult,
+    progress_relay_key,
+    reconcile_kanban_progress_crons,
+    resolve_progress_cron_settings,
+)
 
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
@@ -160,8 +166,18 @@ class GatewayKanbanWatchersMixin:
         except Exception:
             logger.warning("kanban notifier: config loader unavailable; disabled")
             return
+        notifier_profile = getattr(self, "_kanban_notifier_profile", None)
+        if not notifier_profile:
+            notifier_profile = getattr(self, "_active_profile_name")()
+            self._kanban_notifier_profile = notifier_profile
         env_override = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
         if env_override in {"0", "false", "no", "off"}:
+            await asyncio.to_thread(
+                reconcile_kanban_progress_crons,
+                notifier_profile,
+                enabled=False,
+                defer_direct_on_contention=False,
+            )
             logger.info("kanban notifier: disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY env")
             return
         try:
@@ -171,6 +187,12 @@ class GatewayKanbanWatchersMixin:
             return
         kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
         if not kanban_cfg.get("dispatch_in_gateway", True):
+            await asyncio.to_thread(
+                reconcile_kanban_progress_crons,
+                notifier_profile,
+                enabled=False,
+                defer_direct_on_contention=False,
+            )
             logger.info(
                 "kanban notifier: disabled via config kanban.dispatch_in_gateway=false"
             )
@@ -207,16 +229,33 @@ class GatewayKanbanWatchersMixin:
             self, "_kanban_sub_fail_counts", {}
         )
         self._kanban_sub_fail_counts = sub_fail_counts
-        notifier_profile = getattr(self, "_kanban_notifier_profile", None)
-        if not notifier_profile:
-            notifier_profile = self._active_profile_name()
-            self._kanban_notifier_profile = notifier_profile
 
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
 
         while self._running:
             try:
+                try:
+                    tick_cfg = _load_config()
+                except Exception:
+                    tick_cfg = cfg
+                cron_progress_enabled, cron_progress_interval = (
+                    resolve_progress_cron_settings(tick_cfg)
+                )
+                relay_result = await asyncio.to_thread(
+                    reconcile_kanban_progress_crons,
+                    notifier_profile,
+                    interval_minutes=cron_progress_interval,
+                    enabled=cron_progress_enabled,
+                )
+                if not isinstance(relay_result, RelayReconcileResult):
+                    relay_result = RelayReconcileResult()
+                relay_ready_keys = set(relay_result.ready_keys)
+                relay_deferred_keys = set(relay_result.deferred_keys)
+                relay_terminal_confirmed_keys = set(
+                    relay_result.terminal_confirmed_keys
+                )
+
                 def _collect():
                     deliveries: list[dict] = []
                     active_platforms = {
@@ -290,11 +329,37 @@ class GatewayKanbanWatchersMixin:
                                         )
                                         continue
                                 platform = (sub.get("platform") or "").lower()
+                                relay_owner = str(owner_profile or notifier_profile)
+                                relay_key = progress_relay_key(
+                                    board=slug,
+                                    task_id=str(sub.get("task_id") or ""),
+                                    platform=platform,
+                                    chat_id=str(sub.get("chat_id") or ""),
+                                    thread_id=str(sub.get("thread_id") or ""),
+                                    notifier_profile=relay_owner,
+                                )
+                                if relay_key in relay_deferred_keys:
+                                    # Another process is creating or repairing
+                                    # this relay. Skip one tick rather than race
+                                    # a direct send against its first cron run.
+                                    continue
+                                terminal_confirmed = (
+                                    relay_key in relay_terminal_confirmed_keys
+                                )
+                                cron_owned = (
+                                    relay_key in relay_ready_keys or terminal_confirmed
+                                )
                                 if platform not in active_platforms:
                                     logger.debug(
                                         "kanban notifier: subscription for %s on %s skipped; adapter not connected",
                                         sub.get("task_id"), platform or "<missing>",
                                     )
+                                    continue
+                                if cron_owned and not terminal_confirmed:
+                                    # Keep terminal/status events pending until
+                                    # the relay confirms its final delivery.
+                                    # A mode switch or relay failure can still
+                                    # fall back to the direct notifier.
                                     continue
                                 # Terminal/status transitions always win. Their
                                 # claim advances past older progress so a failed
@@ -308,6 +373,12 @@ class GatewayKanbanWatchersMixin:
                                     kinds=TERMINAL_KINDS,
                                 )
                                 if not events:
+                                    if cron_owned:
+                                        # The no-agent cron is the only visible
+                                        # progress transport for this subscription.
+                                        # Leave progress rows unclaimed so the relay
+                                        # can always read the newest durable update.
+                                        continue
                                     old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
                                         conn,
                                         task_id=sub["task_id"],
@@ -348,6 +419,8 @@ class GatewayKanbanWatchersMixin:
                                     "events": events,
                                     "task": task,
                                     "board": slug,
+                                    "cron_owned": cron_owned,
+                                    "terminal_confirmed": terminal_confirmed,
                                 })
                         finally:
                             conn.close()
@@ -358,6 +431,8 @@ class GatewayKanbanWatchersMixin:
                     sub = d["sub"]
                     task = d["task"]
                     board_slug = d.get("board")
+                    cron_owned = bool(d.get("cron_owned"))
+                    terminal_confirmed = bool(d.get("terminal_confirmed"))
                     platform_str = (sub["platform"] or "").lower()
                     try:
                         plat = _Platform(platform_str)
@@ -513,25 +588,32 @@ class GatewayKanbanWatchersMixin:
                                 continue
                         try:
                             try:
-                                send_coro = adapter.send(
-                                    sub["chat_id"], msg, metadata=metadata,
-                                )
-                                if kind == "progress":
-                                    await asyncio.wait_for(
-                                        send_coro,
-                                        timeout=_KANBAN_PROGRESS_SEND_TIMEOUT_SECONDS,
+                                if not cron_owned:
+                                    send_coro = adapter.send(
+                                        sub["chat_id"], msg, metadata=metadata,
                                     )
-                                else:
-                                    await send_coro
+                                    if kind == "progress":
+                                        await asyncio.wait_for(
+                                            send_coro,
+                                            timeout=_KANBAN_PROGRESS_SEND_TIMEOUT_SECONDS,
+                                        )
+                                    else:
+                                        await send_coro
                             finally:
                                 if progress_guard is not None:
                                     await self._kanban_close_progress_delivery_guard(
                                         progress_guard
                                     )
-                            logger.debug(
-                                "kanban notifier: delivered %s event for %s to %s/%s on board %s",
-                                kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
-                            )
+                            if cron_owned:
+                                logger.debug(
+                                    "kanban notifier: processed %s event for cron-owned subscription %s on board %s without direct text delivery",
+                                    kind, sub["task_id"], board_slug,
+                                )
+                            else:
+                                logger.debug(
+                                    "kanban notifier: delivered %s event for %s to %s/%s on board %s",
+                                    kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
+                                )
                             # After delivering the text notification, surface
                             # any artifact paths the worker referenced in
                             # ``kanban_complete(summary=..., artifacts=[...])``
@@ -684,7 +766,7 @@ class GatewayKanbanWatchersMixin:
                                     "kanban notifier: wakeup injection failed for %s: %s",
                                     sub["task_id"], _wk_err, exc_info=True,
                                 )
-                        if task_terminal:
+                        if task_terminal and (not cron_owned or terminal_confirmed):
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,
                             )

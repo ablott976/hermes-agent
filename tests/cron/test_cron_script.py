@@ -171,6 +171,22 @@ class TestRunJobScript:
         assert success is True
         assert output == "ABSENT"
 
+    def test_script_receives_only_explicit_opaque_job_identity(self, cron_env, monkeypatch):
+        from cron.scheduler import _run_job_script
+
+        monkeypatch.delenv("HERMES_CRON_JOB_ID", raising=False)
+        script = cron_env / "scripts" / "job_identity.py"
+        script.write_text(
+            "import os\n"
+            "print(os.environ.get('HERMES_CRON_JOB_ID', 'MISSING'))\n"
+            "print(os.environ.get('HERMES_CRON_JOB_NAME', 'ABSENT'))\n"
+        )
+
+        success, output = _run_job_script("job_identity.py", job_id="abc123def456")
+        assert success is True
+        assert output.splitlines() == ["abc123def456", "ABSENT"]
+        assert "HERMES_CRON_JOB_ID" not in os.environ
+
     def test_script_empty_output(self, cron_env):
         from cron.scheduler import _run_job_script
 
