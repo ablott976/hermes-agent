@@ -845,10 +845,25 @@ When a standing goal is active, Hermes judges whether each assistant response sa
 
 ```yaml
 goals:
-  max_turns: 20   # Max continuation turns before Hermes auto-pauses the goal (default: 20)
+  # Works in the CLI, TUI, and messaging gateway.
+  max_turns: 20
+
+  # Messaging gateway only. Zero preserves agent.max_turns for the slice.
+  max_iterations_per_turn: 0
+
+  # Messaging gateway only: continue an unfinished goal in a fresh session.
+  auto_rollover: false
+  repeat_checkpoint_limit: 3
 ```
 
-`max_turns` caps how many continuation turns a goal can drive before Hermes auto-pauses it and asks the user to `/goal resume`. It protects against judge false negatives (goal actually done but judge says continue) and unbounded model spend on fuzzy or unachievable goals. See [Goals](/user-guide/features/goals) for the full feature.
+`max_turns` caps how many continuation turns a goal can drive before Hermes auto-pauses it and asks the user to `/goal resume`. It protects against judge false negatives (goal actually done but judge says continue) and unbounded model spend on fuzzy or unachievable goals.
+
+The advanced slice controls (`max_iterations_per_turn`, `auto_rollover`, and
+`repeat_checkpoint_limit`) currently apply only to the messaging gateway. That
+surface has an adapter FIFO and session store that can safely create a fresh
+root for an unfinished goal. The CLI and TUI intentionally continue in their
+current session and retain the normal per-turn agent budget. See
+[Goals](/user-guide/features/goals) for the full feature.
 
 ### API Timeouts
 

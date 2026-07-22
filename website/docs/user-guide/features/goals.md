@@ -181,7 +181,23 @@ goals:
   # /goal resume. Default 20. Lower this if you want tighter loops;
   # raise it for long-running refactors.
   max_turns: 20
+
+  # Messaging gateway only: cap model calls in each active goal slice.
+  # Zero keeps the normal agent budget.
+  max_iterations_per_turn: 0
+
+  # Messaging gateway only: move an unfinished goal to a fresh session
+  # when max_turns is reached, pausing repeated checkpoints instead.
+  auto_rollover: false
+  repeat_checkpoint_limit: 3
 ```
+
+`max_turns` works in the CLI, TUI, and messaging gateway. The advanced slice
+controls (`max_iterations_per_turn`, `auto_rollover`, and
+`repeat_checkpoint_limit`) are currently messaging-gateway-only: its adapter
+FIFO can safely migrate an unfinished goal to a fresh session. The CLI and TUI
+deliberately keep the active goal in the current session and use the normal
+per-turn agent budget.
 
 ### Choosing the judge model
 

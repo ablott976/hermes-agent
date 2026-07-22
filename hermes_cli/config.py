@@ -2281,12 +2281,15 @@ DEFAULT_CONFIG = {
         # Enable ``auto_rollover`` to carry the goal into a fresh session at
         # this boundary instead of requiring /goal resume.
         "max_turns": 20,
-        # Per-slice model-call ceiling for active /goal work. Zero preserves
-        # the normal agent budget; positive values are clamped to it.
+        # Messaging gateway only: per-slice model-call ceiling for active
+        # /goal work. Zero preserves the normal agent budget; positive values
+        # are clamped to it.
         "max_iterations_per_turn": 0,
-        # Opt-in automatic session rollover for goal work only.
+        # Messaging gateway only: opt-in automatic fresh-session rollover for
+        # goal work. CLI and TUI keep their current session and normal budget.
         "auto_rollover": False,
-        # Pause after this many identical bounded checkpoints.
+        # Messaging gateway only: pause after this many identical bounded
+        # checkpoints.
         "repeat_checkpoint_limit": 3,
     },
 
