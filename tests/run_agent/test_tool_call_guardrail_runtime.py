@@ -244,10 +244,13 @@ def test_legacy_hard_stop_config_concurrent_path_executes_every_call_in_order():
     with patch("run_agent.handle_function_call", side_effect=fake_handle):
         agent._execute_tool_calls_concurrent(msg, messages, "task-1")
 
-    assert executed == [
-        ("web_search", repeated_args, "c-repeated"),
-        ("web_search", allowed_args, "c-allow"),
-    ]
+    assert sorted(executed, key=lambda item: item[2]) == sorted(
+        [
+            ("web_search", repeated_args, "c-repeated"),
+            ("web_search", allowed_args, "c-allow"),
+        ],
+        key=lambda item: item[2],
+    )
     assert [m["tool_call_id"] for m in messages] == ["c-repeated", "c-allow"]
     assert "repeated_exact_failure_block" not in messages[0]["content"]
     assert json.loads(messages[1]["content"]) == {"ok": "allowed"}

@@ -416,7 +416,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     function_args,
                     [],
                     malformed_args_result,
-                    False,
                 )
             )
             continue
