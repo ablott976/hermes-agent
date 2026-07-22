@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -58,5 +60,27 @@ async def test_gateway_goal_uses_goals_max_turns_from_full_config(tmp_path, monk
         state = goals.GoalManager("sid-gateway-goal-config").state
         assert state is not None
         assert state.max_turns == 7
+    finally:
+        goals._DB_CACHE.clear()
+
+
+def test_goal_slice_budget_only_applies_to_active_goal(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    goals._DB_CACHE.clear()
+    try:
+        runner = object.__new__(GatewayRunner)
+        runner.config = {
+            "goals": {"max_turns": 20, "max_iterations_per_turn": 12},
+        }
+        agent = SimpleNamespace(max_iterations=1000)
+
+        runner._apply_goal_slice_budget(agent, "inactive-goal", 1000)
+        assert agent.max_iterations == 1000
+
+        goals.GoalManager("active-goal").set("work in bounded slices")
+        runner._apply_goal_slice_budget(agent, "active-goal", 1000)
+        assert agent.max_iterations == 12
     finally:
         goals._DB_CACHE.clear()
