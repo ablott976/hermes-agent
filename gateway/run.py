@@ -10943,6 +10943,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     prior_session_id,
                     session_key,
                 )
+        session_entry = await self._consume_goal_rollover_marker(
+            event,
+            session_entry=session_entry,
+            source=source,
+        )
+        if session_entry is None:
+            return
+        session_key = session_entry.session_key
         self._cache_session_source(session_key, source)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             try:
@@ -13033,6 +13041,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=session_key,
             source=source,
         )
+
+    async def _consume_goal_rollover_marker(
+        self,
+        event: MessageEvent,
+        *,
+        session_entry: Any,
+        source: Any,
+    ) -> Any:
+        """Rotate a FIFO rollover marker before its top-level agent turn starts."""
+        metadata = getattr(event, "metadata", None) or {}
+        if not isinstance(metadata, dict) or not metadata.get("goal_session_rollover"):
+            return session_entry
+
+        old_session_id = str(getattr(session_entry, "session_id", "") or "").strip()
+        origin_session_id = str(
+            metadata.get("goal_rollover_from_session_id") or ""
+        ).strip()
+        if not old_session_id or not origin_session_id or origin_session_id != old_session_id:
+            logger.info(
+                "Discarding stale goal rollover from session %s",
+                origin_session_id or "unknown",
+            )
+            return None
+
+        new_entry = await self._rollover_goal_at_fifo_head(
+            old_session_id=old_session_id,
+            session_key=getattr(session_entry, "session_key", "") or "",
+            source=source,
+        )
+        if new_entry is None:
+            logger.info(
+                "Discarding goal rollover marker for session %s because migration was unavailable",
+                old_session_id,
+            )
+        return new_entry
 
     async def _post_turn_goal_continuation(
         self,
