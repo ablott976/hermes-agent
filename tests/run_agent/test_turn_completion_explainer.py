@@ -74,8 +74,6 @@ def test_explanation_quiet_for_normal_text_response():
 def test_explanation_quiet_for_empty_reason():
     assert AIAgent._format_turn_completion_explanation("") == ""
     assert AIAgent._format_turn_completion_explanation("unknown") == ""
-    # guardrail_halt surfaces its own message; explainer stays out of the way.
-    assert AIAgent._format_turn_completion_explanation("guardrail_halt") == ""
 
 
 def test_explanation_for_empty_response_exhausted():

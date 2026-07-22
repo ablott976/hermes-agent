@@ -2,8 +2,7 @@
 
 The controller in this module is intentionally side-effect free: it tracks
 per-turn tool-call observations and returns decisions. Runtime code owns whether
-those decisions become warning guidance, synthetic tool results, or controlled
-turn halts.
+those decisions become warning guidance.
 """
 
 from __future__ import annotations
@@ -64,19 +63,14 @@ MUTATING_TOOL_NAMES = frozenset(
 class ToolCallGuardrailConfig:
     """Thresholds for per-turn tool-call loop detection.
 
-    Warnings are enabled by default and never prevent tool execution. Hard stops
-    are explicit opt-in so interactive CLI/TUI sessions get a gentle nudge unless
-    the user enables circuit-breaker behavior in config.yaml.
+    Warnings never prevent tool execution. Legacy hard-stop configuration is
+    intentionally ignored so repeated failures cannot halt a conversation.
     """
 
     warnings_enabled: bool = True
-    hard_stop_enabled: bool = False
     exact_failure_warn_after: int = 2
-    exact_failure_block_after: int = 5
     same_tool_failure_warn_after: int = 3
-    same_tool_failure_halt_after: int = 8
     no_progress_warn_after: int = 2
-    no_progress_block_after: int = 5
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
 
@@ -89,14 +83,9 @@ class ToolCallGuardrailConfig:
         warn_after = data.get("warn_after")
         if not isinstance(warn_after, Mapping):
             warn_after = {}
-        hard_stop_after = data.get("hard_stop_after")
-        if not isinstance(hard_stop_after, Mapping):
-            hard_stop_after = {}
-
         defaults = cls()
         return cls(
             warnings_enabled=_as_bool(data.get("warnings_enabled"), defaults.warnings_enabled),
-            hard_stop_enabled=_as_bool(data.get("hard_stop_enabled"), defaults.hard_stop_enabled),
             exact_failure_warn_after=_positive_int(
                 warn_after.get("exact_failure", data.get("exact_failure_warn_after")),
                 defaults.exact_failure_warn_after,
@@ -108,18 +97,6 @@ class ToolCallGuardrailConfig:
             no_progress_warn_after=_positive_int(
                 warn_after.get("idempotent_no_progress", data.get("no_progress_warn_after")),
                 defaults.no_progress_warn_after,
-            ),
-            exact_failure_block_after=_positive_int(
-                hard_stop_after.get("exact_failure", data.get("exact_failure_block_after")),
-                defaults.exact_failure_block_after,
-            ),
-            same_tool_failure_halt_after=_positive_int(
-                hard_stop_after.get("same_tool_failure", data.get("same_tool_failure_halt_after")),
-                defaults.same_tool_failure_halt_after,
-            ),
-            no_progress_block_after=_positive_int(
-                hard_stop_after.get("idempotent_no_progress", data.get("no_progress_block_after")),
-                defaults.no_progress_block_after,
             ),
         )
 
@@ -145,20 +122,13 @@ class ToolCallSignature:
 class ToolGuardrailDecision:
     """Decision returned by the tool-call guardrail controller."""
 
-    action: str = "allow"  # allow | warn | block | halt
+    action: str = "allow"  # allow | warn
     code: str = "allow"
     message: str = ""
     tool_name: str = ""
     count: int = 0
     signature: ToolCallSignature | None = None
 
-    @property
-    def allows_execution(self) -> bool:
-        return self.action in {"allow", "warn"}
-
-    @property
-    def should_halt(self) -> bool:
-        return self.action in {"block", "halt"}
 
     def to_metadata(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -232,54 +202,10 @@ class ToolCallGuardrailController:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
-        self._halt_decision: ToolGuardrailDecision | None = None
 
-    @property
-    def halt_decision(self) -> ToolGuardrailDecision | None:
-        return self._halt_decision
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
-        if not self.config.hard_stop_enabled:
-            return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
-
-        exact_count = self._exact_failure_counts.get(signature, 0)
-        if exact_count >= self.config.exact_failure_block_after:
-            decision = ToolGuardrailDecision(
-                action="block",
-                code="repeated_exact_failure_block",
-                message=(
-                    f"Blocked {tool_name}: the same tool call failed {exact_count} "
-                    "times with identical arguments. Stop retrying it unchanged; "
-                    "change strategy or explain the blocker."
-                ),
-                tool_name=tool_name,
-                count=exact_count,
-                signature=signature,
-            )
-            self._halt_decision = decision
-            return decision
-
-        if self._is_idempotent(tool_name):
-            record = self._no_progress.get(signature)
-            if record is not None:
-                _result_hash, repeat_count = record
-                if repeat_count >= self.config.no_progress_block_after:
-                    decision = ToolGuardrailDecision(
-                        action="block",
-                        code="idempotent_no_progress_block",
-                        message=(
-                            f"Blocked {tool_name}: this read-only call returned the same "
-                            f"result {repeat_count} times. Stop repeating it unchanged; "
-                            "use the result already provided or try a different query."
-                        ),
-                        tool_name=tool_name,
-                        count=repeat_count,
-                        signature=signature,
-                    )
-                    self._halt_decision = decision
-                    return decision
-
         return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
     def after_call(
@@ -302,21 +228,6 @@ class ToolCallGuardrailController:
 
             same_count = self._same_tool_failure_counts.get(tool_name, 0) + 1
             self._same_tool_failure_counts[tool_name] = same_count
-
-            if self.config.hard_stop_enabled and same_count >= self.config.same_tool_failure_halt_after:
-                decision = ToolGuardrailDecision(
-                    action="halt",
-                    code="same_tool_failure_halt",
-                    message=(
-                        f"Stopped {tool_name}: it failed {same_count} times this turn. "
-                        "Stop retrying the same failing tool path and choose a different approach."
-                    ),
-                    tool_name=tool_name,
-                    count=same_count,
-                    signature=signature,
-                )
-                self._halt_decision = decision
-                return decision
 
             if self.config.warnings_enabled and exact_count >= self.config.exact_failure_warn_after:
                 return ToolGuardrailDecision(
@@ -380,24 +291,12 @@ class ToolCallGuardrailController:
         return tool_name in self.config.idempotent_tools
 
 
-def toolguard_synthetic_result(decision: ToolGuardrailDecision) -> str:
-    """Build a synthetic role=tool content string for a blocked tool call."""
-    return json.dumps(
-        {
-            "error": decision.message,
-            "guardrail": decision.to_metadata(),
-        },
-        ensure_ascii=False,
-    )
-
-
 def append_toolguard_guidance(result: str, decision: ToolGuardrailDecision) -> str:
     """Append runtime guidance to the current tool result content."""
-    if decision.action not in {"warn", "halt"} or not decision.message:
+    if decision.action != "warn" or not decision.message:
         return result
-    label = "Tool loop hard stop" if decision.action == "halt" else "Tool loop warning"
     suffix = (
-        f"\n\n[{label}: "
+        "\n\n[Tool loop warning: "
         f"{decision.code}; count={decision.count}; {decision.message}]"
     )
     return (result or "") + suffix

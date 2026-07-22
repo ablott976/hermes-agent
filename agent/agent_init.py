@@ -45,7 +45,6 @@ from agent.think_scrubber import StreamingThinkScrubber
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
     ToolCallGuardrailController,
-    ToolGuardrailDecision,
 )
 from hermes_cli.config import cfg_get
 from hermes_cli.timeouts import get_provider_request_timeout
@@ -572,7 +571,6 @@ def init_agent(
     # even when stream consumers are registered (no tokens streaming then)
     agent._executing_tools = False
     agent._tool_guardrails = ToolCallGuardrailController()
-    agent._tool_guardrail_halt_decision: ToolGuardrailDecision | None = None
 
     # Interrupt mechanism for breaking out of tool loops
     agent._interrupt_requested = False
