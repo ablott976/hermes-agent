@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -285,6 +285,68 @@ async def test_goal_rollover_at_fifo_head_migrates_state(hermes_home):
     assert migrated.turns_used == 0
     assert migrated.rollovers_used == 1
     assert migrated.checkpoint.startswith("first slice completed")
+
+
+@pytest.mark.asyncio
+async def test_top_level_rollover_marker_migrates_before_agent_turn(hermes_home):
+    """A FIFO marker drained as a fresh event must rotate before agent startup."""
+    runner, _adapter, session_entry, src = _make_runner_with_adapter()
+    fresh_entry = SessionEntry(
+        session_key=session_entry.session_key,
+        session_id="fresh-goal-session",
+        created_at=session_entry.created_at,
+        updated_at=session_entry.updated_at,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner._rollover_goal_at_fifo_head = AsyncMock(return_value=fresh_entry)
+    from gateway.run import MessageEvent, MessageType
+
+    marker = MessageEvent(
+        text="Continue the active goal from its checkpoint.",
+        message_type=MessageType.TEXT,
+        source=src,
+        metadata={
+            "goal_session_rollover": True,
+            "goal_rollover_from_session_id": session_entry.session_id,
+        },
+    )
+
+    entry = await runner._consume_goal_rollover_marker(
+        marker, session_entry=session_entry, source=src,
+    )
+
+    assert entry is fresh_entry
+    runner._rollover_goal_at_fifo_head.assert_awaited_once_with(
+        old_session_id=session_entry.session_id,
+        session_key=session_entry.session_key,
+        source=src,
+    )
+
+
+@pytest.mark.asyncio
+async def test_goal_rollover_marker_rejects_a_stale_root(hermes_home):
+    """A marker must never revive a goal after the session has moved on."""
+    runner, _adapter, session_entry, src = _make_runner_with_adapter()
+    runner._rollover_goal_at_fifo_head = AsyncMock()
+    from gateway.run import MessageEvent, MessageType
+
+    marker = MessageEvent(
+        text="Continue the active goal from its checkpoint.",
+        message_type=MessageType.TEXT,
+        source=src,
+        metadata={
+            "goal_session_rollover": True,
+            "goal_rollover_from_session_id": "superseded-session",
+        },
+    )
+
+    entry = await runner._consume_goal_rollover_marker(
+        marker, session_entry=session_entry, source=src,
+    )
+
+    assert entry is None
+    runner._rollover_goal_at_fifo_head.assert_not_awaited()
 
 
 @pytest.mark.asyncio
