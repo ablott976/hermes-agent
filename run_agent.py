@@ -185,9 +185,7 @@ from agent.codex_responses_adapter import (
     _summarize_user_message_for_log,  # also used by _sync_external_memory_for_turn (memory boundary)
 )
 from agent.tool_guardrails import (
-    ToolGuardrailDecision,
     append_toolguard_guidance,
-    toolguard_synthetic_result,
 )
 from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
@@ -3067,8 +3065,7 @@ class AIAgent:
                 "the model produced no follow-up text. Send `continue` to "
                 "let it summarize."
             )
-        # Unknown/diagnostic-only reasons (e.g. "unknown", guardrail_halt
-        # which already surfaces its own message) — don't second-guess.
+        # Unknown/diagnostic-only reasons — don't second-guess.
         return ""
 
     def _apply_pending_steer_to_tool_results(self, messages: list, num_tool_msgs: int) -> None:
@@ -5700,19 +5697,6 @@ class AIAgent:
             force=force,
         )
 
-    def _set_tool_guardrail_halt(self, decision: ToolGuardrailDecision) -> None:
-        """Record the first guardrail decision that should stop this turn."""
-        if decision.should_halt and self._tool_guardrail_halt_decision is None:
-            self._tool_guardrail_halt_decision = decision
-
-    def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
-        tool = decision.tool_name or "a tool"
-        return (
-            f"I stopped retrying {tool} because it hit the tool-call guardrail "
-            f"({decision.code}) after {decision.count} repeated non-progressing "
-            "attempts. The last tool result explains the blocker; the next step is "
-            "to change strategy instead of repeating the same call."
-        )
 
     def _append_guardrail_observation(
         self,
@@ -5728,15 +5712,9 @@ class AIAgent:
             function_result,
             failed=failed,
         )
-        if decision.action in {"warn", "halt"}:
+        if decision.action == "warn":
             function_result = append_toolguard_guidance(function_result, decision)
-        if decision.should_halt:
-            self._set_tool_guardrail_halt(decision)
         return function_result
-
-    def _guardrail_block_result(self, decision: ToolGuardrailDecision) -> str:
-        self._set_tool_guardrail_halt(decision)
-        return toolguard_synthetic_result(decision)
 
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls from the assistant message and append results to messages.

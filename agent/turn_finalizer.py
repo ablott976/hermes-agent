@@ -458,8 +458,6 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
-    if agent._tool_guardrail_halt_decision is not None:
-        result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised
     # (the response is still returned either way — #8049).

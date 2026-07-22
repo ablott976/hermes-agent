@@ -30,7 +30,7 @@ from agent.display import (
     redact_tool_args_for_display as _redact_tool_args_for_display,
     _detect_tool_failure,
 )
-from agent.tool_guardrails import ToolGuardrailDecision
+
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
     _is_multimodal_tool_result,
@@ -400,7 +400,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         return
 
     # ── Parse args + pre-execution bookkeeping ───────────────────────
-    parsed_calls = []  # list of (tool_call, function_name, function_args, middleware_trace, block_result, blocked_by_guardrail)
+    parsed_calls = []  # list of (tool_call, function_name, function_args, middleware_trace, block_result)
     for tool_call in tool_calls:
         function_name = tool_call.function.name
 
@@ -416,7 +416,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     function_args,
                     [],
                     malformed_args_result,
-                    False,
                 )
             )
             continue
@@ -474,7 +473,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # We must know whether the tool will execute before touching
         # checkpoint state (dedup slot, real snapshots).
         block_result = None
-        blocked_by_guardrail = False
         if _ts_scope_block is not None:
             # Out-of-scope tool_call: reject before hooks/guardrails/dispatch.
             block_result = _ts_scope_block
@@ -520,23 +518,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     error_message=block_message,
                     middleware_trace=list(middleware_trace),
                 )
-            else:
-                guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
-                if not guardrail_decision.allows_execution:
-                    block_result = agent._guardrail_block_result(guardrail_decision)
-                    blocked_by_guardrail = True
-                    _emit_terminal_post_tool_call(
-                        agent,
-                        function_name=function_name,
-                        function_args=function_args,
-                        result=block_result,
-                        effective_task_id=effective_task_id,
-                        tool_call_id=getattr(tool_call, "id", "") or "",
-                        status="blocked",
-                        error_type="guardrail_block",
-                        error_message=getattr(guardrail_decision, "message", None) or "Tool blocked by guardrail policy",
-                        middleware_trace=list(middleware_trace),
-                    )
 
         # ── Checkpoint preflight (only for tools that will execute) ──
         if block_result is None:
@@ -562,13 +543,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 except Exception:
                     pass
 
-        parsed_calls.append((tool_call, function_name, function_args, middleware_trace, block_result, blocked_by_guardrail))
+        parsed_calls.append((tool_call, function_name, function_args, middleware_trace, block_result))
 
     # ── Logging / callbacks ──────────────────────────────────────────
-    tool_names_str = ", ".join(name for _, name, _, _, _, _ in parsed_calls)
+    tool_names_str = ", ".join(name for _, name, _, _, _ in parsed_calls)
     if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
         print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
-        for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls, 1):
+        for i, (tc, name, args, middleware_trace, block_result) in enumerate(parsed_calls, 1):
             display_args = _redact_tool_args_for_display(name, args) or args
             args_str = json.dumps(display_args, ensure_ascii=False)
             if agent.verbose_logging:
@@ -578,7 +559,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 args_preview = args_str[:agent.log_prefix_chars] + "..." if len(args_str) > agent.log_prefix_chars else args_str
                 print(f"  📞 Tool {i}: {name}({list(args.keys())}) - {args_preview}")
 
-    for tc, name, args, middleware_trace, block_result, blocked_by_guardrail in parsed_calls:
+    for tc, name, args, middleware_trace, block_result in parsed_calls:
         if block_result is not None:
             continue
         if agent.tool_progress_callback:
@@ -589,7 +570,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
 
-    for tc, name, args, middleware_trace, block_result, blocked_by_guardrail in parsed_calls:
+    for tc, name, args, middleware_trace, block_result in parsed_calls:
         if block_result is not None:
             continue
         if agent.tool_start_callback:
@@ -602,7 +583,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # ── Concurrent execution ─────────────────────────────────────────
     # Each slot holds (function_name, function_args, function_result, duration, error_flag, blocked_flag, middleware_trace)
     results = [None] * num_tools
-    for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
+    for i, (tc, name, args, middleware_trace, block_result) in enumerate(parsed_calls):
         if block_result is not None:
             results[i] = (name, args, block_result, 0.0, True, True, middleware_trace)
 
@@ -705,7 +686,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     try:
         runnable_calls = [
             (i, tc, name, args)
-            for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls)
+            for i, (tc, name, args, middleware_trace, block_result) in enumerate(parsed_calls)
             if block_result is None
         ]
         futures = []
@@ -868,7 +849,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             spinner.stop(f"⚡ {completed}/{num_tools} tools completed in {total_dur:.1f}s total")
 
     # ── Post-execution: display per-tool results ─────────────────────
-    for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
+    for i, (tc, name, args, middleware_trace, block_result) in enumerate(parsed_calls):
         r = results[i]
         blocked = False
         # A worker can finish and write results[i] in the window between the
@@ -1173,16 +1154,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception:
                 pass
 
-        _guardrail_block_decision: ToolGuardrailDecision | None = None
-        if _block_msg is None:
-            guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
-            if not guardrail_decision.allows_execution:
-                _guardrail_block_decision = guardrail_decision
-
-        _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
+        _execution_blocked = _block_msg is not None
 
         if _execution_blocked:
-            # Tool blocked by plugin or guardrail policy — skip counters,
+            # Tool blocked by plugin policy — skip counters,
             # callbacks, checkpointing, activity mutation, and real execution.
             pass
         # Reset nudge counters when the relevant tool is actually used
@@ -1270,23 +1245,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 status="blocked",
                 error_type=_block_error_type,
                 error_message=_block_msg,
-                middleware_trace=list(middleware_trace),
-            )
-        elif _guardrail_block_decision is not None:
-            # Tool blocked by tool-loop guardrail — synthesize exactly one
-            # tool result for the original tool_call_id without executing.
-            function_result = agent._guardrail_block_result(_guardrail_block_decision)
-            tool_duration = 0.0
-            _emit_terminal_post_tool_call(
-                agent,
-                function_name=function_name,
-                function_args=function_args,
-                result=function_result,
-                effective_task_id=effective_task_id,
-                tool_call_id=getattr(tool_call, "id", "") or "",
-                status="blocked",
-                error_type="guardrail_block",
-                error_message=getattr(_guardrail_block_decision, "message", None) or "Tool blocked by guardrail policy",
                 middleware_trace=list(middleware_trace),
             )
         elif function_name == "todo":
