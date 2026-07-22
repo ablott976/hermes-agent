@@ -12780,13 +12780,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # ────────────────────────────────────────────────────────────────
     # /goal — persistent cross-turn goals (Ralph-style loop)
     # ────────────────────────────────────────────────────────────────
-    def _goal_max_turns_from_config(self) -> int:
-        """Resolve the configured /goal turn budget for gateway sessions.
-
-        GatewayRunner.config is a GatewayConfig dataclass, not the full
-        user config mapping. Top-level config blocks such as ``goals`` are
-        therefore only available through hermes_cli.config.load_config().
-        """
+    def _goal_config_from_config(self) -> dict:
+        """Return the current profile's ``goals`` mapping, fail-closed."""
         try:
             goals_cfg = (
                 (self.config or {}).get("goals", {})
@@ -12797,9 +12792,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from hermes_cli.config import load_config
 
                 goals_cfg = (load_config() or {}).get("goals") or {}
-            return int(goals_cfg.get("max_turns", 20) or 20)
+            return goals_cfg if isinstance(goals_cfg, dict) else {}
         except Exception:
+            return {}
+
+    def _goal_max_turns_from_config(self) -> int:
+        """Resolve the configured /goal continuation-turn budget."""
+        try:
+            return max(1, int(self._goal_config_from_config().get("max_turns", 20) or 20))
+        except (TypeError, ValueError):
             return 20
+
+    def _goal_slice_max_iterations_from_config(self, global_max: int) -> int:
+        """Return an opt-in per-/goal model-call cap, clamped to global max."""
+        try:
+            configured = int(
+                self._goal_config_from_config().get("max_iterations_per_turn", 0) or 0
+            )
+        except (TypeError, ValueError):
+            return 0
+        if configured <= 0 or global_max <= 0:
+            return 0
+        return min(configured, global_max)
+
+    def _goal_auto_rollover_from_config(self) -> bool:
+        value = self._goal_config_from_config().get("auto_rollover", False)
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _goal_repeat_checkpoint_limit_from_config(self) -> int:
+        try:
+            return max(1, int(
+                self._goal_config_from_config().get("repeat_checkpoint_limit", 3) or 3
+            ))
+        except (TypeError, ValueError):
+            return 3
 
     async def _get_goal_manager_for_event(self, event: "MessageEvent"):
         """Return a GoalManager bound to the session for this gateway event.
@@ -12823,6 +12849,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         max_turns = self._goal_max_turns_from_config()
         return GoalManager(session_id=sid, default_max_turns=max_turns), session_entry
 
+    def _apply_goal_slice_budget(
+        self, agent: Any, session_id: str, global_max_iterations: int,
+    ) -> None:
+        """Constrain only an active /goal turn; normal chats keep their cap."""
+        local_max = self._goal_slice_max_iterations_from_config(global_max_iterations)
+        if not local_max or not session_id:
+            return
+        try:
+            from hermes_cli.goals import GoalManager
+            if not GoalManager(
+                session_id=session_id,
+                default_max_turns=self._goal_max_turns_from_config(),
+            ).is_active():
+                return
+            agent.max_iterations = local_max
+            logger.info(
+                "Applying /goal slice budget %s/%s to session %s",
+                local_max, global_max_iterations, session_id,
+            )
+        except Exception as exc:
+            logger.debug("goal slice budget resolution failed: %s", exc)
 
 
     async def _send_goal_status_notice(self, source: Any, message: str) -> None:
@@ -12887,6 +12934,106 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await _deliver()
 
+    async def _rollover_goal_session(
+        self,
+        *,
+        old_session_id: str,
+        session_key: str,
+        source: Any,
+    ) -> Any:
+        """Rotate one active goal to a fresh root at its FIFO head.
+
+        This must only run when the synthetic continuation is being consumed,
+        not when it is first queued. Real user messages already ahead of that
+        marker then retain their old session and can pause or clear the goal.
+        """
+        old_session_id = str(old_session_id or "")
+        if not old_session_id or source is None:
+            return None
+        try:
+            new_entry = await self.async_session_store.get_or_create_session(
+                source, force_new=True,
+            )
+        except Exception as exc:
+            logger.warning("goal rollover: could not create fresh session: %s", exc)
+            return None
+        new_session_id = str(getattr(new_entry, "session_id", "") or "")
+        if not new_session_id or new_session_id == old_session_id:
+            logger.warning("goal rollover: fresh session was not created")
+            return None
+
+        is_topic_lane = (
+            getattr(source, "platform", None) == Platform.TELEGRAM
+            and getattr(source, "thread_id", None)
+            and hasattr(self, "_sync_telegram_topic_binding")
+        )
+
+        async def _restore_old_root() -> None:
+            try:
+                restored_entry = await self.async_session_store.switch_session(
+                    session_key, old_session_id,
+                )
+            except Exception as exc:
+                logger.error("goal rollover: failed to restore old session: %s", exc)
+                return
+            if is_topic_lane and restored_entry is not None:
+                try:
+                    await asyncio.to_thread(
+                        self._sync_telegram_topic_binding,
+                        source,
+                        restored_entry,
+                        reason="goal-budget-rollover-rollback",
+                    )
+                except Exception as exc:
+                    logger.error("goal rollover: failed to restore topic binding: %s", exc)
+
+        # A topic binding is a second routing source. Validate it before
+        # migrating GoalState so a failed update cannot orphan the objective.
+        if is_topic_lane:
+            try:
+                await asyncio.to_thread(
+                    self._sync_telegram_topic_binding,
+                    source,
+                    new_entry,
+                    reason="goal-budget-rollover",
+                )
+            except Exception as exc:
+                logger.warning("goal rollover: topic binding update failed: %s", exc)
+                await _restore_old_root()
+                return None
+
+        try:
+            from hermes_cli.goals import migrate_goal_to_session
+            migrated = migrate_goal_to_session(
+                old_session_id,
+                new_session_id,
+                reason="goal-budget-rollover",
+                reset_turn_budget=True,
+            )
+        except Exception as exc:
+            logger.warning("goal rollover: state migration failed: %s", exc)
+            migrated = False
+        if not migrated:
+            await _restore_old_root()
+            return None
+        return new_entry
+
+    async def _rollover_goal_at_fifo_head(
+        self,
+        *,
+        old_session_id: str,
+        session_key: str,
+        source: Any,
+    ) -> Any:
+        """Consume a rollover marker only if its original goal is still active."""
+        if not self._goal_still_active_for_session(old_session_id):
+            return None
+        return await self._rollover_goal_session(
+            old_session_id=old_session_id,
+            session_key=session_key,
+            source=source,
+        )
+
     async def _post_turn_goal_continuation(
         self,
         *,
@@ -12930,6 +13077,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             final_response or "",
             user_initiated=True,
             background_processes=_bg_procs,
+            auto_rollover=self._goal_auto_rollover_from_config(),
+            repeat_checkpoint_limit=self._goal_repeat_checkpoint_limit_from_config(),
         )
         msg = decision.get("message") or ""
 
@@ -12942,7 +13091,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if msg and source is not None:
             await self._defer_goal_status_notice_after_delivery(source, msg)
 
-        if not decision.get("should_continue"):
+        rollover_requested = bool(decision.get("should_rollover"))
+        if not decision.get("should_continue") and not rollover_requested:
             return
 
         prompt = decision.get("continuation_prompt") or ""
@@ -12955,12 +13105,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter = self._adapter_for_source(source)
             _quick_key = self._session_key_for_source(source)
             if adapter and _quick_key:
+                continuation_metadata = {}
+                if rollover_requested:
+                    # Marker only: defer session migration until this event is
+                    # at the FIFO head, after earlier real user messages.
+                    continuation_metadata["goal_session_rollover"] = True
+                    continuation_metadata["goal_rollover_from_session_id"] = sid
                 cont_event = MessageEvent(
                     text=prompt,
                     message_type=MessageType.TEXT,
                     source=source,
                     message_id=None,
                     channel_prompt=None,
+                    metadata=continuation_metadata,
                 )
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
@@ -18557,6 +18714,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self._enforce_agent_cache_cap()
                 logger.debug("Created new agent for session %s (sig=%s)", session_key, _sig)
 
+            # A goal slice is opt-in and only changes this turn's local budget.
+            # Cached agents are reset to the global cap above before this hook.
+            self._apply_goal_slice_budget(agent, session_id, max_iterations)
+
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
             # Gate on needs_progress_queue (tool_progress OR thinking_progress)
@@ -20186,9 +20347,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message_id = None
                 next_channel_prompt = None
                 next_session_key = session_key
+                next_session_id = session_id
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
-                    if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
+                    metadata = getattr(pending_event, "metadata", None) or {}
+                    rollover_requested = bool(metadata.get("goal_session_rollover"))
+                    rollover_origin_session_id = str(
+                        metadata.get("goal_rollover_from_session_id") or ""
+                    ).strip()
+                    if rollover_requested and rollover_origin_session_id and (
+                        rollover_origin_session_id != session_id
+                    ):
+                        logger.info(
+                            "Discarding stale goal rollover from session %s",
+                            rollover_origin_session_id,
+                        )
+                        return result
+                    if (
+                        self._is_goal_continuation_event(pending_event)
+                        and not self._goal_still_active_for_session(next_session_id)
+                    ):
                         logger.info(
                             "Discarding stale goal continuation for session %s — goal is no longer active",
                             session_key or "?",
@@ -20207,6 +20385,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key or "?",
                             exc_info=True,
                         )
+                    if rollover_requested:
+                        new_entry = await self._rollover_goal_at_fifo_head(
+                            old_session_id=session_id,
+                            session_key=next_session_key,
+                            source=next_source,
+                        )
+                        if new_entry is None:
+                            # The marker stays terminal on migration failure;
+                            # retrying against the old root risks a duplicate
+                            # side effect after the user has moved on.
+                            return result
+                        next_session_id = new_entry.session_id
+                    if next_session_id != session_id:
+                        try:
+                            switched = await self.async_session_store.switch_session(
+                                next_session_key, next_session_id,
+                            )
+                            if not switched or switched.session_id != next_session_id:
+                                logger.warning(
+                                    "Queued follow-up could not bind fresh session %s",
+                                    next_session_id,
+                                )
+                                return result
+                            updated_history = await self.async_session_store.load_transcript(
+                                next_session_id,
+                            )
+                            # A fresh root must not inherit the cached agent's
+                            # in-memory transcript or system-prompt cache.
+                            self._evict_cached_agent(next_session_key)
+                        except Exception as exc:
+                            logger.warning(
+                                "Queued follow-up session switch failed: %s", exc,
+                            )
+                            return result
                     next_message = await self._prepare_profile_scoped_inbound_message_text(
                         event=pending_event,
                         source=next_source,
@@ -20231,28 +20443,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
 
-                # Re-baseline the cached agent's message_count snapshot before
-                # recursing into the in-band queued (/queue) follow-up turn.
-                # The first turn has completed and flushed its own user +
-                # assistant rows to the SessionDB, so the cross-process
-                # coherence guard (#45966) — which this recursive _run_agent
-                # call re-enters — would otherwise see the grown on-disk count
-                # against the stale build-time snapshot and rebuild the agent
-                # on THIS process's OWN writes, destroying the prompt-cache
-                # prefix #46237 was merged to preserve.  The existing
-                # re-baseline in _handle_message_with_agent only runs after the
-                # whole _run_agent chain unwinds — too late for the in-band
-                # follow-up.  Use the same (session_key, session_id) the
-                # recursive call runs under so the snapshot matches exactly
-                # what the follow-up's guard will consult.  Fail-safe in helper.
-                await self._refresh_agent_cache_message_count(session_key, session_id)
+                # Re-baseline the cached agent's snapshot for the session that
+                # the recursive follow-up will actually use. A rollover uses a
+                # fresh root and was evicted above; ordinary FIFO turns preserve
+                # the existing cache behavior.
+                await self._refresh_agent_cache_message_count(
+                    next_session_key, next_session_id,
+                )
 
                 followup_result = await self._run_agent(
                     message=next_message,
                     context_prompt=context_prompt,
                     history=updated_history,
                     source=next_source,
-                    session_id=session_id,
+                    session_id=next_session_id,
                     session_key=next_session_key,
                     run_generation=run_generation,
                     _interrupt_depth=_interrupt_depth + 1,

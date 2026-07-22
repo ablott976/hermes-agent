@@ -356,6 +356,47 @@ class TestGoalManager:
             assert mgr.state.turns_used == 2
             assert "budget" in (mgr.state.paused_reason or "").lower()
 
+    def test_evaluate_after_turn_auto_rollover_keeps_active_checkpoint(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="eval-rollover", default_max_turns=2)
+        mgr.set("durable goal")
+        with patch.object(goals, "judge_goal", return_value=("continue", "not yet", False, None)):
+            assert mgr.evaluate_after_turn("first checkpoint", auto_rollover=True)["should_continue"]
+            decision = mgr.evaluate_after_turn("second checkpoint", auto_rollover=True)
+
+        assert decision["should_continue"] is False
+        assert decision["should_rollover"] is True
+        assert decision["continuation_prompt"] is not None
+        assert "fresh bounded slice" in decision["continuation_prompt"]
+        assert "second checkpoint" not in decision["continuation_prompt"]
+        assert mgr.state.status == "active"
+        assert mgr.state.checkpoint == "second checkpoint"
+
+    def test_evaluate_after_turn_pauses_after_repeated_checkpoint_limit(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="eval-repeat", default_max_turns=1)
+        mgr.set("durable goal")
+        with patch.object(goals, "judge_goal", return_value=("continue", "not yet", False, None)):
+            assert mgr.evaluate_after_turn(
+                "unchanged", auto_rollover=True, repeat_checkpoint_limit=3,
+            )["should_rollover"]
+            mgr.state.turns_used = 0
+            assert mgr.evaluate_after_turn(
+                "unchanged", auto_rollover=True, repeat_checkpoint_limit=3,
+            )["should_rollover"]
+            mgr.state.turns_used = 0
+            decision = mgr.evaluate_after_turn(
+                "unchanged", auto_rollover=True, repeat_checkpoint_limit=3,
+            )
+
+        assert decision["should_rollover"] is False
+        assert decision["status"] == "paused"
+        assert "repeated 3 times" in decision["message"]
+
     def test_evaluate_after_turn_inactive(self, hermes_home):
         """evaluate_after_turn is a no-op when goal isn't active."""
         from hermes_cli.goals import GoalManager
@@ -635,6 +676,27 @@ class TestMigrateGoalToSession:
         clear_goal("p4")
         assert migrate_goal_to_session("p4", "c4") is False
         assert load_goal("c4") is None
+
+    def test_rollover_migration_resets_turn_budget_and_preserves_checkpoint(self, hermes_home):
+        from hermes_cli.goals import save_goal, load_goal, migrate_goal_to_session, GoalState
+        state = GoalState(
+            goal="ship safely",
+            turns_used=20,
+            max_turns=20,
+            checkpoint="tests passed; inspect PR next",
+            checkpoint_fingerprint="abc",
+            repeated_checkpoint_count=1,
+        )
+        save_goal("roll-parent", state)
+        assert migrate_goal_to_session(
+            "roll-parent", "roll-child", reason="budget", reset_turn_budget=True,
+        )
+        child = load_goal("roll-child")
+        assert child is not None
+        assert child.turns_used == 0
+        assert child.rollovers_used == 1
+        assert child.checkpoint == "tests passed; inspect PR next"
+        assert child.checkpoint_fingerprint == "abc"
 
 
 class TestGoalManagerSubgoals:

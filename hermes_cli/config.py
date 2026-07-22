@@ -2277,11 +2277,17 @@ DEFAULT_CONFIG = {
     # fail OPEN (continue) so a flaky judge never wedges progress — the
     # turn budget is the real backstop.
     "goals": {
-        # Max continuation turns before Hermes auto-pauses the goal and
-        # asks the user to /goal resume. Protects against judge false
-        # negatives (goal actually done but judge says continue) and
-        # unbounded model spend on fuzzy / unachievable goals.
+        # Max continuation turns before Hermes pauses the goal by default.
+        # Enable ``auto_rollover`` to carry the goal into a fresh session at
+        # this boundary instead of requiring /goal resume.
         "max_turns": 20,
+        # Per-slice model-call ceiling for active /goal work. Zero preserves
+        # the normal agent budget; positive values are clamped to it.
+        "max_iterations_per_turn": 0,
+        # Opt-in automatic session rollover for goal work only.
+        "auto_rollover": False,
+        # Pause after this many identical bounded checkpoints.
+        "repeat_checkpoint_limit": 3,
     },
 
     # Mixture of Agents — named presets used by /moa. A preset is an execution
