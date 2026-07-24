@@ -323,7 +323,9 @@ def test_codex_dashboard_worker_persists_inside_session_profile(tmp_path, monkey
     monkeypatch.setattr(
         auth_mod,
         "_save_codex_tokens",
-        lambda tokens: saved_homes.append(get_hermes_home()),
+        lambda tokens, *, allow_pool_only=False: saved_homes.append(
+            (get_hermes_home(), allow_pool_only)
+        ),
     )
 
     sid, _ = ws._new_oauth_session(
@@ -335,7 +337,7 @@ def test_codex_dashboard_worker_persists_inside_session_profile(tmp_path, monkey
         ws._codex_full_login_worker(sid)
 
         assert ws._oauth_sessions[sid]["status"] == "approved"
-        assert saved_homes == [profile_home]
+        assert saved_homes == [(profile_home, True)]
     finally:
         ws._oauth_sessions.pop(sid, None)
 
