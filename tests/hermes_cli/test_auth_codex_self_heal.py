@@ -172,3 +172,83 @@ def test_pool_only_singleton_does_not_import_codex_cli_tokens(tmp_path, monkeypa
     assert shadow["auth_mode"] == "pool_only"
     assert shadow["credential_role"] == "pool-only"
     assert not shadow.get("tokens")
+
+
+def _write_pool_only_shadow(hermes_home):
+    hermes_home.mkdir(exist_ok=True)
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "auth_mode": "pool_only",
+                "credential_role": "pool-only",
+                "source": "manual:pool-only-shadow",
+                "tokens": {},
+            },
+        },
+    }))
+
+
+def test_common_codex_cli_recovery_skips_pool_only_shadow(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    _write_pool_only_shadow(hermes_home)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    import_calls = []
+    save_calls = []
+    monkeypatch.setattr(
+        auth,
+        "_import_codex_cli_tokens",
+        lambda: import_calls.append(True) or {
+            "access_token": "unrelated-cli-access",
+            "refresh_token": "unrelated-cli-refresh",
+        },
+    )
+    monkeypatch.setattr(
+        auth,
+        "_save_codex_tokens",
+        lambda tokens, *args, **kwargs: save_calls.append(dict(tokens)),
+    )
+
+    recovered = auth._recover_codex_tokens_from_cli("automatic-test")
+
+    assert recovered is None
+    assert import_calls == []
+    assert save_calls == []
+
+
+def test_automatic_codex_save_preserves_pool_only_shadow(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    _write_pool_only_shadow(hermes_home)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    auth._save_codex_tokens({
+        "access_token": "unrelated-access",
+        "refresh_token": "unrelated-refresh",
+    })
+
+    stored = json.loads((hermes_home / "auth.json").read_text())
+    shadow = stored["providers"]["openai-codex"]
+    assert shadow["auth_mode"] == "pool_only"
+    assert shadow["credential_role"] == "pool-only"
+    assert not shadow.get("tokens")
+
+
+def test_explicit_codex_login_can_convert_pool_only_shadow(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    _write_pool_only_shadow(hermes_home)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    auth._save_codex_tokens(
+        {
+            "access_token": "explicit-access",
+            "refresh_token": "explicit-refresh",
+        },
+        allow_pool_only=True,
+    )
+
+    stored = json.loads((hermes_home / "auth.json").read_text())
+    singleton = stored["providers"]["openai-codex"]
+    assert singleton["auth_mode"] == "chatgpt"
+    assert "credential_role" not in singleton
+    assert "source" not in singleton
+    assert singleton["tokens"]["access_token"] == "explicit-access"

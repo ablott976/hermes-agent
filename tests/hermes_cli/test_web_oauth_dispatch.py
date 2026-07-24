@@ -171,6 +171,71 @@ def test_oauth_start_stores_profile_for_background_completion(tmp_path, monkeypa
         ws._oauth_sessions.pop(session_id, None)
 
 
+def test_codex_dashboard_worker_persists_inside_session_profile(tmp_path, monkeypatch):
+    from hermes_cli import auth as auth_mod
+    from hermes_cli import web_server as ws
+    from hermes_constants import get_hermes_home
+
+    profile_home = _make_profile_home(tmp_path, monkeypatch)
+
+    class _Resp:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, **kwargs):
+            if url.endswith("/deviceauth/usercode"):
+                return _Resp(200, {
+                    "device_auth_id": "device-auth-id",
+                    "interval": 3,
+                    "user_code": "CODEX-1234",
+                })
+            if url.endswith("/deviceauth/token"):
+                return _Resp(200, {
+                    "authorization_code": "authorization-code",
+                    "code_verifier": "code-verifier",
+                })
+            return _Resp(200, {
+                "access_token": "codex-access",
+                "refresh_token": "codex-refresh",
+            })
+
+    saved_homes = []
+    monkeypatch.setattr(httpx, "Client", _Client)
+    monkeypatch.setattr(ws.time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        auth_mod,
+        "_save_codex_tokens",
+        lambda tokens, *, allow_pool_only=False: saved_homes.append(
+            (get_hermes_home(), allow_pool_only)
+        ),
+    )
+
+    sid, _ = ws._new_oauth_session(
+        "openai-codex",
+        "device_code",
+        profile="coder",
+    )
+    try:
+        ws._codex_full_login_worker(sid)
+
+        assert ws._oauth_sessions[sid]["status"] == "approved"
+        assert saved_homes == [(profile_home, True)]
+    finally:
+        ws._oauth_sessions.pop(sid, None)
 
 
 def test_codex_dashboard_start_rewords_device_authorization_error(monkeypatch):
@@ -354,7 +419,7 @@ def test_codex_worker_final_save_is_atomic_with_cancel_delete(tmp_path, monkeypa
     delete_started = threading.Event()
     delete_finished = threading.Event()
 
-    def fake_save(tokens):
+    def fake_save(tokens, *, allow_pool_only=False):
         # We are inside the worker's critical section right now (holding
         # _oauth_sessions_lock). Fire a real DELETE from another thread and
         # prove it cannot complete until this section releases the lock.
@@ -365,7 +430,7 @@ def test_codex_worker_final_save_is_atomic_with_cancel_delete(tmp_path, monkeypa
         delete_thread.start()
         delete_started.wait(timeout=2)
         still_blocked = not delete_finished.wait(timeout=0.2)
-        saved.append((tokens, still_blocked))
+        saved.append((tokens, still_blocked, allow_pool_only))
 
     def _fire_delete():
         delete_started.set()
@@ -384,8 +449,9 @@ def test_codex_worker_final_save_is_atomic_with_cancel_delete(tmp_path, monkeypa
     delete_threads[0].join(timeout=2)
 
     assert len(saved) == 1
-    tokens, delete_was_still_blocked_during_save = saved[0]
+    tokens, delete_was_still_blocked_during_save, allow_pool_only = saved[0]
     assert tokens == {"access_token": "at", "refresh_token": "rt"}
+    assert allow_pool_only is True
     assert delete_was_still_blocked_during_save, (
         "DELETE must block until the worker's check+save critical section "
         "finishes, not slip in between the check and the save"

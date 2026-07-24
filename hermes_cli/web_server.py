@@ -11013,10 +11013,13 @@ def _codex_full_login_worker(session_id: str) -> None:
                 _log.info("oauth/device: openai-codex login cancelled before token save (session=%s)", session_id)
                 return
             with _profile_scope(session_profile):
-                _save_codex_tokens({
-                    "access_token": access_token,
-                    "refresh_token": refresh_token,
-                })
+                _save_codex_tokens(
+                    {
+                        "access_token": access_token,
+                        "refresh_token": refresh_token,
+                    },
+                    allow_pool_only=True,
+                )
             sess["status"] = "approved"
         _log.info("oauth/device: openai-codex login completed (session=%s)", session_id)
     except Exception as e:

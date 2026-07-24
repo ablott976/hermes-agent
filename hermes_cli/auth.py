@@ -3628,6 +3628,10 @@ def _codex_singleton_is_pool_only() -> bool:
         state = _load_provider_state(auth_store, "openai-codex") or {}
     except Exception:
         return False
+    return _codex_state_is_pool_only(state)
+
+
+def _codex_state_is_pool_only(state: Dict[str, Any]) -> bool:
     auth_mode = str(state.get("auth_mode") or "").strip().lower().replace("-", "_")
     credential_role = str(state.get("credential_role") or "").strip().lower().replace("_", "-")
     return auth_mode == "pool_only" or credential_role == "pool-only"
@@ -3734,13 +3738,31 @@ def _sync_codex_pool_entries(
         entry["last_error_reset_at"] = None
 
 
-def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
-    """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
+def _save_codex_tokens(
+    tokens: Dict[str, str],
+    last_refresh: Optional[str] = None,
+    label: Optional[str] = None,
+    *,
+    allow_pool_only: bool = False,
+) -> None:
+    """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json).
+
+    Automatic recovery/refresh callers must not populate an explicit pool-only
+    shadow. User-driven login flows opt in with ``allow_pool_only=True`` and
+    deliberately convert the shadow back to standalone singleton auth.
+    """
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     with _auth_store_lock():
         auth_store = _load_auth_store()
         state = _load_provider_state(auth_store, "openai-codex") or {}
+        if _codex_state_is_pool_only(state) and not allow_pool_only:
+            logger.info("Skipping automatic Codex token save for pool-only singleton shadow.")
+            return
+        if allow_pool_only and _codex_state_is_pool_only(state):
+            state.pop("credential_role", None)
+            if state.get("source") == "manual:pool-only-shadow":
+                state.pop("source", None)
         # Capture the previous singleton tokens BEFORE overwriting them.  The
         # pool-sync step uses this to distinguish legacy singleton-aliases
         # (which should be refreshed) from independent accounts that
@@ -3764,6 +3786,12 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
 
 def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:
     """Adopt a valid Codex CLI token pair into Hermes auth, if available."""
+    if _codex_singleton_is_pool_only():
+        logger.info(
+            "Skipping Codex CLI recovery for pool-only singleton shadow (%s).",
+            reason,
+        )
+        return None
     imported = _import_codex_cli_tokens()
     # Require BOTH tokens before adopting: persisting a payload without a
     # usable refresh_token would only break the next refresh cycle.
@@ -7816,7 +7844,7 @@ def _login_openai_codex(
             except (EOFError, KeyboardInterrupt):
                 do_import = "n"
             if do_import in {"y", "yes"}:
-                _save_codex_tokens(cli_tokens)
+                _save_codex_tokens(cli_tokens, allow_pool_only=True)
                 base_url = os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/") or DEFAULT_CODEX_BASE_URL
                 config_path = _update_config_for_provider("openai-codex", base_url)
                 print()
@@ -7834,7 +7862,9 @@ def _login_openai_codex(
     creds = _codex_device_code_login()
 
     # Save tokens to Hermes auth store
-    _save_codex_tokens(creds["tokens"], creds.get("last_refresh"))
+    _save_codex_tokens(
+        creds["tokens"], creds.get("last_refresh"), allow_pool_only=True
+    )
     config_path = _update_config_for_provider("openai-codex", creds.get("base_url", DEFAULT_CODEX_BASE_URL))
     print()
     print("Login successful!")
