@@ -92,3 +92,83 @@ def test_self_heals_missing_singleton_access_token_from_codex_cli(tmp_path, monk
     assert tokens["refresh_token"] == "fresh-refresh"
 
 
+def test_missing_singleton_access_token_reraises_when_codex_cli_half_token(tmp_path, monkeypatch):
+    """Missing access_token must not be masked by a malformed Codex CLI import."""
+    hermes_home = tmp_path / "hermes"
+    codex_home = tmp_path / "codex"
+    hermes_home.mkdir()
+    codex_home.mkdir()
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "tokens": {"refresh_token": "stale-refresh"},
+                "auth_mode": "chatgpt",
+            },
+        },
+    }))
+    (codex_home / "auth.json").write_text(json.dumps({
+        "tokens": {"access_token": "fresh-only"},
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    with pytest.raises(AuthError) as ei:
+        resolve_codex_runtime_credentials()
+
+    assert ei.value.code == "codex_auth_missing_access_token"
+
+
+def test_pool_only_singleton_does_not_import_codex_cli_tokens(tmp_path, monkeypatch):
+    """An explicit pool-only shadow must never be promoted from CODEX_HOME.
+
+    Regression: the missing-singleton self-heal ran before the credential-pool
+    fallback.  A scheduled canary therefore copied an unrelated Codex CLI
+    account into ``providers.openai-codex``, changed ``auth_mode`` to
+    ``chatgpt``, and bypassed the profile's selected pool credential.
+    """
+    hermes_home = tmp_path / "hermes"
+    codex_home = tmp_path / "codex"
+    hermes_home.mkdir()
+    codex_home.mkdir()
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "auth_mode": "pool_only",
+                "credential_role": "pool-only",
+                "source": "manual:pool-only-shadow",
+                "tokens": {},
+            },
+        },
+        "credential_pool": {
+            "openai-codex": [{
+                "id": "pool-primary",
+                "label": "pool-primary",
+                "auth_type": "oauth",
+                "priority": 0,
+                "source": "manual:test-independent-primary",
+                "access_token": "pool-access",
+                "refresh_token": "pool-refresh",
+            }],
+        },
+    }))
+    (codex_home / "auth.json").write_text(json.dumps({
+        "tokens": {
+            "access_token": "unrelated-cli-access",
+            "refresh_token": "unrelated-cli-refresh",
+        },
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(auth, "_codex_access_token_is_expiring", lambda *_args, **_kwargs: False)
+
+    resolved = resolve_codex_runtime_credentials()
+
+    assert resolved["api_key"] == "pool-access"
+    assert resolved["source"] == "credential_pool"
+    stored = json.loads((hermes_home / "auth.json").read_text())
+    shadow = stored["providers"]["openai-codex"]
+    assert shadow["auth_mode"] == "pool_only"
+    assert shadow["credential_role"] == "pool-only"
+    assert not shadow.get("tokens")

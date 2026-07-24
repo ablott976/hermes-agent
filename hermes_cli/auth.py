@@ -3614,6 +3614,25 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     }
 
 
+def _codex_singleton_is_pool_only() -> bool:
+    """Return whether the Codex singleton is an explicit tokenless pool shadow.
+
+    Pool-only profiles intentionally keep OAuth material exclusively in
+    ``credential_pool.openai-codex``.  Treating their empty singleton as a
+    broken standalone login causes the Codex CLI recovery path to import an
+    unrelated account and persist it over the shadow.
+    """
+    try:
+        with _auth_store_lock():
+            auth_store = _load_auth_store()
+        state = _load_provider_state(auth_store, "openai-codex") or {}
+    except Exception:
+        return False
+    auth_mode = str(state.get("auth_mode") or "").strip().lower().replace("-", "_")
+    credential_role = str(state.get("credential_role") or "").strip().lower().replace("_", "-")
+    return auth_mode == "pool_only" or credential_role == "pool-only"
+
+
 def _sync_codex_pool_entries(
     auth_store: Dict[str, Any],
     tokens: Dict[str, str],
@@ -3993,12 +4012,17 @@ def resolve_codex_runtime_credentials(
         data = _read_codex_tokens()
     except AuthError as exc:
         read_error = exc
-        if getattr(exc, "relogin_required", False) and getattr(exc, "code", None) in {
-            "codex_auth_missing_access_token",
-            "codex_auth_missing_refresh_token",
-            "codex_auth_invalid_shape",
-        }:
-            imported = _recover_codex_tokens_from_cli(str(getattr(exc, "code", None) or "auth_error"))
+        error_code = getattr(exc, "code", None)
+        if (
+            not _codex_singleton_is_pool_only()
+            and getattr(exc, "relogin_required", False)
+            and error_code in {
+                "codex_auth_missing_access_token",
+                "codex_auth_missing_refresh_token",
+                "codex_auth_invalid_shape",
+            }
+        ):
+            imported = _recover_codex_tokens_from_cli(str(error_code or "auth_error"))
             if imported:
                 data = {"tokens": imported, "last_refresh": imported.get("last_refresh")}
             else:
