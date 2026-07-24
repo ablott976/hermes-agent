@@ -993,10 +993,11 @@ def test_login_openai_codex_force_new_login_skips_existing_reuse_prompt(monkeypa
         },
     )
 
-    def _fake_save(tokens, last_refresh=None):
+    def _fake_save(tokens, last_refresh=None, *, allow_pool_only=False):
         called["device_login"] += 1
         called["tokens"] = dict(tokens)
         called["last_refresh"] = last_refresh
+        called["allow_pool_only"] = allow_pool_only
 
     monkeypatch.setattr("hermes_cli.auth._save_codex_tokens", _fake_save)
     monkeypatch.setattr("hermes_cli.auth._update_config_for_provider", lambda *args, **kwargs: "/tmp/config.yaml")
@@ -1009,6 +1010,7 @@ def test_login_openai_codex_force_new_login_skips_existing_reuse_prompt(monkeypa
 
     assert called["device_login"] == 1
     assert called["tokens"]["access_token"] == "fresh-at"
+    assert called["allow_pool_only"] is True
 
 
 class _FakeResp:

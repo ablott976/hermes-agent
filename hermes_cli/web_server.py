@@ -9356,10 +9356,13 @@ def _codex_full_login_worker(session_id: str) -> None:
         from hermes_cli.auth import _save_codex_tokens
 
         with _profile_scope(_oauth_session_profile(session_id)):
-            _save_codex_tokens({
-                "access_token": access_token,
-                "refresh_token": refresh_token,
-            })
+            _save_codex_tokens(
+                {
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                },
+                allow_pool_only=True,
+            )
         with _oauth_sessions_lock:
             sess["status"] = "approved"
         _log.info("oauth/device: openai-codex login completed (session=%s)", session_id)
