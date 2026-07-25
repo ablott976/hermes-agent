@@ -67,6 +67,11 @@ _JUDGE_RESPONSE_SNIPPET_CHARS = 4000
 # exhausted with every reply shaped like `judge returned empty response` or
 # `judge reply was not JSON`.
 DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
+# Transport failures (API auth errors 401, timeouts, DNS, etc.) are also
+# tracked and auto-pause the loop after this many consecutive failures.
+# A broken/invalid API key returns 401 every call — the loop must not
+# run until the turn budget, wasting every turn on an unreachable judge.
+DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
 
 
 CONTINUATION_PROMPT_TEMPLATE = (
@@ -145,7 +150,7 @@ JUDGE_SYSTEM_PROMPT = (
     '{"verdict": "wait", "wait_on_session": "<id>", "reason": "<one sentence>"}\n'
     '{"verdict": "wait", "wait_on_pid": <int>, "reason": "<one sentence>"}\n'
     '{"verdict": "wait", "wait_for_seconds": <int>, "reason": "<one sentence>"}\n'
-    "The legacy shape {\"done\": <true|false>, \"reason\": \"...\"} is still "
+    'The legacy shape {"done": <true|false>, "reason": "..."} is still '
     "accepted (true=done, false=continue)."
 )
 
@@ -372,9 +377,7 @@ def parse_contract(text: str) -> Tuple[str, GoalContract]:
             headline_parts.append(line)
 
     headline = " ".join(headline_parts).strip()
-    contract = GoalContract(
-        **{f: " ".join(v).strip() for f, v in fields.items()}
-    )
+    contract = GoalContract(**{f: " ".join(v).strip() for f, v in fields.items()})
     # If a headline was given but no explicit `outcome:` field, the headline
     # IS the outcome — don't duplicate it into the contract block (the goal
     # text already carries it), so leave outcome empty in that case.
@@ -391,15 +394,15 @@ class GoalState:
     """Serializable goal state stored per session."""
 
     goal: str
-    status: str = "active"          # active | paused | done | cleared
+    status: str = "active"  # active | paused | done | cleared
     turns_used: int = 0
     max_turns: int = DEFAULT_MAX_TURNS
     created_at: float = 0.0
     last_turn_at: float = 0.0
-    last_verdict: Optional[str] = None        # "done" | "continue" | "skipped"
+    last_verdict: Optional[str] = None  # "done" | "continue" | "skipped"
     last_reason: Optional[str] = None
-    paused_reason: Optional[str] = None       # why we auto-paused (budget, etc.)
-    consecutive_parse_failures: int = 0       # judge-output parse failures in a row
+    paused_reason: Optional[str] = None  # why we auto-paused (budget, etc.)
+    consecutive_parse_failures: int = 0  # judge-output parse failures in a row
     # Compact durable handoff for an automatic session rollover. The
     # fingerprint/counter are deterministic so a repeated checkpoint can stop
     # an otherwise unbounded loop without an extra model call.
@@ -407,6 +410,11 @@ class GoalState:
     checkpoint_fingerprint: str = ""
     repeated_checkpoint_count: int = 0
     rollovers_used: int = 0
+    # Transport failures are API/auth/network errors.  Broken API keys return
+    # 401 every call — track them separately so the loop auto-pauses instead
+    # of burning every turn budget slot on an unreachable judge.
+    consecutive_transport_failures: int = 0  # judge API/transport errors in a row
+
     # User-added criteria appended mid-loop via the /subgoal command.
     # When non-empty the judge prompt and continuation prompt both
     # include them so the agent works toward them and the judge factors
@@ -458,20 +466,35 @@ class GoalState:
             goal=data.get("goal", ""),
             status=data.get("status", "active"),
             turns_used=int(data.get("turns_used", 0) or 0),
-            max_turns=int(data.get("max_turns", DEFAULT_MAX_TURNS) or DEFAULT_MAX_TURNS),
+            max_turns=int(
+                data.get("max_turns", DEFAULT_MAX_TURNS) or DEFAULT_MAX_TURNS
+            ),
             created_at=float(data.get("created_at", 0.0) or 0.0),
             last_turn_at=float(data.get("last_turn_at", 0.0) or 0.0),
             last_verdict=data.get("last_verdict"),
             last_reason=data.get("last_reason"),
             paused_reason=data.get("paused_reason"),
-            consecutive_parse_failures=int(data.get("consecutive_parse_failures", 0) or 0),
+            consecutive_parse_failures=int(
+                data.get("consecutive_parse_failures", 0) or 0
+            ),
             checkpoint=str(data.get("checkpoint") or ""),
             checkpoint_fingerprint=str(data.get("checkpoint_fingerprint") or ""),
-            repeated_checkpoint_count=int(data.get("repeated_checkpoint_count", 0) or 0),
+            repeated_checkpoint_count=int(
+                data.get("repeated_checkpoint_count", 0) or 0
+            ),
             rollovers_used=int(data.get("rollovers_used", 0) or 0),
+            consecutive_transport_failures=int(
+                data.get("consecutive_transport_failures", 0) or 0
+            ),
             subgoals=subgoals,
-            waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
-            waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
+            waiting_on_pid=(
+                int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None
+            ),
+            waiting_on_session=(
+                str(data["waiting_on_session"])
+                if data.get("waiting_on_session")
+                else None
+            ),
             waiting_until=float(data.get("waiting_until", 0.0) or 0.0),
             waiting_reason=data.get("waiting_reason"),
             waiting_since=float(data.get("waiting_since", 0.0) or 0.0),
@@ -490,7 +513,9 @@ class GoalState:
         when no subgoals exist."""
         if not self.subgoals:
             return ""
-        return "\n".join(f"- {i}. {text}" for i, text in enumerate(self.subgoals, start=1))
+        return "\n".join(
+            f"- {i}. {text}" for i, text in enumerate(self.subgoals, start=1)
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -552,7 +577,9 @@ def load_goal(session_id: str) -> Optional[GoalState]:
     try:
         return GoalState.from_json(raw)
     except Exception as exc:
-        logger.warning("GoalManager: could not parse stored goal for %s: %s", session_id, exc)
+        logger.warning(
+            "GoalManager: could not parse stored goal for %s: %s", session_id, exc
+        )
         return None
 
 
@@ -618,7 +645,9 @@ def migrate_goal_to_session(
         clear_goal(old_session_id)
         logger.debug(
             "GoalManager: migrated goal %s -> %s (%s)",
-            old_session_id, new_session_id, reason or "rotation",
+            old_session_id,
+            new_session_id,
+            reason or "rotation",
         )
         return True
     except Exception as exc:  # pragma: no cover - defensive
@@ -740,7 +769,7 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
         # Peel off leading json/JSON/etc tag
         nl = text.find("\n")
         if nl != -1:
-            text = text[nl + 1:]
+            text = text[nl + 1 :]
 
     # First try: parse the whole blob.
     data: Optional[Dict[str, Any]] = None
@@ -756,7 +785,12 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
                 data = None
 
     if not isinstance(data, dict):
-        return "continue", f"judge reply was not JSON: {_truncate(raw, 200)!r}", True, None
+        return (
+            "continue",
+            f"judge reply was not JSON: {_truncate(raw, 200)!r}",
+            True,
+            None,
+        )
 
     reason = str(data.get("reason") or "").strip() or "no reason provided"
 
@@ -796,7 +830,11 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
 
     # Prefer a session-id directive (releases on the process's own trigger —
     # exit OR watch-pattern match), then pid (exit only), then seconds.
-    sess = data.get("wait_on_session") or data.get("session_id") or data.get("wait_session")
+    sess = (
+        data.get("wait_on_session")
+        or data.get("session_id")
+        or data.get("wait_session")
+    )
     if isinstance(sess, str) and sess.strip():
         return "wait", reason, False, {"session_id": sess.strip()}
     pid = _first_int("wait_on_pid", "pid", "wait_pid")
@@ -806,10 +844,17 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
     if seconds is not None:
         return "wait", reason, False, {"seconds": seconds}
     # Wait with no usable target — can't park on nothing; treat as continue.
-    return "continue", f"{reason} (wait verdict had no target — continuing)", False, None
+    return (
+        "continue",
+        f"{reason} (wait verdict had no target — continuing)",
+        False,
+        None,
+    )
 
 
-def _render_background_block(background_processes: Optional[List[Dict[str, Any]]]) -> str:
+def _render_background_block(
+    background_processes: Optional[List[Dict[str, Any]]],
+) -> str:
     """Render the live background-process list for the judge prompt.
 
     Each entry is a ``process_registry.list_sessions()`` dict. Only RUNNING
@@ -831,7 +876,9 @@ def _render_background_block(background_processes: Optional[List[Dict[str, Any]]
             continue
         cmd = _truncate(str(p.get("command") or "").replace("\n", " ").strip(), 120)
         uptime = p.get("uptime_seconds")
-        tail = _truncate(str(p.get("output_preview") or "").replace("\n", " ").strip(), 120)
+        tail = _truncate(
+            str(p.get("output_preview") or "").replace("\n", " ").strip(), 120
+        )
         sid = p.get("session_id")
         line = f"- pid {pid}"
         if sid:
@@ -863,17 +910,23 @@ def judge_goal(
     subgoals: Optional[List[str]] = None,
     background_processes: Optional[List[Dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
-) -> Tuple[str, str, bool, Optional[Dict[str, Any]]]:
+) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
-    Returns ``(verdict, reason, parse_failed, wait_directive)`` where verdict
+    Returns ``(verdict, reason, parse_failed, wait_directive, transport_failed)`` where verdict
     is ``"done"``, ``"continue"``, ``"wait"``, or ``"skipped"`` (when the
     judge couldn't be reached). ``wait_directive`` is set only for ``"wait"``
     (``{"pid": int}`` or ``{"seconds": int}``); ``None`` otherwise.
 
     ``parse_failed`` is True only when the judge call succeeded but its output
     was unusable (empty or non-JSON). API/transport errors return False — they
-    are transient and should fail-open silently. Callers use this flag to
+    are transient and should fail-open silently.
+
+    ``transport_failed`` is True only when the judge couldn't reach the API at
+    all (auth 401, timeout, DNS, connection error).  Repeated transport
+    failures signal a permanent config problem (e.g. invalid API key).  Callers
+    use this flag to auto-pause after N consecutive transport failures (see
+    ``DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES``). Callers use this flag to
     auto-pause after N consecutive parse failures (see
     ``DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES``).
 
@@ -889,30 +942,23 @@ def judge_goal(
     judge prompt; when none are set, behavior is identical to the original
     free-form judge.
 
-    This is deliberately fail-open: any error returns ``("continue", ..., False, None)``
-    so a broken judge doesn't wedge progress — the turn budget and the
-    consecutive-parse-failures auto-pause are the backstops.
+    This is deliberately fail-open: transport errors return ``("continue", ..., ..., None, True)``
+    — the ``transport_failed=True`` flag lets callers track and auto-pause after
+    N consecutive transport failures (see
+    ``DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES``) so a permanently broken
+    judge doesn't burn the entire turn budget.
     """
     if not goal.strip():
-        return "skipped", "empty goal", False, None
+        return "skipped", "empty goal", False, None, False
     if not last_response.strip():
         # No substantive reply this turn — almost certainly not done yet.
-        return "continue", "empty response (nothing to evaluate)", False, None
+        return "continue", "empty response (nothing to evaluate)", False, None, False
 
     try:
-        from agent.auxiliary_client import get_auxiliary_extra_body, get_text_auxiliary_client
+        from agent.auxiliary_client import call_llm
     except Exception as exc:
         logger.debug("goal judge: auxiliary client import failed: %s", exc)
-        return "continue", "auxiliary client unavailable", False, None
-
-    try:
-        client, model = get_text_auxiliary_client("goal_judge")
-    except Exception as exc:
-        logger.debug("goal judge: get_text_auxiliary_client failed: %s", exc)
-        return "continue", "auxiliary client unavailable", False, None
-
-    if client is None or not model:
-        return "continue", "no auxiliary client configured", False, None
+        return "continue", "auxiliary client unavailable", False, None, False
 
     # Build the prompt. Priority: contract > subgoals > plain. When both a
     # contract and subgoals exist, the subgoals are appended into the
@@ -920,7 +966,9 @@ def judge_goal(
     # truth.
     clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
     background_block = _render_background_block(background_processes)
-    current_time = datetime.now(tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    current_time = (
+        datetime.now(tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    )
 
     if contract is not None and not contract.is_empty():
         contract_block = contract.render_block()
@@ -957,8 +1005,11 @@ def judge_goal(
         )
 
     try:
-        resp = client.chat.completions.create(
-            model=model,
+        # Route through call_llm so auxiliary.goal_judge.* config
+        # (provider/model/base_url, extra_body, reasoning_effort, retries)
+        # all apply — the direct-create path dropped extra_body (#35566).
+        resp = call_llm(
+            task="goal_judge",
             messages=[
                 {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
@@ -966,11 +1017,12 @@ def judge_goal(
             temperature=0,
             max_tokens=_goal_judge_max_tokens(),
             timeout=timeout,
-            extra_body=get_auxiliary_extra_body() or None,
         )
     except Exception as exc:
-        logger.info("goal judge: API call failed (%s) — falling through to continue", exc)
-        return "continue", f"judge error: {type(exc).__name__}", False, None
+        logger.info(
+            "goal judge: API call failed (%s) — falling through to continue", exc
+        )
+        return "continue", f"judge error: {type(exc).__name__}", False, None, True
 
     try:
         raw = resp.choices[0].message.content or ""
@@ -980,10 +1032,11 @@ def judge_goal(
     verdict, reason, parse_failed, wait_directive = _parse_judge_response(raw)
     logger.info(
         "goal judge: verdict=%s reason=%s%s",
-        verdict, _truncate(reason, 120),
+        verdict,
+        _truncate(reason, 120),
         f" wait={wait_directive}" if wait_directive else "",
     )
-    return verdict, reason, parse_failed, wait_directive
+    return verdict, reason, parse_failed, wait_directive, False
 
 
 def gather_background_processes(task_id: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -1006,7 +1059,9 @@ def gather_background_processes(task_id: Optional[str] = None) -> List[Dict[str,
     return [s for s in sessions if isinstance(s, dict) and s.get("status") != "exited"]
 
 
-def draft_contract(objective: str, *, timeout: float = DEFAULT_JUDGE_TIMEOUT) -> Optional[GoalContract]:
+def draft_contract(
+    objective: str, *, timeout: float = DEFAULT_JUDGE_TIMEOUT
+) -> Optional[GoalContract]:
     """Expand a plain-language objective into a structured completion contract.
 
     Uses the ``goal_judge`` auxiliary task (main-model-first, cache-safe — it
@@ -1021,31 +1076,25 @@ def draft_contract(objective: str, *, timeout: float = DEFAULT_JUDGE_TIMEOUT) ->
         return None
 
     try:
-        from agent.auxiliary_client import get_auxiliary_extra_body, get_text_auxiliary_client
+        from agent.auxiliary_client import call_llm
     except Exception as exc:
         logger.debug("goal draft: auxiliary client import failed: %s", exc)
         return None
 
     try:
-        client, model = get_text_auxiliary_client("goal_judge")
-    except Exception as exc:
-        logger.debug("goal draft: get_text_auxiliary_client failed: %s", exc)
-        return None
-
-    if client is None or not model:
-        return None
-
-    try:
-        resp = client.chat.completions.create(
-            model=model,
+        # Route through call_llm — same #35566 fix as the judge call above.
+        resp = call_llm(
+            task="goal_judge",
             messages=[
                 {"role": "system", "content": DRAFT_CONTRACT_SYSTEM_PROMPT},
-                {"role": "user", "content": f"Objective:\n{_truncate(objective, 4000)}"},
+                {
+                    "role": "user",
+                    "content": f"Objective:\n{_truncate(objective, 4000)}",
+                },
             ],
             temperature=0,
             max_tokens=_goal_judge_max_tokens(),
             timeout=timeout,
-            extra_body=get_auxiliary_extra_body() or None,
         )
     except Exception as exc:
         logger.info("goal draft: API call failed (%s)", exc)
@@ -1077,7 +1126,7 @@ def _extract_json_object(raw: str) -> Optional[Dict[str, Any]]:
         text = text.strip("`")
         nl = text.find("\n")
         if nl != -1:
-            text = text[nl + 1:]
+            text = text[nl + 1 :]
     try:
         data = json.loads(text)
     except Exception:
@@ -1135,10 +1184,16 @@ class GoalManager:
 
     def status_line(self) -> str:
         s = self._state
-        if s is None or s.status in {"cleared",}:
+        if s is None or s.status in {
+            "cleared",
+        }:
             return "No active goal. Set one with /goal <text>."
         turns = f"{s.turns_used}/{s.max_turns} turns"
-        sub = f", {len(s.subgoals)} subgoal{'s' if len(s.subgoals) != 1 else ''}" if s.subgoals else ""
+        sub = (
+            f", {len(s.subgoals)} subgoal{'s' if len(s.subgoals) != 1 else ''}"
+            if s.subgoals
+            else ""
+        )
         con = ", contract" if self.has_contract() else ""
         meta = f"{turns}{sub}{con}"
         if s.status == "active":
@@ -1162,7 +1217,13 @@ class GoalManager:
 
     # --- mutation -----------------------------------------------------
 
-    def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:
+    def set(
+        self,
+        goal: str,
+        *,
+        max_turns: Optional[int] = None,
+        contract: Optional[GoalContract] = None,
+    ) -> GoalState:
         goal = (goal or "").strip()
         if not goal:
             raise ValueError("goal text is empty")
@@ -1258,9 +1319,7 @@ class GoalManager:
             raise RuntimeError("no active goal")
         idx = int(index_1based) - 1
         if idx < 0 or idx >= len(self._state.subgoals):
-            raise IndexError(
-                f"index out of range (1..{len(self._state.subgoals)})"
-            )
+            raise IndexError(f"index out of range (1..{len(self._state.subgoals)})")
         removed = self._state.subgoals.pop(idx)
         save_goal(self.session_id, self._state)
         return removed
@@ -1472,7 +1531,8 @@ class GoalManager:
         checkpoint = _truncate(last_response or "", _JUDGE_RESPONSE_SNIPPET_CHARS)
         fingerprint = (
             hashlib.sha256(checkpoint.encode("utf-8", "replace")).hexdigest()
-            if checkpoint else ""
+            if checkpoint
+            else ""
         )
         if fingerprint and fingerprint == state.checkpoint_fingerprint:
             state.repeated_checkpoint_count += 1
@@ -1481,7 +1541,7 @@ class GoalManager:
             state.repeated_checkpoint_count = 1 if fingerprint else 0
         state.checkpoint = checkpoint
 
-        verdict, reason, parse_failed, wait_directive = judge_goal(
+        verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal,
             last_response,
             subgoals=state.subgoals or None,
@@ -1498,6 +1558,16 @@ class GoalManager:
             state.consecutive_parse_failures += 1
         else:
             state.consecutive_parse_failures = 0
+
+        # Track consecutive transport failures separately — persistent API
+        # errors (401 auth, DNS, timeout) signal a broken config, not
+        # transient network flakiness.  Auto-pause after N consecutive
+        # transport failures so a permanently broken judge doesn't burn
+        # every turn budget slot on an unreachable API.
+        if transport_failed:
+            state.consecutive_transport_failures += 1
+        else:
+            state.consecutive_transport_failures = 0
 
         # WAIT verdict: the judge decided the agent is blocked on async work
         # and re-poking now would be busy-work. Set the barrier and park —
@@ -1536,6 +1606,39 @@ class GoalManager:
                 "message": f"✓ Goal achieved: {reason}",
             }
 
+        # Auto-pause when the judge cannot reach the API at all N turns in a
+        # row (401 auth, DNS failure, timeout).  Persistent transport failures
+        # signal a broken configuration (e.g. invalid API key), not transient
+        # flakiness.  Without this guard, a permanently broken judge burns
+        # every turn budget slot on an unreachable API.
+        if (
+            state.consecutive_transport_failures
+            >= DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES
+        ):
+            state.status = "paused"
+            state.paused_reason = (
+                f"judge API unreachable {state.consecutive_transport_failures} turns in a row "
+                f"(check auxiliary.goal_judge provider/key in config.yaml)"
+            )
+            save_goal(self.session_id, state)
+            return {
+                "status": "paused",
+                "should_continue": False,
+                "continuation_prompt": None,
+                "verdict": "continue",
+                "reason": reason,
+                "message": (
+                    f"⏸ Goal paused — judge API returned errors "
+                    f"({state.consecutive_transport_failures} turns). "
+                    "Check the goal_judge provider/key in ~/.hermes/config.yaml:\n"
+                    "  auxiliary:\n"
+                    "    goal_judge:\n"
+                    "      provider: deepseek\n"
+                    "      model: deepseek-v4-flash\n"
+                    "Then /goal resume to continue."
+                ),
+            }
+
         # Auto-pause when the judge model can't produce the expected JSON
         # verdict N turns in a row. Points the user at the goal_judge config
         # so they can route this side task to a model that follows the
@@ -1544,9 +1647,7 @@ class GoalManager:
         # empty strings.
         if state.consecutive_parse_failures >= DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES:
             state.status = "paused"
-            state.paused_reason = (
-                f"judge model returned unparseable output {state.consecutive_parse_failures} turns in a row"
-            )
+            state.paused_reason = f"judge model returned unparseable output {state.consecutive_parse_failures} turns in a row"
             save_goal(self.session_id, state)
             return {
                 "status": "paused",
@@ -1574,8 +1675,7 @@ class GoalManager:
             if auto_rollover and state.repeated_checkpoint_count >= repeat_limit:
                 state.status = "paused"
                 state.paused_reason = (
-                    "same checkpoint repeated "
-                    f"{state.repeated_checkpoint_count} times"
+                    f"same checkpoint repeated {state.repeated_checkpoint_count} times"
                 )
                 save_goal(self.session_id, state)
                 return {
@@ -1606,7 +1706,9 @@ class GoalManager:
                     ),
                 }
             state.status = "paused"
-            state.paused_reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
+            state.paused_reason = (
+                f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
+            )
             save_goal(self.session_id, state)
             return {
                 "status": "paused",
@@ -1773,33 +1875,59 @@ def run_kanban_goal_loop(
             status = task_status_fn()
         except Exception as exc:
             _log(f"kanban goal loop: status check failed ({exc}); stopping")
-            return {"outcome": "stopped", "turns_used": turns_used, "reason": "status check failed"}
+            return {
+                "outcome": "stopped",
+                "turns_used": turns_used,
+                "reason": "status check failed",
+            }
 
         if status == "done":
-            _log(f"kanban goal loop: task {task_id} completed by worker after {turns_used} turn(s)")
-            return {"outcome": "completed_by_worker", "turns_used": turns_used, "reason": "worker completed the task"}
+            _log(
+                f"kanban goal loop: task {task_id} completed by worker after {turns_used} turn(s)"
+            )
+            return {
+                "outcome": "completed_by_worker",
+                "turns_used": turns_used,
+                "reason": "worker completed the task",
+            }
         if status == "blocked":
-            _log(f"kanban goal loop: task {task_id} blocked by worker after {turns_used} turn(s)")
-            return {"outcome": "blocked_by_worker", "turns_used": turns_used, "reason": "worker blocked the task"}
+            _log(
+                f"kanban goal loop: task {task_id} blocked by worker after {turns_used} turn(s)"
+            )
+            return {
+                "outcome": "blocked_by_worker",
+                "turns_used": turns_used,
+                "reason": "worker blocked the task",
+            }
         if status not in ("running", "ready"):
             # Reclaimed / archived / unexpected — let the dispatcher own it.
             _log(f"kanban goal loop: task {task_id} status={status!r}; stopping")
-            return {"outcome": "stopped", "turns_used": turns_used, "reason": f"status={status}"}
+            return {
+                "outcome": "stopped",
+                "turns_used": turns_used,
+                "reason": f"status={status}",
+            }
 
         # Still open — judge whether the latest response satisfies the card.
         # The kanban worker loop has no wait-barrier concept (workers finish
         # via kanban_complete / kanban_block, not by parking), so a WAIT
         # verdict is treated as CONTINUE here.
-        verdict, reason, _parse_failed, _wait = judge_goal(goal_text, last_response)
+        verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(
+            goal_text, last_response
+        )
         if verdict == "wait":
             verdict = "continue"
-        _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
+        _log(
+            f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}"
+        )
 
         if verdict == "done":
             if nudged_to_finalize:
                 # Already asked once to call kanban_complete and it still
                 # didn't — block for review rather than spin.
-                _log(f"kanban goal loop: task {task_id} judged done but worker won't finalize; blocking")
+                _log(
+                    f"kanban goal loop: task {task_id} judged done but worker won't finalize; blocking"
+                )
                 try:
                     block_fn(
                         f"Goal-mode worker's output looked complete but it never "
@@ -1807,15 +1935,23 @@ def run_kanban_goal_loop(
                     )
                 except Exception as exc:
                     _log(f"kanban goal loop: block_fn failed ({exc})")
-                return {"outcome": "blocked_budget", "turns_used": turns_used, "reason": "judged done, never finalized"}
+                return {
+                    "outcome": "blocked_budget",
+                    "turns_used": turns_used,
+                    "reason": "judged done, never finalized",
+                }
             prompt = KANBAN_GOAL_FINALIZE_TEMPLATE.format(reason=_truncate(reason, 400))
             nudged_to_finalize = True
         else:
-            prompt = KANBAN_GOAL_CONTINUATION_TEMPLATE.format(reason=_truncate(reason, 400))
+            prompt = KANBAN_GOAL_CONTINUATION_TEMPLATE.format(
+                reason=_truncate(reason, 400)
+            )
 
         # Budget check BEFORE spending another turn.
         if turns_used >= max_turns:
-            _log(f"kanban goal loop: task {task_id} exhausted {turns_used}/{max_turns} turns; blocking")
+            _log(
+                f"kanban goal loop: task {task_id} exhausted {turns_used}/{max_turns} turns; blocking"
+            )
             try:
                 block_fn(
                     f"Goal-mode worker exhausted its turn budget "
@@ -1824,14 +1960,22 @@ def run_kanban_goal_loop(
                 )
             except Exception as exc:
                 _log(f"kanban goal loop: block_fn failed ({exc})")
-            return {"outcome": "blocked_budget", "turns_used": turns_used, "reason": "turn budget exhausted"}
+            return {
+                "outcome": "blocked_budget",
+                "turns_used": turns_used,
+                "reason": "turn budget exhausted",
+            }
 
         # Run another turn in the same session.
         try:
             last_response = run_turn(prompt) or ""
         except Exception as exc:
             _log(f"kanban goal loop: run_turn failed ({exc}); stopping")
-            return {"outcome": "stopped", "turns_used": turns_used, "reason": f"run_turn error: {type(exc).__name__}"}
+            return {
+                "outcome": "stopped",
+                "turns_used": turns_used,
+                "reason": f"run_turn error: {type(exc).__name__}",
+            }
         turns_used += 1
 
 
