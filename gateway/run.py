@@ -10387,15 +10387,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # next turn makes more progress. Wrapped in try/except so a
             # broken judge never breaks normal message handling.
             try:
-                _final_text = ""
-                if isinstance(_agent_result, dict):
-                    _final_text = str(_agent_result.get("final_response") or "")
-                elif isinstance(_agent_result, str):
-                    _final_text = _agent_result
-                # Skip for empty responses (interrupted / errored) — the
-                # judge would almost always say "continue" and we'd loop
-                # on error. Let the user drive the next turn.
-                if _final_text.strip():
+                _goal_payload = self._goal_continuation_payload(_agent_result)
+                if _goal_payload is not None:
+                    _final_text, _defer_goal_status = _goal_payload
                     try:
                         session_entry = await self.async_session_store.get_or_create_session(source)
                     except Exception:
@@ -10405,9 +10399,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_entry=session_entry,
                             source=source,
                             final_response=_final_text,
+                            defer_status=_defer_goal_status,
                         )
             except Exception as _goal_exc:
-                logger.debug("goal continuation hook failed: %s", _goal_exc)
+                logger.warning("goal continuation hook failed: %s", _goal_exc, exc_info=True)
             return _agent_result
         finally:
             # MoA one-shot restore must run on EVERY exit path, not just
@@ -12899,6 +12894,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 getattr(result, "error", "unknown error"),
             )
 
+    @staticmethod
+    def _goal_continuation_payload(agent_result: Any) -> Optional[tuple[str, bool]]:
+        """Return ``(response_text, defer_status)`` for a safe goal boundary.
+
+        A substantive response is always judgeable. An empty result is only
+        safe to continue when the agent explicitly reports an ordinary
+        iteration ceiling and did not fail or receive an interrupt. Provider
+        errors, user stops, and unclassified empty replies stay fail-closed so
+        the gateway cannot create an automatic error loop.
+        """
+        if isinstance(agent_result, str):
+            return (agent_result, True) if agent_result.strip() else None
+        if not isinstance(agent_result, dict):
+            return None
+
+        final_text = str(agent_result.get("final_response") or "")
+        if final_text.strip():
+            return final_text, True
+
+        exit_reason = str(agent_result.get("turn_exit_reason") or "")
+        safe_budget_boundary = (
+            exit_reason.startswith("max_iterations_reached(")
+            and not bool(agent_result.get("failed"))
+            and not bool(agent_result.get("interrupted"))
+        )
+        if safe_budget_boundary:
+            # No visible main response will be delivered, so the goal status
+            # notice must be sent immediately rather than registered behind a
+            # post-delivery callback that would never fire.
+            return "", False
+        return None
+
     async def _defer_goal_status_notice_after_delivery(self, source: Any, message: str) -> None:
         """Send a /goal status line after the main response is delivered.
 
@@ -13083,6 +13110,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_entry: Any,
         source: Any,
         final_response: str,
+        defer_status: bool = True,
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
         enqueue a continuation prompt for the same session.
@@ -13132,7 +13160,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # an awaited post-delivery callback preserves delivery reliability
         # without reversing the user-visible ordering.
         if msg and source is not None:
-            await self._defer_goal_status_notice_after_delivery(source, msg)
+            if defer_status:
+                await self._defer_goal_status_notice_after_delivery(source, msg)
+            else:
+                await self._send_goal_status_notice(source, msg)
 
         rollover_requested = bool(decision.get("should_rollover"))
         if not decision.get("should_continue") and not rollover_requested:

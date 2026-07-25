@@ -75,6 +75,45 @@ def _slack_thread_source() -> SessionSource:
 CONTINUATION_TEXT = "[Continuing toward your standing goal]\nGoal: ship it"
 
 
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        ({"final_response": "progress"}, ("progress", True)),
+        (
+            {
+                "final_response": "",
+                "turn_exit_reason": "max_iterations_reached(12/12)",
+                "failed": False,
+                "interrupted": False,
+            },
+            ("", False),
+        ),
+        (
+            {
+                "final_response": "",
+                "turn_exit_reason": "max_iterations_reached(12/12)",
+                "failed": True,
+            },
+            None,
+        ),
+        (
+            {
+                "final_response": "",
+                "turn_exit_reason": "max_iterations_reached(12/12)",
+                "interrupted": True,
+            },
+            None,
+        ),
+        ({"final_response": "", "turn_exit_reason": "provider_error"}, None),
+        ({"final_response": ""}, None),
+    ],
+)
+def test_goal_continuation_payload_only_accepts_safe_empty_budget_boundaries(result, expected):
+    from gateway.run import GatewayRunner
+
+    assert GatewayRunner._goal_continuation_payload(result) == expected
+
+
 @pytest.fixture()
 def hermes_home(tmp_path, monkeypatch):
     from pathlib import Path
@@ -196,3 +235,54 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
     assert adapter._pending_messages[adapter_key].text.startswith(
         "[Continuing toward your standing goal]"
     )
+
+
+@pytest.mark.asyncio
+async def test_empty_budget_boundary_enqueues_and_sends_status_without_delivery_callback(
+    hermes_home,
+):
+    """A 12/12 turn with no final text has no main message after which a
+    deferred status callback could fire. It must announce and enqueue now."""
+    from datetime import datetime
+    from unittest.mock import MagicMock
+    import uuid
+
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionEntry
+    from hermes_cli.goals import GoalManager
+
+    src = _slack_thread_source()
+    adapter_key = build_session_key(src)
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")},
+    )
+    runner._queued_events = {}
+    session_entry = SessionEntry(
+        session_key=adapter_key,
+        session_id=f"goal-empty-{uuid.uuid4().hex[:8]}",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.SLACK,
+        chat_type="channel",
+    )
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store._generate_session_key.return_value = adapter_key
+    adapter = _DrainProbeAdapter()
+    runner.adapters = {Platform.SLACK: adapter}
+
+    GoalManager(session_entry.session_id).set("ship it")
+    await runner._post_turn_goal_continuation(
+        session_entry=session_entry,
+        source=src,
+        final_response="",
+        defer_status=False,
+    )
+
+    assert adapter_key in adapter._pending_messages
+    assert adapter._pending_messages[adapter_key].text.startswith(
+        "[Continuing toward your standing goal]"
+    )
+    assert any("Continuing toward goal" in message for message in adapter.sent)
