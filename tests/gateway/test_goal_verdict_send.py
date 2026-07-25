@@ -52,7 +52,11 @@ class _RecordingAdapter:
         self.sends: list[dict] = []
 
     async def send(self, chat_id: str, content: str, reply_to=None, metadata=None):
-        self.sends.append({"chat_id": chat_id, "content": content, "metadata": metadata})
+        self.sends.append({
+            "chat_id": chat_id,
+            "content": content,
+            "metadata": metadata,
+        })
 
         class _R:
             success = True
@@ -107,7 +111,10 @@ async def test_goal_verdict_done_sent_via_adapter_send(hermes_home):
     mgr = GoalManager(session_entry.session_id)
     mgr.set("ship the feature")
 
-    with patch("hermes_cli.goals.judge_goal", return_value=("done", "the feature shipped", False, None)):
+    with patch(
+        "hermes_cli.goals.judge_goal",
+        return_value=("done", "the feature shipped", False, None, False),
+    ):
         await runner._post_turn_goal_continuation(
             session_entry=session_entry,
             source=src,
@@ -116,7 +123,9 @@ async def test_goal_verdict_done_sent_via_adapter_send(hermes_home):
         # fire-and-forget create_task — give the loop a tick
         await asyncio.sleep(0.05)
 
-    assert len(adapter.sends) == 1, f"expected 1 send, got {len(adapter.sends)}: {adapter.sends}"
+    assert len(adapter.sends) == 1, (
+        f"expected 1 send, got {len(adapter.sends)}: {adapter.sends}"
+    )
     msg = adapter.sends[0]
     assert msg["chat_id"] == "c1"
     assert "Goal achieved" in msg["content"]
@@ -136,7 +145,10 @@ async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
     mgr = GoalManager(session_entry.session_id)
     mgr.set("polish the docs")
 
-    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "still needs work", False, None)):
+    with patch(
+        "hermes_cli.goals.judge_goal",
+        return_value=("continue", "still needs work", False, None, False),
+    ):
         await runner._post_turn_goal_continuation(
             session_entry=session_entry,
             source=src,
@@ -148,7 +160,9 @@ async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
     assert len(adapter.sends) == 1
     assert "Continuing toward goal" in adapter.sends[0]["content"]
     # Continuation prompt enqueued for next turn
-    assert adapter._pending_messages, "continuation prompt must be enqueued in pending_messages"
+    assert adapter._pending_messages, (
+        "continuation prompt must be enqueued in pending_messages"
+    )
 
 
 @pytest.mark.asyncio
@@ -164,7 +178,10 @@ async def test_goal_verdict_budget_exhausted_sends_pause(hermes_home):
     state.turns_used = 2
     save_goal(session_entry.session_id, state)
 
-    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "keep going", False, None)):
+    with patch(
+        "hermes_cli.goals.judge_goal",
+        return_value=("continue", "keep going", False, None, False),
+    ):
         await runner._post_turn_goal_continuation(
             session_entry=session_entry,
             source=src,
@@ -195,7 +212,10 @@ async def test_goal_budget_rollover_is_deferred_until_fifo_head(hermes_home):
     state.turns_used = 1
     goals.save_goal(session_entry.session_id, state)
 
-    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "more work", False, None)):
+    with patch(
+        "hermes_cli.goals.judge_goal",
+        return_value=("continue", "more work", False, None, False),
+    ):
         await runner._post_turn_goal_continuation(
             session_entry=session_entry,
             source=src,
@@ -267,7 +287,8 @@ async def test_goal_rollover_at_fifo_head_migrates_state(hermes_home):
 
     runner.session_store = _Store()
     state = GoalManager(session_entry.session_id, default_max_turns=2).set(
-        "continue across a fresh root", max_turns=2,
+        "continue across a fresh root",
+        max_turns=2,
     )
     state.turns_used = 2
     state.checkpoint = "first slice completed; inspect the repository next"
@@ -313,7 +334,9 @@ async def test_top_level_rollover_marker_migrates_before_agent_turn(hermes_home)
     )
 
     entry = await runner._consume_goal_rollover_marker(
-        marker, session_entry=session_entry, source=src,
+        marker,
+        session_entry=session_entry,
+        source=src,
     )
 
     assert entry is fresh_entry
@@ -342,7 +365,9 @@ async def test_goal_rollover_marker_rejects_a_stale_root(hermes_home):
     )
 
     entry = await runner._consume_goal_rollover_marker(
-        marker, session_entry=session_entry, source=src,
+        marker,
+        session_entry=session_entry,
+        source=src,
     )
 
     assert entry is None
@@ -397,7 +422,9 @@ async def test_topic_binding_failure_rolls_back_before_goal_migration(hermes_hom
     assert result is None
     assert load_goal(session_entry.session_id).status == "active"
     assert load_goal("topic-fresh-session") is None
-    assert runner.session_store.switches == [(session_entry.session_key, session_entry.session_id)]
+    assert runner.session_store.switches == [
+        (session_entry.session_key, session_entry.session_id)
+    ]
     assert runner._sync_telegram_topic_binding.call_count == 2
 
 
@@ -432,7 +459,9 @@ async def test_goal_verdict_survives_adapter_without_send(hermes_home):
 
     runner.adapters[Platform.TELEGRAM] = _NoSendAdapter()
 
-    with patch("hermes_cli.goals.judge_goal", return_value=("done", "ok", False, None)):
+    with patch(
+        "hermes_cli.goals.judge_goal", return_value=("done", "ok", False, None, False)
+    ):
         # must not raise
         await runner._post_turn_goal_continuation(
             session_entry=session_entry,

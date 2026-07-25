@@ -43,21 +43,19 @@ def test_default_config_is_warning_only():
 
 
 def test_config_parses_warning_thresholds_and_ignores_legacy_hard_stops():
-    cfg = ToolCallGuardrailConfig.from_mapping(
-        {
-            "warnings_enabled": False,
-            "hard_stop_enabled": True,
-            "warn_after": {
-                "exact_failure": 3,
-                "same_tool_failure": 4,
-                "idempotent_no_progress": 5,
-            },
-            "hard_stop_after": {
-                "exact_failure": 6,
-                "idempotent_no_progress": 8,
-            },
-        }
-    )
+    cfg = ToolCallGuardrailConfig.from_mapping({
+        "warnings_enabled": False,
+        "hard_stop_enabled": True,
+        "warn_after": {
+            "exact_failure": 3,
+            "same_tool_failure": 4,
+            "idempotent_no_progress": 5,
+        },
+        "hard_stop_after": {
+            "exact_failure": 6,
+            "idempotent_no_progress": 8,
+        },
+    })
 
     assert cfg.warnings_enabled is False
     assert cfg.exact_failure_warn_after == 3
@@ -87,12 +85,10 @@ def test_default_repeated_identical_failed_call_warns_without_blocking():
 
 def test_legacy_hard_stop_config_never_blocks_repeated_exact_failure():
     controller = ToolCallGuardrailController(
-        ToolCallGuardrailConfig.from_mapping(
-            {
-                "hard_stop_enabled": True,
-                "hard_stop_after": {"exact_failure": 2},
-            }
-        )
+        ToolCallGuardrailConfig.from_mapping({
+            "hard_stop_enabled": True,
+            "hard_stop_after": {"exact_failure": 2},
+        })
     )
     args = {"query": "same"}
 
@@ -140,10 +136,18 @@ def test_same_tool_varying_args_warns_by_default_without_halting():
         ToolCallGuardrailConfig(same_tool_failure_warn_after=2)
     )
 
-    first = controller.after_call("terminal", {"command": "cmd-1"}, '{"exit_code":1}', failed=True)
-    second = controller.after_call("terminal", {"command": "cmd-2"}, '{"exit_code":1}', failed=True)
-    third = controller.after_call("terminal", {"command": "cmd-3"}, '{"exit_code":1}', failed=True)
-    fourth = controller.after_call("terminal", {"command": "cmd-4"}, '{"exit_code":1}', failed=True)
+    first = controller.after_call(
+        "terminal", {"command": "cmd-1"}, '{"exit_code":1}', failed=True
+    )
+    second = controller.after_call(
+        "terminal", {"command": "cmd-2"}, '{"exit_code":1}', failed=True
+    )
+    third = controller.after_call(
+        "terminal", {"command": "cmd-3"}, '{"exit_code":1}', failed=True
+    )
+    fourth = controller.after_call(
+        "terminal", {"command": "cmd-4"}, '{"exit_code":1}', failed=True
+    )
 
     assert first.action == "allow"
     assert [second.action, third.action, fourth.action] == ["warn", "warn", "warn"]
@@ -156,13 +160,11 @@ def test_same_tool_varying_args_warns_by_default_without_halting():
 
 def test_hard_stop_enabled_never_halts_same_tool_varying_args_failure_streak():
     controller = ToolCallGuardrailController(
-        ToolCallGuardrailConfig.from_mapping(
-            {
-                "hard_stop_enabled": True,
-                "warn_after": {"same_tool_failure": 2},
-                "hard_stop_after": {"same_tool_failure": 2},
-            }
-        )
+        ToolCallGuardrailConfig.from_mapping({
+            "hard_stop_enabled": True,
+            "warn_after": {"same_tool_failure": 2},
+            "hard_stop_after": {"same_tool_failure": 2},
+        })
     )
 
     decisions = [
@@ -177,7 +179,9 @@ def test_hard_stop_enabled_never_halts_same_tool_varying_args_failure_streak():
 
     assert decisions[0].action == "allow"
     assert [decision.action for decision in decisions[1:]] == ["warn"] * 4
-    assert {decision.code for decision in decisions[1:]} == {"same_tool_failure_warning"}
+    assert {decision.code for decision in decisions[1:]} == {
+        "same_tool_failure_warning"
+    }
 
 
 def test_idempotent_no_progress_repeated_result_warns_without_blocking_by_default():
@@ -198,19 +202,19 @@ def test_idempotent_no_progress_repeated_result_warns_without_blocking_by_defaul
 
 def test_legacy_hard_stop_config_never_blocks_idempotent_no_progress():
     controller = ToolCallGuardrailController(
-        ToolCallGuardrailConfig.from_mapping(
-            {
-                "hard_stop_enabled": True,
-                "warn_after": {"idempotent_no_progress": 2},
-                "hard_stop_after": {"idempotent_no_progress": 2},
-            }
-        )
+        ToolCallGuardrailConfig.from_mapping({
+            "hard_stop_enabled": True,
+            "warn_after": {"idempotent_no_progress": 2},
+            "hard_stop_after": {"idempotent_no_progress": 2},
+        })
     )
     args = {"path": "/tmp/same.txt"}
     result = "same file contents"
 
     assert controller.before_call("read_file", args).action == "allow"
-    assert controller.after_call("read_file", args, result, failed=False).action == "allow"
+    assert (
+        controller.after_call("read_file", args, result, failed=False).action == "allow"
+    )
     assert controller.before_call("read_file", args).action == "allow"
     warn = controller.after_call("read_file", args, result, failed=False)
     assert warn.action == "warn"
@@ -220,36 +224,97 @@ def test_legacy_hard_stop_config_never_blocks_idempotent_no_progress():
 
 
 def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_success_output_by_default():
-    controller = ToolCallGuardrailController(ToolCallGuardrailConfig(no_progress_warn_after=2))
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(no_progress_warn_after=2)
+    )
 
     for _ in range(3):
-        assert controller.before_call("write_file", {"path": "/tmp/x", "content": "x"}).action == "allow"
-        assert controller.after_call("write_file", {"path": "/tmp/x", "content": "x"}, "ok", failed=False).action == "allow"
+        assert (
+            controller.before_call(
+                "write_file", {"path": "/tmp/x", "content": "x"}
+            ).action
+            == "allow"
+        )
+        assert (
+            controller.after_call(
+                "write_file", {"path": "/tmp/x", "content": "x"}, "ok", failed=False
+            ).action
+            == "allow"
+        )
         assert controller.before_call("custom_tool", {"x": 1}).action == "allow"
-        assert controller.after_call("custom_tool", {"x": 1}, "ok", failed=False).action == "allow"
+        assert (
+            controller.after_call("custom_tool", {"x": 1}, "ok", failed=False).action
+            == "allow"
+        )
 
 
 def test_reset_for_turn_clears_bounded_guardrail_state():
     controller = ToolCallGuardrailController()
-    controller.after_call("web_search", {"query": "same"}, '{"error":"boom"}', failed=True)
-    controller.after_call("web_search", {"query": "same"}, '{"error":"boom"}', failed=True)
+    controller.after_call(
+        "web_search", {"query": "same"}, '{"error":"boom"}', failed=True
+    )
+    controller.after_call(
+        "web_search", {"query": "same"}, '{"error":"boom"}', failed=True
+    )
     controller.after_call("read_file", {"path": "/tmp/x"}, "same", failed=False)
     controller.after_call("read_file", {"path": "/tmp/x"}, "same", failed=False)
 
-    assert controller.after_call(
-        "web_search", {"query": "same"}, '{"error":"boom"}', failed=True
-    ).action == "warn"
-    assert controller.after_call(
-        "read_file", {"path": "/tmp/x"}, "same", failed=False
-    ).action == "warn"
+    assert (
+        controller.after_call(
+            "web_search", {"query": "same"}, '{"error":"boom"}', failed=True
+        ).action
+        == "warn"
+    )
+    assert (
+        controller.after_call(
+            "read_file", {"path": "/tmp/x"}, "same", failed=False
+        ).action
+        == "warn"
+    )
 
     controller.reset_for_turn()
 
     assert controller.before_call("web_search", {"query": "same"}).action == "allow"
     assert controller.before_call("read_file", {"path": "/tmp/x"}).action == "allow"
-    assert controller.after_call(
-        "web_search", {"query": "same"}, '{"error":"boom"}', failed=True
-    ).action == "allow"
-    assert controller.after_call(
-        "read_file", {"path": "/tmp/x"}, "same", failed=False
-    ).action == "allow"
+    assert (
+        controller.after_call(
+            "web_search", {"query": "same"}, '{"error":"boom"}', failed=True
+        ).action
+        == "allow"
+    )
+    assert (
+        controller.after_call(
+            "read_file", {"path": "/tmp/x"}, "same", failed=False
+        ).action
+        == "allow"
+    )
+
+
+def test_after_call_survives_lone_surrogates_in_result_and_args():
+    # Scraped web/social text can contain unpaired UTF-16 surrogates (e.g. the
+    # first half of a mathematical-bold pair, '\ud835'). str.encode('utf-8')
+    # rejects them, and the result hasher crashed the whole conversation loop
+    # (live outage: "Outer loop error in API call #34 ... surrogates not
+    # allowed"). Weird text must never take down the loop.
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            exact_failure_warn_after=2,
+            no_progress_warn_after=2,
+        )
+    )
+    dirty = "price \ud835 update"
+
+    decision = controller.after_call(
+        "web_search", {"query": dirty}, dirty, failed=False
+    )
+    assert decision.action in {"allow", "warn"}
+
+    # hashing stays deterministic: the same dirty failure twice still trips
+    # the exact-failure guard, proving the hash is stable across calls
+    controller.after_call(
+        "web_search", {"query": dirty}, '{"error":"\ud835 boom"}', failed=True
+    )
+    controller.after_call(
+        "web_search", {"query": dirty}, '{"error":"\ud835 boom"}', failed=True
+    )
+    assert controller.before_call("web_search", {"query": dirty}).action == "allow"
