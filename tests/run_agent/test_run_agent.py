@@ -5355,6 +5355,48 @@ class TestRunConversation:
             "_record_task_failure should not be called outside kanban mode"
         )
 
+    def test_goal_mode_iteration_ceiling_stays_inside_goal_loop(self, agent, monkeypatch):
+        """A goal-mode turn ceiling is a slice boundary, not a task failure.
+
+        The outer Kanban goal loop must retain the running claim so it can
+        judge the summary and invoke another turn. In particular, two normal
+        slices must never consume the task's ``failure_limit=2`` budget.
+        """
+        self._setup_agent(agent)
+        agent.max_iterations = 2
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_goal_mode_task")
+        monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        tool_resp = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[tc],
+        )
+        summary_resp = _mock_response(
+            content="Slice checkpoint — more work remains.", finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            tool_resp, tool_resp, summary_resp,
+        ]
+
+        mock_record_failure = MagicMock(return_value=False)
+        mock_connect = MagicMock(return_value=MagicMock())
+
+        with (
+            patch("run_agent.handle_function_call", return_value="ok"),
+            patch("hermes_cli.kanban_db._record_task_failure", mock_record_failure),
+            patch("hermes_cli.kanban_db.connect", mock_connect),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("continue the goal-mode card")
+
+        assert result["completed"] is False
+        assert result["turn_exit_reason"].startswith("max_iterations_reached(")
+        assert result["final_response"] == "Slice checkpoint — more work remains."
+        mock_record_failure.assert_not_called()
+
 
 class TestHookPayloadSanitizesSimpleNamespace:
     """Regression: ``_hook_jsonable`` referenced ``SimpleNamespace`` without

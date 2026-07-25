@@ -108,7 +108,8 @@ def finalize_turn(
         # rather than ``kanban_block`` so this counts toward the dispatcher's
         # consecutive-failure circuit breaker (#29747 gap 2).
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
-        if _kanban_task:
+        _kanban_goal_mode = os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1"
+        if _kanban_task and not _kanban_goal_mode:
             try:
                 from hermes_cli import kanban_db as _kb
                 _conn = _kb.connect()
@@ -145,6 +146,20 @@ def finalize_turn(
                     _kanban_task,
                     exc_info=True,
                 )
+        elif _kanban_task:
+            # A goal-mode card owns a higher-level multi-turn loop in
+            # ``run_kanban_goal_loop``. Reaching this *per-turn* ceiling is an
+            # expected slice boundary: the summary is returned to that loop,
+            # which judges progress and starts the next turn. Recording a task
+            # failure here would release/end the run before the goal loop can
+            # continue; two ordinary slices would then trip ``failure_limit``.
+            logger.info(
+                "kanban goal-mode slice reached iteration ceiling for task %s "
+                "(%d/%d); keeping the task run active",
+                _kanban_task,
+                api_call_count,
+                agent.max_iterations,
+            )
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
