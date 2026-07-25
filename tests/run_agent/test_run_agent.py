@@ -5372,16 +5372,10 @@ class TestRunConversation:
         tool_resp = _mock_response(
             content="", finish_reason="tool_calls", tool_calls=[tc],
         )
-        summary_resp = _mock_response(
-            content="Slice checkpoint — more work remains.", finish_reason="stop",
-        )
-        agent.client.chat.completions.create.side_effect = [
-            tool_resp, tool_resp, summary_resp,
-        ]
-
         mock_record_failure = MagicMock(return_value=False)
         mock_connect = MagicMock(return_value=MagicMock())
 
+        results = []
         with (
             patch("run_agent.handle_function_call", return_value="ok"),
             patch("hermes_cli.kanban_db._record_task_failure", mock_record_failure),
@@ -5390,11 +5384,33 @@ class TestRunConversation:
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            result = agent.run_conversation("continue the goal-mode card")
+            for slice_number in (1, 2):
+                agent.client.chat.completions.create.side_effect = [
+                    tool_resp,
+                    tool_resp,
+                    _mock_response(
+                        content=f"Slice {slice_number} checkpoint — more work remains.",
+                        finish_reason="stop",
+                    ),
+                ]
+                results.append(
+                    agent.run_conversation(
+                        f"continue goal-mode card, slice {slice_number}"
+                    )
+                )
 
-        assert result["completed"] is False
-        assert result["turn_exit_reason"].startswith("max_iterations_reached(")
-        assert result["final_response"] == "Slice checkpoint — more work remains."
+        assert len(results) == 2
+        assert all(result["completed"] is False for result in results)
+        assert all(
+            result["turn_exit_reason"].startswith("max_iterations_reached(")
+            for result in results
+        )
+        assert [result["final_response"] for result in results] == [
+            "Slice 1 checkpoint — more work remains.",
+            "Slice 2 checkpoint — more work remains.",
+        ]
+        # The old behavior called this once per slice, so failure_limit=2
+        # blocked the card here before its outer goal loop could continue.
         mock_record_failure.assert_not_called()
 
 
