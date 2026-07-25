@@ -10380,29 +10380,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         try:
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
-            # Goal continuation: after the agent returns a final response
-            # for this turn, check any standing /goal — the judge will
-            # either mark it done, pause it (budget), or enqueue a
-            # continuation prompt back through the adapter FIFO so the
-            # next turn makes more progress. Wrapped in try/except so a
-            # broken judge never breaks normal message handling.
-            try:
-                _goal_payload = self._goal_continuation_payload(_agent_result)
-                if _goal_payload is not None:
-                    _final_text, _defer_goal_status = _goal_payload
-                    try:
-                        session_entry = await self.async_session_store.get_or_create_session(source)
-                    except Exception:
-                        session_entry = None
-                    if session_entry is not None:
-                        await self._post_turn_goal_continuation(
-                            session_entry=session_entry,
-                            source=source,
-                            final_response=_final_text,
-                            defer_status=_defer_goal_status,
-                        )
-            except Exception as _goal_exc:
-                logger.warning("goal continuation hook failed: %s", _goal_exc, exc_info=True)
             return _agent_result
         finally:
             # MoA one-shot restore must run on EVERY exit path, not just
@@ -12262,6 +12239,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
+            # Evaluate a standing /goal while the adapter's in-band handler
+            # frame is still alive. Streaming returns None below because the
+            # response has already reached the user; an outer post-turn hook
+            # therefore cannot recover either the response or the effective
+            # session and silently skips continuation. Keeping the hook here
+            # also guarantees the adapter sees the queued continuation before
+            # its FIFO drain runs.
+            await self._handle_goal_after_agent_turn(
+                session_entry=session_entry,
+                source=source,
+                agent_result=agent_result,
+                final_response=response,
+                response_already_delivered=_already_sent,
+            )
             if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
                 await self._send_voice_reply(event, response)
 
@@ -12909,6 +12900,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not isinstance(agent_result, dict):
             return None
 
+        if (
+            bool(agent_result.get("failed"))
+            or bool(agent_result.get("partial"))
+            or bool(agent_result.get("interrupted"))
+        ):
+            return None
+
         final_text = str(agent_result.get("final_response") or "")
         if final_text.strip():
             return final_text, True
@@ -12925,6 +12923,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # post-delivery callback that would never fire.
             return "", False
         return None
+
+    async def _handle_goal_after_agent_turn(
+        self,
+        *,
+        session_entry: Any,
+        source: Any,
+        agent_result: Any,
+        final_response: str,
+        response_already_delivered: bool,
+    ) -> None:
+        """Evaluate and enqueue one standing-goal continuation in-band.
+
+        The effective response may have been normalized or transformed after
+        ``_run_agent`` returned, so it overrides the raw result. A streamed
+        response has already been delivered and must receive its status notice
+        immediately; a non-streamed response keeps the post-delivery callback
+        so the visible reply remains first.
+        """
+        if not isinstance(agent_result, dict):
+            return
+        goal_result = dict(agent_result)
+        goal_result["final_response"] = final_response or ""
+        payload = self._goal_continuation_payload(goal_result)
+        if payload is None:
+            return
+        response_text, defer_status = payload
+
+        try:
+            await self._post_turn_goal_continuation(
+                session_entry=session_entry,
+                source=source,
+                final_response=response_text,
+                defer_status=(defer_status and not response_already_delivered),
+            )
+        except Exception as exc:
+            sid = str(getattr(session_entry, "session_id", "") or "")
+            logger.warning(
+                "goal continuation hook failed for session %s: %s",
+                sid or "unknown",
+                exc,
+                exc_info=True,
+            )
+            try:
+                if sid and self._goal_still_active_for_session(sid):
+                    await self._send_goal_status_notice(
+                        source,
+                        "⚠️ Goal remains active, but automatic continuation failed for this turn.",
+                    )
+            except Exception:
+                logger.warning(
+                    "goal continuation failure notice could not be delivered",
+                    exc_info=True,
+                )
 
     async def _defer_goal_status_notice_after_delivery(self, source: Any, message: str) -> None:
         """Send a /goal status line after the main response is delivered.
@@ -13116,7 +13167,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         enqueue a continuation prompt for the same session.
 
         Called from ``_handle_message_with_agent`` at turn boundary, AFTER
-        the response has been delivered. Safe when no goal is set.
+        the response has been produced. Safe when no goal is set.
 
         We use the adapter's pending-message / FIFO machinery so any real
         user message that arrives simultaneously is handled by the same
@@ -13195,7 +13246,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
-            logger.debug("goal continuation: enqueue failed: %s", exc)
+            logger.warning("goal continuation: enqueue failed: %s", exc, exc_info=True)
 
 
 
@@ -19513,6 +19564,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "failed": result.get("failed", False),
                     "partial": result.get("partial", False),
                     "completed": result.get("completed"),
+                    "turn_exit_reason": result.get("turn_exit_reason"),
                     "interrupted": result.get("interrupted", False),
                     "interrupt_message": result.get("interrupt_message"),
                     "error": result.get("error"),
@@ -19620,6 +19672,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
                 "api_calls": result_holder[0].get("api_calls", 0) if result_holder[0] else 0,
                 "completed": result_holder[0].get("completed") if result_holder[0] else None,
+                "failed": result_holder[0].get("failed", False) if result_holder[0] else False,
+                "turn_exit_reason": result_holder[0].get("turn_exit_reason") if result_holder[0] else None,
                 "interrupted": result_holder[0].get("interrupted", False) if result_holder[0] else False,
                 "partial": result_holder[0].get("partial", False) if result_holder[0] else False,
                 "error": result_holder[0].get("error") if result_holder[0] else None,
