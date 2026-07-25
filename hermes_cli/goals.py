@@ -927,10 +927,10 @@ def judge_goal(
         client, model = get_text_auxiliary_client("goal_judge")
     except Exception as exc:
         logger.debug("goal judge: get_text_auxiliary_client failed: %s", exc)
-        return "continue", "auxiliary client unavailable", False, None
+        return "continue", "auxiliary client unavailable", False, None, True
 
     if client is None or not model:
-        return "continue", "no auxiliary client configured", False, None
+        return "continue", "no auxiliary client configured", False, None, True
 
     # Build the prompt. Priority: contract > subgoals > plain. When both a
     # contract and subgoals exist, the subgoals are appended into the

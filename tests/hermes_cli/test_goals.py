@@ -152,13 +152,13 @@ class TestJudgeGoal:
     def test_empty_goal_skipped(self):
         from hermes_cli.goals import judge_goal
 
-        verdict, _, _, _wd = judge_goal("", "some response")
+        verdict, _, _, _wd, _tf = judge_goal("", "some response")
         assert verdict == "skipped"
 
     def test_empty_response_continues(self):
         from hermes_cli.goals import judge_goal
 
-        verdict, _, _, _wd = judge_goal("ship the thing", "")
+        verdict, _, _, _wd, _tf = judge_goal("ship the thing", "")
         assert verdict == "continue"
 
     def test_no_aux_client_continues(self):
