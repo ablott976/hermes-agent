@@ -32,6 +32,7 @@ servers are missing binaries and auto-install is off, ``is_active``
 returns False and the file_operations layer falls through to the
 in-process syntax check.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -104,6 +105,7 @@ class _BackgroundLoop:
         Returns the coroutine's result, or raises its exception.
         """
         from agent.async_utils import safe_schedule_threadsafe
+
         if self._loop is None:
             if asyncio.iscoroutine(coro):
                 coro.close()
@@ -206,6 +208,7 @@ class LSPService:
         """
         try:
             from hermes_cli.config import load_config
+
             cfg = load_config()
         except Exception as e:  # noqa: BLE001
             logger.debug("LSP config load failed: %s", e)
@@ -317,10 +320,7 @@ class LSPService:
         with self._state_lock:
             for key, client in list(self._clients.items()):
                 last = self._last_used.get(key, 0.0)
-                if (
-                    self._in_flight.get(key, 0) == 0
-                    and now - last > self._idle_timeout
-                ):
+                if self._in_flight.get(key, 0) == 0 and now - last > self._idle_timeout:
                     to_reap.append((key, client))
                     self._clients.pop(key, None)
                     self._last_used.pop(key, None)
@@ -330,11 +330,14 @@ class LSPService:
             return
         logger.info(
             "LSP idle reaper: shutting down %d client(s) idle >%ss",
-            len(to_reap), self._idle_timeout,
+            len(to_reap),
+            self._idle_timeout,
         )
         for key, client in to_reap:
             logger.debug(
-                "  reaping %s (workspace=%s)", key[0], key[1],
+                "  reaping %s (workspace=%s)",
+                key[0],
+                key[1],
             )
             try:
                 await client.shutdown()
@@ -345,14 +348,18 @@ class LSPService:
             except Exception as exc:  # noqa: BLE001
                 logger.debug(
                     "LSP idle reaper shutdown failed for %s (%s): %s",
-                    key[0], key[1], exc,
+                    key[0],
+                    key[1],
+                    exc,
                 )
             else:
                 with self._state_lock:
                     reaping = self._reaping.get(key)
                     if reaping is not None:
                         remaining = [
-                            candidate for candidate in reaping if candidate is not client
+                            candidate
+                            for candidate in reaping
+                            if candidate is not client
                         ]
                         if remaining:
                             self._reaping[key] = remaining
@@ -414,7 +421,10 @@ class LSPService:
         if not self.enabled_for(file_path):
             return
         try:
-            diags = self._loop.run(self._snapshot_async(file_path), timeout=8.0)
+            # Outer join budget must exceed the inner wait budget or a
+            # slow-but-alive server gets falsely marked broken.
+            t = max(8.0, self._wait_timeout + 3.0)
+            diags = self._loop.run(self._snapshot_async(file_path), timeout=t)
             self._delta_baseline[os.path.abspath(file_path)] = diags or []
         except Exception as e:  # noqa: BLE001
             logger.debug("baseline snapshot failed for %s: %s", file_path, e)
@@ -463,7 +473,7 @@ class LSPService:
 
         try:
             t = timeout if timeout is not None else self._wait_timeout + 2.0
-            diags = self._loop.run(self._open_and_wait_async(file_path), timeout=t) or []
+            diags = self._loop.run(self._open_and_wait_async(file_path), timeout=t)
         except asyncio.TimeoutError as e:
             eventlog.log_timeout(server_id, file_path)
             logger.debug("LSP diagnostics timeout for %s: %s", file_path, e)
@@ -473,6 +483,17 @@ class LSPService:
             eventlog.log_server_error(server_id, file_path, e)
             logger.debug("LSP diagnostics fetch failed for %s: %s", file_path, e)
             self._mark_broken_for_file(file_path, e)
+            return []
+
+        if diags is None:
+            # The server is alive but never produced diagnostics for the
+            # post-edit content within the wait budget (common for
+            # tsserver on large projects).  Report "no data" rather than
+            # whatever stale state is in the stores — surfacing the
+            # previous edit's errors as if they were current is the
+            # ghost-diagnostics bug.  The server is NOT marked broken:
+            # slow is not dead, and the next edit may well succeed.
+            eventlog.log_timeout(server_id, file_path, kind="fresh diagnostics")
             return []
 
         abs_path = os.path.abspath(file_path)
@@ -486,6 +507,7 @@ class LSPService:
                     # that mapped into a deleted region drop out
                     # silently — they no longer apply.
                     from agent.lsp.range_shift import shift_baseline
+
                     baseline = shift_baseline(baseline, line_shift)
                 seen = {_diag_key(d) for d in baseline}
                 diags = [d for d in diags if _diag_key(d) not in seen]
@@ -493,7 +515,10 @@ class LSPService:
             # to the just-emitted state, mirroring claude-code's
             # diagnosticTracking.
             try:
-                fresh = self._loop.run(self._current_diags_async(file_path), timeout=2.0) or []
+                fresh = (
+                    self._loop.run(self._current_diags_async(file_path), timeout=2.0)
+                    or []
+                )
             except Exception:  # noqa: BLE001
                 fresh = []
             if fresh:
@@ -585,28 +610,57 @@ class LSPService:
             return []
         try:
             try:
-                version = await client.open_file(file_path, language_id=language_id_for(file_path))
-                await client.wait_for_diagnostics(file_path, version, mode=self._wait_mode)
+                version = await client.open_file(
+                    file_path, language_id=language_id_for(file_path)
+                )
+                fresh = await client.wait_for_diagnostics(
+                    file_path,
+                    version,
+                    mode=self._wait_mode,
+                )
             except Exception as e:  # noqa: BLE001
                 logger.debug("snapshot open/wait failed: %s", e)
                 return []
-            return list(client.diagnostics_for(file_path))
+            if not fresh:
+                # No fresh data for the pre-edit content — an empty baseline
+                # is safe: worst case the delta filter removes less, never
+                # more. Never seed the baseline from stale stores.
+                return []
+            return list(client.diagnostics_for(file_path, fresh_only=True))
         finally:
             self._finish_client_use(client)
 
-    async def _open_and_wait_async(self, file_path: str) -> List[Dict[str, Any]]:
+    async def _open_and_wait_async(
+        self, file_path: str
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Open + wait for fresh diagnostics without racing idle reaping.
+
+        Returns the fresh diagnostic list, or ``None`` when the server
+        never produced post-change data within the wait budget. ``[]`` means
+        the server checked the new content and found it clean; ``None`` means
+        no verdict and must never be replaced with stale diagnostics.
+        """
         client = await self._get_or_spawn(file_path, claim=True)
         if client is None:
-            return []
+            return None
         try:
             try:
-                version = await client.open_file(file_path, language_id=language_id_for(file_path))
+                version = await client.open_file(
+                    file_path, language_id=language_id_for(file_path)
+                )
                 await client.save_file(file_path)
-                await client.wait_for_diagnostics(file_path, version, mode=self._wait_mode)
+                fresh = await client.wait_for_diagnostics(
+                    file_path,
+                    version,
+                    mode=self._wait_mode,
+                    timeout=self._wait_timeout,
+                )
             except Exception as e:  # noqa: BLE001
                 logger.debug("open/wait failed for %s: %s", file_path, e)
-                return []
-            return list(client.diagnostics_for(file_path))
+                return None
+            if not fresh:
+                return None
+            return list(client.diagnostics_for(file_path, fresh_only=True))
         finally:
             self._finish_client_use(client)
 
@@ -631,7 +685,7 @@ class LSPService:
             client = self._clients.get((srv.server_id, ws))
         if client is None:
             return []
-        return list(client.diagnostics_for(file_path))
+        return list(client.diagnostics_for(file_path, fresh_only=True))
 
     async def _get_or_spawn(
         self, file_path: str, *, claim: bool = False
@@ -707,7 +761,8 @@ class LSPService:
                 env=spec.env,
                 cwd=spec.cwd,
                 initialization_options=spec.initialization_options,
-                seed_diagnostics_on_first_push=spec.seed_diagnostics_on_first_push or srv.seed_first_push,
+                seed_diagnostics_on_first_push=spec.seed_diagnostics_on_first_push
+                or srv.seed_first_push,
             )
             try:
                 await client.start()
@@ -731,9 +786,7 @@ class LSPService:
     async def _shutdown_async(self) -> None:
         with self._state_lock:
             clients = list(self._clients.values()) + [
-                client
-                for reaping in self._reaping.values()
-                for client in reaping
+                client for reaping in self._reaping.values() for client in reaping
             ]
             self._clients.clear()
             self._reaping.clear()
@@ -786,13 +839,15 @@ def _normalize_idle_timeout(value: Any) -> float:
     except (TypeError, ValueError):
         logger.warning(
             "Invalid lsp.idle_timeout=%r; using default %ss",
-            value, DEFAULT_IDLE_TIMEOUT,
+            value,
+            DEFAULT_IDLE_TIMEOUT,
         )
         return float(DEFAULT_IDLE_TIMEOUT)
     if not math.isfinite(timeout) or timeout < 0:
         logger.warning(
             "Invalid lsp.idle_timeout=%r; using default %ss",
-            value, DEFAULT_IDLE_TIMEOUT,
+            value,
+            DEFAULT_IDLE_TIMEOUT,
         )
         return float(DEFAULT_IDLE_TIMEOUT)
     return timeout
@@ -818,15 +873,13 @@ def _diag_key(d: Dict[str, Any]) -> str:
     code = d.get("code")
     if code is not None and not isinstance(code, str):
         code = str(code)
-    return "\x00".join(
-        [
-            str(d.get("severity") or 1),
-            str(code or ""),
-            str(d.get("source") or ""),
-            str(d.get("message") or "").strip(),
-            f"{start.get('line', 0)}:{start.get('character', 0)}-{end.get('line', 0)}:{end.get('character', 0)}",
-        ]
-    )
+    return "\x00".join([
+        str(d.get("severity") or 1),
+        str(code or ""),
+        str(d.get("source") or ""),
+        str(d.get("message") or "").strip(),
+        f"{start.get('line', 0)}:{start.get('character', 0)}-{end.get('line', 0)}:{end.get('character', 0)}",
+    ])
 
 
 __all__ = ["LSPService"]

@@ -111,7 +111,9 @@ CONTINUATION_TEXT = "[Continuing toward your standing goal]\nGoal: ship it"
         ({"final_response": "stopped", "interrupted": True}, None),
     ],
 )
-def test_goal_continuation_payload_only_accepts_safe_empty_budget_boundaries(result, expected):
+def test_goal_continuation_payload_only_accepts_safe_empty_budget_boundaries(
+    result, expected
+):
     from gateway.run import GatewayRunner
 
     assert GatewayRunner._goal_continuation_payload(result) == expected

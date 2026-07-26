@@ -71,6 +71,7 @@ export function BaseBranchPicker({
     void load()
   }, [load])
 
+
   // Pin the current session's branch to the top, keep the rest in git's
   // most-recently-committed order.
   const sorted = useMemo(() => {
