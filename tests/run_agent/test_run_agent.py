@@ -5653,6 +5653,68 @@ class TestRunConversation:
             "_record_task_failure should not be called outside kanban mode"
         )
 
+    def test_goal_mode_iteration_ceiling_stays_inside_goal_loop(
+        self, agent, monkeypatch
+    ):
+        """A goal-mode turn ceiling is a slice boundary, not a task failure.
+
+        The outer Kanban goal loop must retain the running claim so it can
+        judge the summary and invoke another turn. In particular, two normal
+        slices must never consume the task's ``failure_limit=2`` budget.
+        """
+        self._setup_agent(agent)
+        agent.max_iterations = 2
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_goal_mode_task")
+        monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        tool_resp = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[tc],
+        )
+        mock_record_failure = MagicMock(return_value=False)
+        mock_connect = MagicMock(return_value=MagicMock())
+
+        results = []
+        with (
+            patch("run_agent.handle_function_call", return_value="ok"),
+            patch("hermes_cli.kanban_db._record_task_failure", mock_record_failure),
+            patch("hermes_cli.kanban_db.connect", mock_connect),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            for slice_number in (1, 2):
+                agent.client.chat.completions.create.side_effect = [
+                    tool_resp,
+                    tool_resp,
+                    _mock_response(
+                        content=(
+                            f"Slice {slice_number} checkpoint — more work remains."
+                        ),
+                        finish_reason="stop",
+                    ),
+                ]
+                results.append(
+                    agent.run_conversation(
+                        f"continue goal-mode card, slice {slice_number}"
+                    )
+                )
+
+        assert len(results) == 2
+        assert all(result["completed"] is False for result in results)
+        assert all(
+            result["turn_exit_reason"].startswith("max_iterations_reached(")
+            for result in results
+        )
+        assert [result["final_response"] for result in results] == [
+            "Slice 1 checkpoint — more work remains.",
+            "Slice 2 checkpoint — more work remains.",
+        ]
+        # The old behavior called this once per slice, so failure_limit=2
+        # blocked the card here before its outer goal loop could continue.
+        mock_record_failure.assert_not_called()
+
     # ── Output-cap retry: safe_out uses provider available_out + request estimate ──
 
     def test_output_cap_retry_uses_provider_available_out(self, agent):
