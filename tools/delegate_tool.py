@@ -3137,6 +3137,7 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
+    model: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -3215,6 +3216,12 @@ def delegate_task(
         creds = _resolve_delegation_credentials(cfg, parent_agent)
     except ValueError as exc:
         return tool_error(str(exc))
+
+    # Per-call model override: lets the caller pick a different model for
+    # this delegation without touching config.yaml. Provider/base_url stay
+    # from the delegation config (cliproxy by default).
+    if model:
+        creds["model"] = model
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -4224,6 +4231,15 @@ DELEGATE_TASK_SCHEMA = {
                     "Background information the subagent needs: file paths, "
                     "error messages, project structure, constraints. The more "
                     "specific you are, the better the subagent performs."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional model override for this delegation (e.g. "
+                    "'kimi-k3', 'gpt-5.6-luna'). Overrides the configured "
+                    "delegation model for all children in this call; "
+                    "provider/base_url stay from config."
                 ),
             },
             "tasks": {
