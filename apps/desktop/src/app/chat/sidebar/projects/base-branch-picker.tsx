@@ -65,11 +65,11 @@ export function BaseBranchPicker({
 
   // Load on mount so the default branch fills in before the user opens the
   // popover — otherwise the button reads "branch off " with nothing after it.
+  // An empty result is still a completed attempt; only retry when the user
+  // opens the picker again.
   useEffect(() => {
-    if (branches.length === 0 && !loading) {
-      void load()
-    }
-  }, [branches.length, loading, load])
+    void load()
+  }, [load])
 
   // Pin the current session's branch to the top, keep the rest in git's
   // most-recently-committed order.
