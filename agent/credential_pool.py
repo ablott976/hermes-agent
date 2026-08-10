@@ -440,9 +440,15 @@ def _exhausted_until(entry: PooledCredential, *, sole_credential: bool = False) 
     if reset_at is not None:
         # Legacy/corrupt auth.json entries may have a provider reset timestamp
         # without the local exhaustion timestamp needed to anchor a safe cap.
-        # A past reset can clear the entry, but a future advisory must not
-        # freeze it indefinitely.
-        return reset_at if reset_at <= time.time() else None
+        # A past reset can clear every entry.  Future OAuth advisories must not
+        # freeze refreshable credentials indefinitely, while API-key providers
+        # legitimately expose reset timestamps without a token-refresh event.
+        now = time.time()
+        if reset_at <= now:
+            return reset_at
+        if entry.auth_type == AUTH_TYPE_API_KEY:
+            return min(reset_at, now + MAX_PROVIDER_RESET_WINDOW_SECONDS)
+        return None
     return None
 
 

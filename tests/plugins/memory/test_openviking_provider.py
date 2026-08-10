@@ -921,6 +921,8 @@ def test_validate_openviking_reachability_uses_health_only(monkeypatch):
 def _make_provider_with_session(session_id: str, turn_count: int):
     provider = OpenVikingMemoryProvider()
     provider._client = MagicMock()
+    provider._auto_commit_enabled = lambda: True
+    provider._min_commit_turns = lambda: 1
     provider._session_id = session_id
     provider._turn_count = turn_count
     return provider
@@ -930,6 +932,7 @@ def test_on_session_switch_commits_old_session_and_rotates_id():
     provider = _make_provider_with_session("old-sid", turn_count=3)
 
     provider.on_session_switch("new-sid", parent_session_id="old-sid")
+    assert provider._drain_finalizers(timeout=2.0)
 
     provider._client.post.assert_called_once_with(
         "/api/v1/sessions/old-sid/commit",
@@ -1110,6 +1113,7 @@ def test_concurrent_providers_claim_unlocked_pending_owner_once(
     for provider in providers:
         provider._client = StubClient()
         provider._hermes_home = str(tmp_path)
+        provider._auto_commit_enabled = lambda: True
         pending_sessions = provider._pending_sessions
 
         def _scan_together(scan=pending_sessions):

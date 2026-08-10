@@ -3641,13 +3641,17 @@ class OpenVikingMemoryProvider(MemoryProvider):
                                 continue
                             if self._shutting_down:
                                 continue
-                            if self._session_needs_commit(pending_sid, 0):
-                                self._commit_session(
-                                    pending_sid,
-                                    0,
-                                    context="during startup recovery",
-                                    clear_missing=True,
-                                )
+                            # The durable marker is itself the recovery signal.
+                            # Re-running _session_needs_commit() here can reject
+                            # every orphan after the originating process and its
+                            # in-memory token counters are gone, leaving the
+                            # marker stranded forever.
+                            self._commit_session(
+                                pending_sid,
+                                0,
+                                context="during startup recovery",
+                                clear_missing=True,
+                            )
                         finally:
                             with self._deferred_commit_lock:
                                 self._deferred_commit_sids.discard(pending_sid)
