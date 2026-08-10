@@ -124,6 +124,7 @@ SUPPORTED_POOL_STRATEGIES = {
 EXHAUSTED_TTL_401_SECONDS = 5 * 60           # 5 minutes
 EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour
 EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
+MAX_PROVIDER_RESET_WINDOW_SECONDS = 31 * 24 * 60 * 60
 # When a pool has no other credential to rotate to (the offending key is the
 # sole non-DEAD entry), a 1-hour bench means an hour of hard failures with
 # nothing to fall back to. Throttles (429/403/5xx) are transient and reset in
@@ -424,14 +425,24 @@ def _exhausted_until(entry: PooledCredential, *, sole_credential: bool = False) 
     if entry.last_status != STATUS_EXHAUSTED:
         return None
     reset_at = _parse_absolute_timestamp(getattr(entry, "last_error_reset_at", None))
-    if reset_at is not None:
-        return reset_at
+    ttl_until = None
     if entry.last_status_at:
-        return entry.last_status_at + _exhausted_ttl(
+        ttl_until = entry.last_status_at + _exhausted_ttl(
             entry.last_error_code,
             sole_credential=sole_credential,
             failure_reason=getattr(entry, "failure_reason", None),
         )
+    if reset_at is not None and entry.last_status_at is not None:
+        reset_cap = entry.last_status_at + MAX_PROVIDER_RESET_WINDOW_SECONDS
+        return min(reset_at, reset_cap)
+    if ttl_until is not None:
+        return ttl_until
+    if reset_at is not None:
+        # Legacy/corrupt auth.json entries may have a provider reset timestamp
+        # without the local exhaustion timestamp needed to anchor a safe cap.
+        # A past reset can clear the entry, but a future advisory must not
+        # freeze it indefinitely.
+        return reset_at if reset_at <= time.time() else None
     return None
 
 
@@ -1786,21 +1797,59 @@ class CredentialPool:
         with self._lock:
             return self._select_unlocked()
 
+    def _refresh_exhausted_entry_keepalive(self, entry: PooledCredential) -> None:
+        """Rotate an exhausted OAuth token without lifting its quota gate."""
+        exhaustion_state = {
+            "last_status": entry.last_status,
+            "last_status_at": entry.last_status_at,
+            "last_error_code": entry.last_error_code,
+            "last_error_reason": entry.last_error_reason,
+            "last_error_message": entry.last_error_message,
+            "last_error_reset_at": entry.last_error_reset_at,
+        }
+        try:
+            refreshed = self._refresh_entry(entry, force=False)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(
+                "credential pool: keepalive refresh raised for exhausted %s "
+                "entry %s: %s",
+                self.provider,
+                entry.label or entry.id[:8],
+                exc,
+            )
+            return
+
+        with self._lock:
+            current = next((item for item in self._entries if item.id == entry.id), None)
+            # Terminal refresh failures intentionally remove/quarantine the
+            # credential. Never resurrect such an entry merely to restore its
+            # old cooldown metadata.
+            if current is None or current.last_status == STATUS_DEAD:
+                return
+            base = refreshed if refreshed is not None else current
+            restored = replace(base, **exhaustion_state)
+            if current != restored:
+                self._replace_entry(current, restored)
+                self._persist()
+
     def _refresh_pending_entries(self, pending: List[tuple]) -> None:
-        """Refresh deferred single-use-token entries outside the lock.
+        """Refresh deferred OAuth entries outside the lock.
 
         Each entry is refreshed under the cross-process ``_auth_store_lock``
         (which can block for 20+ seconds) and then merged into the pool.
         On failure the entry is silently skipped.
         """
-        for entry, sync_fn in pending:
+        for entry, _sync_fn, preserve_exhaustion in pending:
             # _refresh_entry merges the refreshed entry into the pool
             # internally. Its mutation primitives (_replace_entry, _persist)
             # are self-locking, and the quarantine paths inside
             # _refresh_entry_impl take self._lock explicitly around their
             # read-modify-write of self._entries — required because this
             # call site runs OUTSIDE the pool lock.
-            self._refresh_entry(entry, force=False)
+            if preserve_exhaustion:
+                self._refresh_exhausted_entry_keepalive(entry)
+            else:
+                self._refresh_entry(entry, force=False)
 
     def _available_entries(
         self, *, clear_expired: bool = False, refresh: bool = False,
@@ -1820,11 +1869,10 @@ class CredentialPool:
         cleared_any = False
         entries_to_prune: List[str] = []
         available: List[PooledCredential] = []
-        # Entries that need an OAuth refresh via a single-use token provider
-        # (openai-codex, xai-oauth).  These require a cross-process file lock
-        # that can block for 20+ seconds.  We collect them under self._lock
-        # and refresh outside the lock to avoid stalling all pool consumers.
-        pending_refresh: List[tuple] = []  # (entry, sync_entry_fn)
+        # OAuth refreshes can require a cross-process file lock and network I/O
+        # that block for 20+ seconds. Collect them under self._lock and execute
+        # outside it; the boolean records whether the quota gate must survive.
+        pending_refresh: List[tuple] = []  # (entry, sync_entry_fn, preserve_exhaustion)
         # DEAD entries never re-enter rotation, so if at most one non-DEAD entry
         # exists there is nothing to rotate to: an exhausted sole credential
         # should cool down briefly rather than bench the only key for an hour.
@@ -1924,6 +1972,19 @@ class CredentialPool:
                         clear_expired
                         and self._codex_quota_restored_upstream(entry)
                     ):
+                        if (
+                            refresh
+                            and entry.auth_type == AUTH_TYPE_OAUTH
+                            and self._entry_needs_refresh(entry)
+                        ):
+                            sync_fn = (
+                                self._sync_codex_entry_from_auth_store
+                                if self.provider == "openai-codex"
+                                else self._sync_xai_oauth_entry_from_pool_store
+                                if self.provider == "xai-oauth"
+                                else None
+                            )
+                            pending_refresh.append((entry, sync_fn, True))
                         continue
                 if clear_expired:
                     cleared = replace(
@@ -1947,7 +2008,7 @@ class CredentialPool:
                         if self.provider == "openai-codex"
                         else self._sync_xai_oauth_entry_from_pool_store
                     )
-                    pending_refresh.append((entry, sync_fn))
+                    pending_refresh.append((entry, sync_fn, False))
                     continue
                 refreshed = self._refresh_entry(entry, force=False)
                 if refreshed is None:

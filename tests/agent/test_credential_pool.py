@@ -77,6 +77,213 @@ def test_explicit_reset_timestamp_overrides_default_429_ttl(tmp_path, monkeypatc
     assert pool.select() is None
 
 
+def test_provider_reset_timestamp_is_capped_to_safe_window():
+    from agent.credential_pool import (
+        AUTH_TYPE_OAUTH,
+        MAX_PROVIDER_RESET_WINDOW_SECONDS,
+        PooledCredential,
+        STATUS_EXHAUSTED,
+        _exhausted_until,
+    )
+
+    exhausted_at = time.time()
+    entry = PooledCredential(
+        provider="openai-codex",
+        id="cred-cap",
+        label="remote-reset",
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=0,
+        source="manual:device_code",
+        access_token="tok",
+        last_status=STATUS_EXHAUSTED,
+        last_status_at=exhausted_at,
+        last_error_code=429,
+        last_error_reset_at=exhausted_at + 365 * 24 * 60 * 60,
+    )
+
+    assert _exhausted_until(entry) == exhausted_at + MAX_PROVIDER_RESET_WINDOW_SECONDS
+
+
+def test_legacy_future_reset_without_status_timestamp_is_advisory(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-legacy",
+                        "label": "legacy-reset",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "tok",
+                        "last_status": "exhausted",
+                        "last_status_at": None,
+                        "last_error_code": 429,
+                        "last_error_reset_at": time.time() + 7 * 24 * 60 * 60,
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import STATUS_OK, load_pool
+
+    selected = load_pool("openai-codex").select()
+    assert selected is not None
+    assert selected.id == "cred-legacy"
+    assert selected.last_status == STATUS_OK
+
+
+def _load_exhausted_codex_pool(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    reset_at = time.time() + 30 * 60
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-keepalive",
+                        "label": "weekly-cooldown",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "old-access",
+                        "refresh_token": "old-refresh",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time() - 60,
+                        "last_error_code": 429,
+                        "last_error_reason": "weekly_quota",
+                        "last_error_message": "weekly limit",
+                        "last_error_reset_at": reset_at,
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    monkeypatch.setattr(pool, "_codex_quota_restored_upstream", lambda entry: False)
+    return pool, reset_at
+
+
+def test_exhausted_oauth_keepalive_is_deferred_and_preserves_quota(tmp_path, monkeypatch):
+    from dataclasses import replace as dc_replace
+
+    from agent.credential_pool import STATUS_EXHAUSTED, STATUS_OK, load_pool
+
+    pool, reset_at = _load_exhausted_codex_pool(tmp_path, monkeypatch)
+    refresh_calls = []
+
+    def _refresh(entry, *, force):
+        refresh_calls.append((entry.id, force))
+        updated = dc_replace(
+            entry,
+            access_token="new-access",
+            refresh_token="new-refresh",
+            last_status=STATUS_OK,
+            last_status_at=None,
+            last_error_code=None,
+            last_error_reason=None,
+            last_error_message=None,
+            last_error_reset_at=None,
+        )
+        pool._replace_entry(entry, updated)
+        pool._persist()
+        return updated
+
+    monkeypatch.setattr(pool, "_entry_needs_refresh", lambda entry: True)
+    monkeypatch.setattr(pool, "_refresh_entry", _refresh)
+
+    available, pending = pool._available_entries(clear_expired=True, refresh=True)
+    assert available == []
+    assert len(pending) == 1
+    assert refresh_calls == []
+
+    pool._refresh_pending_entries(pending)
+
+    assert refresh_calls == [("cred-keepalive", False)]
+    rotated = pool._entries[0]
+    assert rotated.access_token == "new-access"
+    assert rotated.refresh_token == "new-refresh"
+    assert rotated.last_status == STATUS_EXHAUSTED
+    assert rotated.last_error_reset_at == reset_at
+    assert rotated.last_error_reason == "weekly_quota"
+
+    on_disk = load_pool("openai-codex")._entries[0]
+    assert on_disk.access_token == "new-access"
+    assert on_disk.refresh_token == "new-refresh"
+    assert on_disk.last_status == STATUS_EXHAUSTED
+    assert on_disk.last_error_reset_at == reset_at
+
+
+def test_terminal_keepalive_failure_is_not_resurrected(tmp_path, monkeypatch):
+    from dataclasses import replace as dc_replace
+
+    from agent.credential_pool import STATUS_DEAD
+
+    pool, _ = _load_exhausted_codex_pool(tmp_path, monkeypatch)
+
+    def _terminal(entry, *, force):
+        dead = dc_replace(entry, last_status=STATUS_DEAD)
+        pool._replace_entry(entry, dead)
+        pool._persist()
+        return None
+
+    monkeypatch.setattr(pool, "_entry_needs_refresh", lambda entry: True)
+    monkeypatch.setattr(pool, "_refresh_entry", _terminal)
+
+    available, pending = pool._available_entries(clear_expired=True, refresh=True)
+    assert available == []
+    pool._refresh_pending_entries(pending)
+
+    assert pool._entries[0].last_status == STATUS_DEAD
+
+
+def test_nonterminal_keepalive_failure_restores_original_cooldown(tmp_path, monkeypatch):
+    from dataclasses import replace as dc_replace
+
+    from agent.credential_pool import STATUS_EXHAUSTED
+
+    pool, reset_at = _load_exhausted_codex_pool(tmp_path, monkeypatch)
+
+    def _failed_refresh(entry, *, force):
+        damaged = dc_replace(
+            entry,
+            last_status=STATUS_EXHAUSTED,
+            last_status_at=time.time(),
+            last_error_code=None,
+            last_error_reason=None,
+            last_error_message=None,
+            last_error_reset_at=None,
+        )
+        pool._replace_entry(entry, damaged)
+        pool._persist()
+        return None
+
+    monkeypatch.setattr(pool, "_entry_needs_refresh", lambda entry: True)
+    monkeypatch.setattr(pool, "_refresh_entry", _failed_refresh)
+
+    available, pending = pool._available_entries(clear_expired=True, refresh=True)
+    assert available == []
+    pool._refresh_pending_entries(pending)
+
+    restored = pool._entries[0]
+    assert restored.last_status == STATUS_EXHAUSTED
+    assert restored.last_error_code == 429
+    assert restored.last_error_reason == "weekly_quota"
+    assert restored.last_error_message == "weekly limit"
+    assert restored.last_error_reset_at == reset_at
+
+
 
 
 def test_billing_rotation_marks_all_entries_sharing_failed_key(tmp_path, monkeypatch):
