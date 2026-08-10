@@ -90,6 +90,8 @@ _DEFAULT_RECALL_TIMEOUT_SECONDS = 4.0
 _DEFAULT_RECALL_REQUEST_TIMEOUT_SECONDS = 3.0
 _DEFAULT_RECALL_FULL_READ_LIMIT = 2
 _RECALL_QUERY_MIN_CHARS = 5
+_DEFAULT_SYNC_CHAR_LIMIT = 4000
+_DEFAULT_MIN_COMMIT_TURNS = 1
 _RECALL_MIN_TIMEOUT_SECONDS = 0.05
 _READ_BATCH_LIMIT = 3
 _READ_BATCH_FULL_LIMIT = 2500
@@ -180,6 +182,10 @@ class _OpenVikingHTTPError(RuntimeError):
     def __init__(self, message: str, status_code: Optional[int] = None):
         super().__init__(message)
         self.status_code = status_code
+
+
+class _SessionMessageWriteError(RuntimeError):
+    """A non-idempotent single-message write failed and must not be retried."""
 
 
 class _OpenVikingEndpointError(ValueError):
@@ -2207,6 +2213,14 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._deferred_commit_lock = threading.Lock()
         self._committed_session_ids: Set[str] = set()
         self._committed_session_lock = threading.Lock()
+        # OpenViking releases differ on whether session writes are batch or
+        # single-message. Cache the read-only OpenAPI decision per endpoint and
+        # serialize message sequences so a legacy single-message turn cannot
+        # interleave with another async writer.
+        self._session_message_api_mode = ""
+        self._session_message_api_endpoint = ""
+        self._session_message_api_mode_lock = threading.Lock()
+        self._session_message_write_lock = threading.Lock()
         self._pending_marked_sids: Set[str] = set()
         # Connection settings and _client are one published state. Serialize
         # refreshes so callers never observe a new config with the old client.
@@ -2288,6 +2302,54 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 ),
                 "default": "hermes",
                 "env_var": "OPENVIKING_AGENT",
+            },
+            {
+                "key": "auto_sync",
+                "description": "Automatically mirror conversation turns",
+                "type": "boolean",
+                "default": True,
+                "env_var": "OPENVIKING_AUTO_SYNC",
+            },
+            {
+                "key": "auto_prefetch",
+                "description": "Automatically inject recalled context before turns",
+                "type": "boolean",
+                "default": True,
+                "env_var": "OPENVIKING_AUTO_PREFETCH",
+            },
+            {
+                "key": "auto_commit",
+                "description": "Automatically commit sessions for memory extraction",
+                "type": "boolean",
+                "default": True,
+                "env_var": "OPENVIKING_AUTO_COMMIT",
+            },
+            {
+                "key": "min_commit_turns",
+                "description": "Minimum mirrored turns before an automatic commit",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1_000_000,
+                "default": _DEFAULT_MIN_COMMIT_TURNS,
+                "env_var": "OPENVIKING_MIN_COMMIT_TURNS",
+            },
+            {
+                "key": "sync_user_char_limit",
+                "description": "Maximum user characters mirrored per turn",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100_000,
+                "default": _DEFAULT_SYNC_CHAR_LIMIT,
+                "env_var": "OPENVIKING_SYNC_USER_CHAR_LIMIT",
+            },
+            {
+                "key": "sync_assistant_char_limit",
+                "description": "Maximum assistant/tool characters mirrored per turn",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100_000,
+                "default": _DEFAULT_SYNC_CHAR_LIMIT,
+                "env_var": "OPENVIKING_SYNC_ASSISTANT_CHAR_LIMIT",
             },
             {
                 "key": "recall_limit",
@@ -2914,6 +2976,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Return recall context for this query/session."""
+        if not self._auto_prefetch_enabled():
+            return ""
         query_text = _derive_openviking_user_text(query).strip()
         if not self._ensure_client():
             return ""
@@ -3081,6 +3145,189 @@ class OpenVikingMemoryProvider(MemoryProvider):
             agent=self._agent,
         )
 
+    def _resolve_session_message_api_mode(self, client: _VikingClient) -> str:
+        """Choose the best session write contract from read-only OpenAPI metadata."""
+        endpoint = str(getattr(client, "_endpoint", "") or self._endpoint).rstrip("/")
+        with self._session_message_api_mode_lock:
+            if (
+                self._session_message_api_mode
+                and self._session_message_api_endpoint == endpoint
+            ):
+                return self._session_message_api_mode
+
+            mode = "batch"
+            try:
+                spec = self._unwrap_result(client.openapi_payload())
+                paths = spec.get("paths", {}) if isinstance(spec, dict) else {}
+                batch = paths.get(
+                    "/api/v1/sessions/{session_id}/messages/batch",
+                    {},
+                )
+                single = paths.get(
+                    "/api/v1/sessions/{session_id}/messages",
+                    {},
+                )
+                # Batch is the preferred modern contract when both are present.
+                if isinstance(batch, dict) and "post" in batch:
+                    mode = "batch"
+                elif isinstance(single, dict) and "post" in single:
+                    mode = "single"
+            except Exception:
+                # Older/remote deployments may not expose OpenAPI. Preserve the
+                # batch contract until a route-level 404/405 proves it absent.
+                mode = "batch"
+
+            self._session_message_api_endpoint = endpoint
+            self._session_message_api_mode = mode
+            return mode
+
+    def _set_session_message_api_mode(self, client: _VikingClient, mode: str) -> None:
+        endpoint = str(getattr(client, "_endpoint", "") or self._endpoint).rstrip("/")
+        with self._session_message_api_mode_lock:
+            self._session_message_api_endpoint = endpoint
+            self._session_message_api_mode = mode
+
+    @staticmethod
+    def _limit_sync_messages(
+        messages: List[Dict[str, Any]],
+        *,
+        user_limit: int,
+        assistant_limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Apply per-turn character budgets to structured session payloads."""
+        remaining = {"user": user_limit, "assistant": assistant_limit}
+        limited_messages: List[Dict[str, Any]] = []
+
+        for message in messages:
+            role = "user" if message.get("role") == "user" else "assistant"
+            budget = remaining[role]
+            limited_parts: List[Dict[str, Any]] = []
+
+            for raw_part in message.get("parts") or []:
+                part = dict(raw_part)
+                part_type = part.get("type")
+                if part_type == "text":
+                    if budget <= 0:
+                        continue
+                    text = str(part.get("text") or "")[:budget]
+                    if not text:
+                        continue
+                    part["text"] = text
+                    budget -= len(text)
+                elif part_type == "tool":
+                    tool_input = part.get("tool_input")
+                    if tool_input is not None:
+                        try:
+                            encoded_input = json.dumps(
+                                tool_input,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                default=str,
+                            )
+                        except (TypeError, ValueError):
+                            encoded_input = str(tool_input)
+                        if len(encoded_input) <= budget:
+                            budget -= len(encoded_input)
+                        else:
+                            part["tool_input"] = {}
+
+                    output = str(part.get("tool_output") or "")[:budget]
+                    part["tool_output"] = output
+                    budget -= len(output)
+                else:
+                    try:
+                        encoded_part = json.dumps(
+                            part,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            default=str,
+                        )
+                    except (TypeError, ValueError):
+                        encoded_part = str(part)
+                    if len(encoded_part) > budget:
+                        continue
+                    budget -= len(encoded_part)
+
+                limited_parts.append(part)
+
+            remaining[role] = budget
+            if limited_parts:
+                limited_message = dict(message)
+                limited_message["parts"] = limited_parts
+                limited_messages.append(limited_message)
+
+        return limited_messages
+
+    def _post_session_messages(
+        self,
+        client: _VikingClient,
+        sid: str,
+        messages: List[Dict[str, Any]],
+        *,
+        progress: Optional[List[int]] = None,
+    ) -> None:
+        """Write a turn without replaying messages already accepted in this sequence."""
+        if progress is None:
+            progress = [0]
+
+        # OpenViking's single-message endpoint auto-creates a missing session.
+        # Keep a whole message sequence under one lock so concurrent async turns
+        # cannot interleave. Do not add an explicit, non-idempotent session create.
+        with self._session_message_write_lock:
+            mode = self._resolve_session_message_api_mode(client)
+            while progress[0] < len(messages):
+                if mode == "single":
+                    message_index = progress[0]
+                    path = f"/api/v1/sessions/{sid}/messages"
+                    if _sync_trace_enabled():
+                        logger.info(
+                            "OpenViking sync_turn trace: POST %s message_index=%d payload=%s",
+                            path,
+                            message_index,
+                            json.dumps(messages[message_index], ensure_ascii=False),
+                        )
+                    try:
+                        # Preserve role_id/peer_id exactly as produced by the
+                        # current transport; different servers accept either.
+                        client.post(path, dict(messages[message_index]))
+                    except Exception as exc:
+                        # The server may have persisted this message before a
+                        # transport/error response. Retrying the turn would
+                        # duplicate this message or earlier accepted messages.
+                        raise _SessionMessageWriteError(str(exc)) from exc
+                    progress[0] += 1
+                    continue
+
+                batch_end = min(
+                    progress[0] + _SESSION_MESSAGE_BATCH_LIMIT,
+                    len(messages),
+                )
+                payload = {"messages": messages[progress[0]:batch_end]}
+                if _sync_trace_enabled():
+                    logger.info(
+                        "OpenViking sync_turn trace: POST "
+                        "/api/v1/sessions/%s/messages/batch range=%d:%d payload=%s",
+                        sid,
+                        progress[0],
+                        batch_end,
+                        json.dumps(payload, ensure_ascii=False),
+                    )
+                try:
+                    client.post(
+                        f"/api/v1/sessions/{sid}/messages/batch",
+                        payload,
+                    )
+                except Exception as exc:
+                    if _status_code_from_error(exc) not in {404, 405}:
+                        raise
+                    # A route/method miss proves this batch was not accepted.
+                    # Switch only the still-unsent suffix to singles; any prior
+                    # successful chunks remain outside the fallback sequence.
+                    mode = "single"
+                    self._set_session_message_api_mode(client, mode)
+                    continue
+                progress[0] = batch_end
+
     @staticmethod
     def _text_part(content: str) -> Dict[str, str]:
         return {"type": "text", "text": content}
@@ -3105,10 +3352,14 @@ class OpenVikingMemoryProvider(MemoryProvider):
         sid: str,
         user_content: str,
         assistant_content: str,
+        *,
+        progress: Optional[List[int]] = None,
     ) -> None:
-        client.post(
-            f"/api/v1/sessions/{sid}/messages/batch",
-            self._turn_batch_payload(user_content, assistant_content),
+        self._post_session_messages(
+            client,
+            sid,
+            self._turn_batch_payload(user_content, assistant_content)["messages"],
+            progress=progress,
         )
 
     def _session_has_pending_tokens(self, sid: str) -> bool:
@@ -3308,7 +3559,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
             logger.debug("Could not remove OpenViking owner run lock %s: %s", path, e)
 
     def _mark_session_pending(self, sid: str) -> None:
-        if not sid or self._has_committed_session(sid):
+        if not self._auto_commit_enabled() or not sid or self._has_committed_session(sid):
             return
         if sid in self._pending_marked_sids:
             return
@@ -3360,7 +3611,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         return sessions
 
     def _recover_pending_sessions(self) -> None:
-        if not self._client:
+        if not self._client or not self._auto_commit_enabled():
             return
         pending_by_owner: Dict[str, List[str]] = {}
         for sid, owner_run_id in self._pending_sessions():
@@ -3390,12 +3641,13 @@ class OpenVikingMemoryProvider(MemoryProvider):
                                 continue
                             if self._shutting_down:
                                 continue
-                            self._commit_session(
-                                pending_sid,
-                                0,
-                                context="during startup recovery",
-                                clear_missing=True,
-                            )
+                            if self._session_needs_commit(pending_sid, 0):
+                                self._commit_session(
+                                    pending_sid,
+                                    0,
+                                    context="during startup recovery",
+                                    clear_missing=True,
+                                )
                         finally:
                             with self._deferred_commit_lock:
                                 self._deferred_commit_sids.discard(pending_sid)
@@ -3419,13 +3671,18 @@ class OpenVikingMemoryProvider(MemoryProvider):
             thread.start()
 
     def _session_needs_commit(self, sid: str, turn_count: int) -> bool:
+        if not self._auto_commit_enabled():
+            return False
         # Already-committed sessions never need a second commit, regardless of
         # the turn counter — a racing sync_turn can re-increment _turn_count
         # after a commit+reset, so the committed-guard must win over turn_count.
         if self._has_committed_session(sid):
             return False
+        min_turns = self._min_commit_turns()
         if turn_count > 0:
-            return True
+            return turn_count >= min_turns
+        if min_turns > _DEFAULT_MIN_COMMIT_TURNS:
+            return False
         return self._session_has_pending_tokens(sid)
 
     def _commit_session(
@@ -3436,6 +3693,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
         context: str,
         clear_missing: bool = False,
     ) -> bool:
+        if not self._auto_commit_enabled():
+            return False
         try:
             self._client.post(
                 f"/api/v1/sessions/{sid}/commit",
@@ -3653,6 +3912,66 @@ class OpenVikingMemoryProvider(MemoryProvider):
             cls._warn_invalid_setting_once(source, value, default)
             parsed = default
         return max(minimum, min(maximum, parsed))
+
+    def _session_policy_config(self) -> Dict[str, Any]:
+        """Resolve automatic session policy from config.yaml with legacy env overrides."""
+        cfg = _load_hermes_openviking_config()
+        return {
+            "auto_sync": self._setting_bool(
+                "OPENVIKING_AUTO_SYNC",
+                cfg.get("auto_sync", True),
+                default=True,
+            ),
+            "auto_prefetch": self._setting_bool(
+                "OPENVIKING_AUTO_PREFETCH",
+                cfg.get("auto_prefetch", True),
+                default=True,
+            ),
+            "auto_commit": self._setting_bool(
+                "OPENVIKING_AUTO_COMMIT",
+                cfg.get("auto_commit", True),
+                default=True,
+            ),
+            "min_commit_turns": self._setting_int(
+                "OPENVIKING_MIN_COMMIT_TURNS",
+                cfg.get("min_commit_turns", _DEFAULT_MIN_COMMIT_TURNS),
+                default=_DEFAULT_MIN_COMMIT_TURNS,
+                minimum=1,
+                maximum=1_000_000,
+            ),
+            "sync_user_char_limit": self._setting_int(
+                "OPENVIKING_SYNC_USER_CHAR_LIMIT",
+                cfg.get("sync_user_char_limit", _DEFAULT_SYNC_CHAR_LIMIT),
+                default=_DEFAULT_SYNC_CHAR_LIMIT,
+                minimum=1,
+                maximum=100_000,
+            ),
+            "sync_assistant_char_limit": self._setting_int(
+                "OPENVIKING_SYNC_ASSISTANT_CHAR_LIMIT",
+                cfg.get("sync_assistant_char_limit", _DEFAULT_SYNC_CHAR_LIMIT),
+                default=_DEFAULT_SYNC_CHAR_LIMIT,
+                minimum=1,
+                maximum=100_000,
+            ),
+        }
+
+    def _auto_sync_enabled(self) -> bool:
+        return self._session_policy_config()["auto_sync"]
+
+    def _auto_prefetch_enabled(self) -> bool:
+        return self._session_policy_config()["auto_prefetch"]
+
+    def _auto_commit_enabled(self) -> bool:
+        return self._session_policy_config()["auto_commit"]
+
+    def _min_commit_turns(self) -> int:
+        return self._session_policy_config()["min_commit_turns"]
+
+    def _sync_char_limit(self, role: str) -> int:
+        policy = self._session_policy_config()
+        if role == "user":
+            return policy["sync_user_char_limit"]
+        return policy["sync_assistant_char_limit"]
 
     def _recall_config(self) -> Dict[str, Any]:
         # Read from config.yaml → memory.openviking as primary source, env vars
@@ -4451,15 +4770,24 @@ class OpenVikingMemoryProvider(MemoryProvider):
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Record the conversation turn in OpenViking's session (non-blocking)."""
-        if not self._ensure_client():
+        policy = self._session_policy_config()
+        if not policy["auto_sync"] or not self._ensure_client():
             return
 
-        user_content = _derive_openviking_user_text(user_content)
-        if not user_content:
+        derived_user_content = _derive_openviking_user_text(user_content)
+        if not derived_user_content:
             return
 
+        user_content = derived_user_content[:policy["sync_user_char_limit"]]
+        assistant_text = self._message_text(assistant_content)[
+            :policy["sync_assistant_char_limit"]
+        ]
         turn_messages = (
-            self._extract_current_turn_messages(messages, user_content, assistant_content)
+            self._extract_current_turn_messages(
+                messages,
+                derived_user_content,
+                assistant_content,
+            )
             if messages is not None
             else []
         )
@@ -4473,6 +4801,16 @@ class OpenVikingMemoryProvider(MemoryProvider):
             turn_messages,
             assistant_peer_id=getattr(self, "_agent", _DEFAULT_AGENT),
         )
+        batch_messages = self._limit_sync_messages(
+            batch_messages,
+            user_limit=policy["sync_user_char_limit"],
+            assistant_limit=policy["sync_assistant_char_limit"],
+        )
+        if not batch_messages:
+            batch_messages = self._turn_batch_payload(
+                user_content,
+                assistant_text,
+            )["messages"]
 
         if _sync_trace_enabled():
             logger.info(
@@ -4486,10 +4824,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 len(messages) if messages is not None else None,
                 len(turn_messages),
                 len(batch_messages),
-                len(str(user_content or "")),
-                len(str(assistant_content or "")),
+                len(user_content),
+                len(assistant_text),
                 _preview(user_content),
-                _preview(assistant_content),
+                _preview(assistant_text),
             )
 
         # Snapshot the sid and bump the turn counter atomically so a
@@ -4502,96 +4840,41 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 return
             self._turn_count += 1
 
-        self._mark_session_pending(sid)
+        if policy["auto_commit"]:
+            self._mark_session_pending(sid)
 
         def _sync():
-            next_batch_index = 0
-
-            def _post_unsent_messages_individually(client: _VikingClient) -> None:
-                nonlocal next_batch_index
-                path = f"/api/v1/sessions/{sid}/messages"
-                while next_batch_index < len(batch_messages):
-                    if _sync_trace_enabled():
-                        logger.info(
-                            "OpenViking sync_turn trace: POST %s message_index=%d payload=%s",
-                            path,
-                            next_batch_index,
-                            json.dumps(batch_messages[next_batch_index], ensure_ascii=False),
-                        )
-                    client.post(path, batch_messages[next_batch_index])
-                    next_batch_index += 1
+            progress = [0]
 
             def _post_turn(client: _VikingClient) -> None:
-                nonlocal next_batch_index
-                if batch_messages:
-                    while next_batch_index < len(batch_messages):
-                        batch_end = min(
-                            next_batch_index + _SESSION_MESSAGE_BATCH_LIMIT,
-                            len(batch_messages),
-                        )
-                        payload = {"messages": batch_messages[next_batch_index:batch_end]}
-                        if _sync_trace_enabled():
-                            logger.info(
-                                "OpenViking sync_turn trace: POST "
-                                "/api/v1/sessions/%s/messages/batch range=%d:%d payload=%s",
-                                sid,
-                                next_batch_index,
-                                batch_end,
-                                json.dumps(payload, ensure_ascii=False),
-                            )
-                        try:
-                            client.post(f"/api/v1/sessions/{sid}/messages/batch", payload)
-                        except Exception as batch_error:
-                            if next_batch_index:
-                                raise
-                            logger.warning(
-                                "OpenViking structured sync failed; falling back to text sync: %s",
-                                batch_error,
-                            )
-                            break
-                        next_batch_index = batch_end
-
-                    if next_batch_index == len(batch_messages):
-                        return
-
-                self._post_session_turn(
+                self._post_session_messages(
                     client,
                     sid,
-                    user_content[:4000],
-                    self._message_text(assistant_content)[:4000],
+                    batch_messages,
+                    progress=progress,
                 )
 
             try:
                 client = self._new_client()
                 _post_turn(client)
-            except Exception as e:
-                logger.debug("OpenViking sync_turn failed, reconnecting: %s", e)
-                retry_client = None
+            except _SessionMessageWriteError as exc:
+                logger.warning(
+                    "OpenViking session message write failed; "
+                    "not retrying a non-idempotent turn: %s",
+                    exc,
+                )
+            except Exception as exc:
+                logger.debug("OpenViking sync_turn failed, reconnecting: %s", exc)
                 try:
                     retry_client = self._new_client()
                     _post_turn(retry_client)
+                except _SessionMessageWriteError as retry_error:
+                    logger.warning(
+                        "OpenViking session message write failed after reconnect; "
+                        "not replaying accepted messages: %s",
+                        retry_error,
+                    )
                 except Exception as retry_error:
-                    if (
-                        retry_client is not None
-                        and batch_messages
-                        and next_batch_index < len(batch_messages)
-                    ):
-                        logger.warning(
-                            "OpenViking structured sync retry failed; writing %d remaining "
-                            "messages individually: %s",
-                            len(batch_messages) - next_batch_index,
-                            retry_error,
-                        )
-                        try:
-                            _post_unsent_messages_individually(retry_client)
-                            return
-                        except Exception as fallback_error:
-                            logger.warning(
-                                "OpenViking sync_turn failed during individual-message "
-                                "fallback: %s",
-                                fallback_error,
-                            )
-                            return
                     logger.warning("OpenViking sync_turn failed: %s", retry_error)
 
         self._spawn_writer(sid, _sync, name="openviking-sync")
@@ -4602,7 +4885,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         OpenViking automatically extracts 6 categories of memories:
         profile, preferences, entities, events, cases, and patterns.
         """
-        if not self._ensure_client():
+        if not self._auto_commit_enabled() or not self._ensure_client():
             return
 
         # Snapshot sid + turn count atomically against a concurrent sync_turn
@@ -4653,7 +4936,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
         ``_turn_count``.
         """
         new_id = str(new_session_id or "").strip()
-        if not new_id or not self._ensure_client():
+        if not new_id:
+            return
+        auto_commit = self._auto_commit_enabled()
+        if auto_commit and not self._ensure_client():
             return
 
         rewound = bool(kwargs.get("rewound"))
@@ -4712,7 +4998,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
             return
 
         # Drain + commit the OLD session off the command thread.
-        if old_session_id:
+        if old_session_id and auto_commit:
             self._finalize_session_async(old_session_id, old_turn_count, context="on switch")
 
         logger.debug(

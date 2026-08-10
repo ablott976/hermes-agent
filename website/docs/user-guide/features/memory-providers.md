@@ -323,6 +323,27 @@ OpenViking server settings live in `ov.conf` (`--config`,
 live in `ovcli.conf` (`OPENVIKING_CLI_CONFIG_FILE` or
 `~/.openviking/ovcli.conf`).
 
+Automatic session behavior is configured in Hermes' `config.yaml`:
+
+```yaml
+memory:
+  provider: openviking
+  openviking:
+    auto_sync: true
+    auto_prefetch: true
+    auto_commit: true
+    min_commit_turns: 1
+    sync_user_char_limit: 4000
+    sync_assistant_char_limit: 4000
+```
+
+Set `auto_sync`, `auto_prefetch`, or `auto_commit` to `false` to disable that
+automatic path while keeping the explicit `viking_*` tools available. Character
+limits apply independently to each role and `min_commit_turns` delays automatic
+memory extraction until the session has enough mirrored turns. Existing
+`OPENVIKING_*` policy variables remain accepted for compatibility, but new
+behavioral configuration should use `config.yaml`.
+
 **Key features:**
 - Tiered context loading: L0 (~100 tokens) → L1 (~2k) → L2 (full)
 - Automatic memory extraction on session commit (profile, preferences, entities, events, cases, patterns)

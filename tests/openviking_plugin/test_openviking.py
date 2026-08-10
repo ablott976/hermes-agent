@@ -8,6 +8,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
+import pytest
+
 import plugins.memory.openviking as openviking_plugin
 from plugins.memory.openviking import OpenVikingMemoryProvider
 
@@ -1287,3 +1289,169 @@ class TestUnavailableWarningsPromiseRetry:
         assert client is not None
         assert client.endpoint == "https://remote.example"
         assert len(probes) == 2
+
+
+class _SessionWriteClient:
+    def __init__(self, *, mode="batch", responses=None):
+        self._endpoint = "http://openviking.test"
+        self.mode = mode
+        self.responses = list(responses or [])
+        self.calls = []
+
+    def openapi_payload(self):
+        paths = {}
+        if self.mode == "batch":
+            paths["/api/v1/sessions/{session_id}/messages/batch"] = {"post": {}}
+        elif self.mode == "single":
+            paths["/api/v1/sessions/{session_id}/messages"] = {"post": {}}
+        return {"paths": paths}
+
+    def post(self, path, payload=None, **kwargs):
+        self.calls.append((path, payload or {}))
+        response = self.responses.pop(0) if self.responses else {}
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+def _session_messages(count=2):
+    return [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "peer_id": "client" if index % 2 == 0 else "hermes",
+            "parts": [{"type": "text", "text": f"message-{index}"}],
+        }
+        for index in range(count)
+    ]
+
+
+class TestOpenVikingSessionWriteContracts:
+    def test_session_policy_reads_yaml_and_env_overrides(self, monkeypatch, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            """\
+memory:
+  provider: openviking
+  openviking:
+    auto_sync: false
+    auto_prefetch: false
+    auto_commit: false
+    min_commit_turns: 4
+    sync_user_char_limit: 120
+    sync_assistant_char_limit: 240
+""",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        for name in (
+            "OPENVIKING_AUTO_SYNC",
+            "OPENVIKING_AUTO_PREFETCH",
+            "OPENVIKING_AUTO_COMMIT",
+            "OPENVIKING_MIN_COMMIT_TURNS",
+            "OPENVIKING_SYNC_USER_CHAR_LIMIT",
+            "OPENVIKING_SYNC_ASSISTANT_CHAR_LIMIT",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+        provider = OpenVikingMemoryProvider()
+        assert provider._session_policy_config() == {
+            "auto_sync": False,
+            "auto_prefetch": False,
+            "auto_commit": False,
+            "min_commit_turns": 4,
+            "sync_user_char_limit": 120,
+            "sync_assistant_char_limit": 240,
+        }
+
+        monkeypatch.setenv("OPENVIKING_AUTO_SYNC", "true")
+        monkeypatch.setenv("OPENVIKING_MIN_COMMIT_TURNS", "2")
+        policy = provider._session_policy_config()
+        assert policy["auto_sync"] is True
+        assert policy["min_commit_turns"] == 2
+
+    def test_sync_limits_apply_independently_by_role(self):
+        messages = [
+            {"role": "user", "parts": [{"type": "text", "text": "abcdef"}]},
+            {"role": "assistant", "parts": [{"type": "text", "text": "uvwxyz"}]},
+        ]
+
+        limited = OpenVikingMemoryProvider._limit_sync_messages(
+            messages,
+            user_limit=3,
+            assistant_limit=4,
+        )
+
+        assert limited[0]["parts"][0]["text"] == "abc"
+        assert limited[1]["parts"][0]["text"] == "uvwx"
+
+    @pytest.mark.parametrize("status", [404, 405])
+    def test_batch_route_miss_falls_back_to_unsent_single_messages(self, status):
+        provider = OpenVikingMemoryProvider()
+        client = _SessionWriteClient(
+            responses=[openviking_plugin._OpenVikingHTTPError("missing", status), {}, {}]
+        )
+        messages = _session_messages()
+
+        provider._post_session_messages(cast(Any, client), "sid", messages)
+
+        assert [path for path, _ in client.calls] == [
+            "/api/v1/sessions/sid/messages/batch",
+            "/api/v1/sessions/sid/messages",
+            "/api/v1/sessions/sid/messages",
+        ]
+        assert client.calls[1][1] == messages[0]
+        assert client.calls[2][1] == messages[1]
+
+    @pytest.mark.parametrize("status", [401, 422, 500])
+    def test_non_route_batch_errors_never_fall_back_to_single_writes(self, status):
+        provider = OpenVikingMemoryProvider()
+        error = openviking_plugin._OpenVikingHTTPError("rejected", status)
+        client = _SessionWriteClient(responses=[error])
+
+        with pytest.raises(openviking_plugin._OpenVikingHTTPError) as caught:
+            provider._post_session_messages(
+                cast(Any, client), "sid", _session_messages()
+            )
+
+        assert caught.value is error
+        assert [path for path, _ in client.calls] == [
+            "/api/v1/sessions/sid/messages/batch"
+        ]
+
+    def test_retry_continues_after_last_accepted_batch_without_replay(self):
+        provider = OpenVikingMemoryProvider()
+        messages = _session_messages(openviking_plugin._SESSION_MESSAGE_BATCH_LIMIT + 1)
+        progress = [0]
+        first = _SessionWriteClient(
+            responses=[{}, openviking_plugin._OpenVikingHTTPError("temporary", 500)]
+        )
+
+        with pytest.raises(openviking_plugin._OpenVikingHTTPError):
+            provider._post_session_messages(
+                cast(Any, first), "sid", messages, progress=progress
+            )
+
+        assert progress == [openviking_plugin._SESSION_MESSAGE_BATCH_LIMIT]
+        retry = _SessionWriteClient()
+        provider._post_session_messages(
+            cast(Any, retry), "sid", messages, progress=progress
+        )
+
+        assert progress == [len(messages)]
+        assert len(retry.calls) == 1
+        assert retry.calls[0][1]["messages"] == messages[-1:]
+
+    def test_uncertain_single_write_is_not_retryable(self):
+        provider = OpenVikingMemoryProvider()
+        client = _SessionWriteClient(
+            mode="single",
+            responses=[openviking_plugin._OpenVikingHTTPError("timeout", 500)],
+        )
+
+        with pytest.raises(openviking_plugin._SessionMessageWriteError):
+            provider._post_session_messages(
+                cast(Any, client), "sid", _session_messages()
+            )
+
+        assert len(client.calls) == 1
