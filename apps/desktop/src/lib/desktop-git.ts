@@ -1,6 +1,8 @@
 import type {
+  HermesGitBaseBranch,
   HermesGitBranch,
   HermesGitWorktree,
+  HermesRepoPullRequests,
   HermesRepoStatus,
   HermesReviewList,
   HermesReviewShipInfo
@@ -58,6 +60,9 @@ const remoteGit: GitBridge = {
   branchList: async repoPath =>
     (await gitGet<{ branches: HermesGitBranch[] }>('branches', { path: repoPath })).branches,
 
+  baseBranchList: async repoPath =>
+    (await gitGet<{ branches: HermesGitBaseBranch[] }>('base-branches', { path: repoPath })).branches,
+
   repoStatus: repoPath => gitGet<HermesRepoStatus | null>('status', { path: repoPath }),
 
   fileDiff: async (repoPath, filePath) =>
@@ -88,6 +93,9 @@ const remoteGit: GitBridge = {
 
     shipInfo: repoPath => gitGet<HermesReviewShipInfo>('review/ship-info', { path: repoPath }),
 
+    prList: (repoPath, branches, numbers) =>
+      gitPost<HermesRepoPullRequests>('review/pr-list', { branches, numbers: numbers ?? [], path: repoPath }),
+
     createPr: repoPath => gitPost('review/create-pr', { path: repoPath })
   },
 
@@ -97,5 +105,9 @@ const remoteGit: GitBridge = {
 }
 
 export function desktopGit(): GitBridge | undefined {
+  if (typeof window === 'undefined') {
+    return undefined
+  }
+
   return isDesktopFsRemoteMode() ? remoteGit : window.hermesDesktop?.git
 }

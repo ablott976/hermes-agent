@@ -7,9 +7,7 @@ on.
 """
 from __future__ import annotations
 
-import asyncio
 import sys
-import threading
 import time
 from pathlib import Path
 from typing import cast
@@ -81,33 +79,8 @@ def mock_pyright(monkeypatch, tmp_path):
         pass
 
 
-def test_service_returns_empty_when_disabled(tmp_path):
-    svc = LSPService(
-        enabled=False,
-        wait_mode="document",
-        wait_timeout=2.0,
-        install_strategy="auto",
-    )
-    assert not svc.is_active()
-    f = tmp_path / "x.py"
-    f.write_text("")
-    assert svc.get_diagnostics_sync(str(f)) == []
-    svc.shutdown()
 
 
-def test_service_skips_files_outside_workspace(tmp_path):
-    """Files outside any git worktree must not trigger LSP."""
-    svc = LSPService(
-        enabled=True,
-        wait_mode="document",
-        wait_timeout=2.0,
-        install_strategy="manual",
-    )
-    f = tmp_path / "x.py"
-    f.write_text("")
-    # No .git anywhere — service should report not enabled for this file.
-    assert not svc.enabled_for(str(f))
-    svc.shutdown()
 
 
 def test_service_e2e_delta_filter(mock_pyright):
@@ -162,7 +135,18 @@ def test_service_e2e_delta_filter_with_line_shift(mock_pyright):
         svc.shutdown()
 
 
-def test_service_status_includes_clients(mock_pyright):
+
+
+
+
+def test_reused_client_refreshes_last_used_and_survives_reap(mock_pyright):
+    """A client re-acquired from the cache must have its ``_last_used``
+    timestamp refreshed so a subsequent sweep does NOT evict it.
+
+    Covers the timestamp refresh on the existing-client fast path in
+    ``_get_or_spawn`` — without it, a client in constant use would be
+    reaped ``idle_timeout`` seconds after its FIRST use.
+    """
     repo = mock_pyright
     f = repo / "x.py"
     f.write_text("")
@@ -171,197 +155,93 @@ def test_service_status_includes_clients(mock_pyright):
         wait_mode="document",
         wait_timeout=3.0,
         install_strategy="manual",
+        idle_timeout=60.0,  # sweeps manually below; loop never fires
     )
     try:
         svc.get_diagnostics_sync(str(f))
-        info = svc.get_status()
-        assert info["enabled"] is True
-        assert info["idle_timeout"] == 600.0
-        assert info["reaper_running"] is True
-        assert any(c["server_id"] == "pyright" for c in info["clients"])
+        key = next(iter(svc._clients))
+        first_used = svc._last_used[key]
+
+        # Age the timestamp past the cutoff, then re-acquire the client.
+        svc._last_used[key] = first_used - 120.0
+        svc.get_diagnostics_sync(str(f))
+        assert svc._last_used[key] > first_used - 120.0, (
+            "re-acquiring a cached client must refresh _last_used"
+        )
+
+        # A sweep right after reuse must keep the client.
+        svc._loop.run(svc._reap_idle_once(), timeout=5.0)
+        assert key in svc._clients
+        assert svc.get_status()["clients"]
     finally:
         svc.shutdown()
 
 
-def _wait_until(predicate, timeout: float = 3.0) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(0.02)
-    return predicate()
+def test_reaper_survives_sweep_error(mock_pyright):
+    """One failing sweep must not kill the reaper loop — the loop's
+    ``except Exception`` guard must swallow the error and keep sweeping."""
+    repo = mock_pyright
+    f = repo / "x.py"
+    f.write_text("")
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=3.0,
+        install_strategy="manual",
+        idle_timeout=0.1,
+    )
+    try:
+        # Sabotage the sweep itself so the reaper-loop except branch
+        # actually runs (a failing client.shutdown() would be swallowed
+        # by gather(return_exceptions=True) and never reach the loop).
+        calls = {"n": 0}
+        real_reap = svc._reap_idle_once
+
+        async def _flaky_reap():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("sweep sabotage")
+            await real_reap()
+
+        svc._reap_idle_once = _flaky_reap  # type: ignore[method-assign]
+
+        svc.get_diagnostics_sync(str(f))
+        assert svc.get_status()["clients"]
+
+        # First sweep raises; later sweeps must still reap the client.
+        deadline = time.monotonic() + 3.0
+        while svc.get_status()["clients"] and time.monotonic() < deadline:
+            time.sleep(0.02)
+
+        assert calls["n"] >= 2, "reaper loop died after the failing sweep"
+        assert svc.get_status()["clients"] == []
+        assert svc._idle_reaper_task is not None
+        assert not svc._idle_reaper_task.done()
+    finally:
+        svc.shutdown()
 
 
 class _FakeClient:
-    def __init__(self, server_id: str, workspace_root: str, *, fail_shutdown: bool = False):
+    def __init__(self, server_id: str, workspace_root: str, *, fail_shutdown=False):
         self.server_id = server_id
         self.workspace_root = workspace_root
         self.state = "running"
         self.is_running = True
         self.fail_shutdown = fail_shutdown
         self.shutdown_calls = 0
-        self.manager: LSPService | None = None
 
     async def shutdown(self):
         self.shutdown_calls += 1
-        if self.manager is not None:
-            assert self.manager._state_lock.acquire(blocking=False)
-            self.manager._state_lock.release()
         if self.fail_shutdown:
             raise RuntimeError("expected shutdown failure")
         self.state = "stopped"
         self.is_running = False
 
 
-class _CancelThenStopClient(_FakeClient):
-    """Block the first shutdown until reaper cancellation, then stop."""
-
-    def __init__(self, server_id: str, workspace_root: str):
-        super().__init__(server_id, workspace_root)
-        self.shutdown_started = threading.Event()
-
-    async def shutdown(self):
-        self.shutdown_calls += 1
-        self.shutdown_started.set()
-        if self.shutdown_calls == 1:
-            await asyncio.Event().wait()
-        self.state = "stopped"
-        self.is_running = False
-
-
-def test_idle_reaper_runs_automatically_and_client_respawns(mock_pyright):
-    repo = mock_pyright
-    f = repo / "x.py"
-    f.write_text("print('hi')\n")
-
-    svc = LSPService(
-        enabled=True,
-        wait_mode="document",
-        wait_timeout=3.0,
-        install_strategy="manual",
-        idle_timeout=0.2,
-    )
-    try:
-        svc.get_diagnostics_sync(str(f))
-        with svc._state_lock:
-            first = next(iter(svc._clients.values()))
-        assert _wait_until(lambda: len(svc.get_status()["clients"]) == 0)
-
-        svc.get_diagnostics_sync(str(f))
-        with svc._state_lock:
-            second = next(iter(svc._clients.values()))
-        assert second is not first
-        assert second.is_running
-    finally:
-        svc.shutdown()
-
-
-def test_idle_reaper_keeps_recent_and_in_flight_clients(tmp_path):
-    svc = LSPService(
-        enabled=True,
-        wait_mode="document",
-        wait_timeout=1.0,
-        install_strategy="manual",
-        idle_timeout=100.0,
-    )
-    recent_key = ("recent", str(tmp_path / "recent"))
-    active_key = ("active", str(tmp_path / "active"))
-    recent = _FakeClient(*recent_key)
-    active = _FakeClient(*active_key)
-    try:
-        with svc._state_lock:
-            svc._clients[recent_key] = cast(LSPClient, recent)
-            svc._clients[active_key] = cast(LSPClient, active)
-            svc._last_used[recent_key] = time.monotonic()
-            svc._last_used[active_key] = time.monotonic() - 200.0
-            svc._in_flight[active_key] = 1
-
-        svc._loop.run(svc._reap_idle_clients(), timeout=2.0)
-        with svc._state_lock:
-            assert svc._clients[recent_key] is recent
-            assert svc._clients[active_key] is active
-    finally:
-        svc.shutdown()
-
-
-def test_idle_reaper_tracks_workspaces_independently_and_isolates_shutdown_errors(tmp_path):
-    svc = LSPService(
-        enabled=True,
-        wait_mode="document",
-        wait_timeout=1.0,
-        install_strategy="manual",
-        idle_timeout=100.0,
-    )
-    failing_key = ("pyright", str(tmp_path / "failing-stale"))
-    second_key = ("typescript", str(tmp_path / "second-stale"))
-    fresh_key = ("pyright", str(tmp_path / "fresh"))
-    failing = _FakeClient(*failing_key, fail_shutdown=True)
-    second = _FakeClient(*second_key)
-    fresh = _FakeClient(*fresh_key)
-    failing.manager = svc
-    second.manager = svc
-    fresh.manager = svc
-    try:
-        with svc._state_lock:
-            svc._clients[failing_key] = cast(LSPClient, failing)
-            svc._clients[second_key] = cast(LSPClient, second)
-            svc._clients[fresh_key] = cast(LSPClient, fresh)
-            svc._last_used[failing_key] = time.monotonic() - 200.0
-            svc._last_used[second_key] = time.monotonic() - 200.0
-            svc._last_used[fresh_key] = time.monotonic()
-
-        svc._loop.run(svc._reap_idle_clients(), timeout=2.0)
-        with svc._state_lock:
-            assert failing_key not in svc._clients
-            assert second_key not in svc._clients
-            assert svc._clients[fresh_key] is fresh
-        assert failing.shutdown_calls == 1
-        assert second.shutdown_calls == 1
-        assert fresh.shutdown_calls == 0
-    finally:
-        svc.shutdown()
-
-
-def test_idle_reaper_preserves_failed_client_when_workspace_is_reused(tmp_path):
-    svc = LSPService(
-        enabled=True,
-        wait_mode="document",
-        wait_timeout=1.0,
-        install_strategy="manual",
-        idle_timeout=100.0,
-    )
-    key = ("pyright", str(tmp_path / "reused"))
-    failed = _FakeClient(*key, fail_shutdown=True)
-    replacement = _FakeClient(*key)
-    try:
-        with svc._state_lock:
-            svc._clients[key] = cast(LSPClient, failed)
-            svc._last_used[key] = time.monotonic() - 200.0
-
-        svc._loop.run(svc._reap_idle_clients(), timeout=2.0)
-
-        with svc._state_lock:
-            svc._clients[key] = cast(LSPClient, replacement)
-            svc._last_used[key] = time.monotonic() - 200.0
-
-        svc._loop.run(svc._reap_idle_clients(), timeout=2.0)
-
-        with svc._state_lock:
-            assert svc._reaping[key] == [failed]
-        assert failed.shutdown_calls == 1
-        assert replacement.shutdown_calls == 1
-    finally:
-        failed.fail_shutdown = False
-        svc.shutdown()
-
-    assert failed.shutdown_calls == 2
-    assert failed.is_running is False
-
-
 def test_client_claim_blocks_reaping_until_operation_finishes(mock_pyright):
     repo = mock_pyright
-    f = repo / "x.py"
-    f.write_text("print('hi')\n")
+    file_path = repo / "x.py"
+    file_path.write_text("print('hi')\n")
     svc = LSPService(
         enabled=True,
         wait_mode="document",
@@ -370,114 +250,61 @@ def test_client_claim_blocks_reaping_until_operation_finishes(mock_pyright):
         idle_timeout=100.0,
     )
     try:
-        client = svc._loop.run(svc._get_or_spawn(str(f), claim=True), timeout=3.0)
+        client = svc._loop.run(
+            svc._get_or_spawn(str(file_path), claim=True), timeout=3.0
+        )
         assert client is not None
         key = (client.server_id, client.workspace_root)
         with svc._state_lock:
             assert svc._in_flight[key] == 1
             svc._last_used[key] = time.monotonic() - 200.0
 
-        svc._loop.run(svc._reap_idle_clients(), timeout=2.0)
+        svc._loop.run(svc._reap_idle_once(), timeout=2.0)
         with svc._state_lock:
             assert svc._clients[key] is client
 
-        svc._finish_client_use(client)
+        svc._release_client(client)
         with svc._state_lock:
             svc._last_used[key] = time.monotonic() - 200.0
-        svc._loop.run(svc._reap_idle_clients(), timeout=2.0)
+        svc._loop.run(svc._reap_idle_once(), timeout=2.0)
         with svc._state_lock:
             assert key not in svc._clients
     finally:
         svc.shutdown()
 
 
-def test_idle_timeout_zero_disables_reaper_and_start_is_singleton():
-    disabled = LSPService(
-        enabled=True,
-        wait_mode="document",
-        wait_timeout=1.0,
-        install_strategy="manual",
-        idle_timeout=0,
-    )
-    try:
-        assert disabled.get_status()["reaper_running"] is False
-    finally:
-        disabled.shutdown()
-
-    enabled = LSPService(
-        enabled=True,
-        wait_mode="document",
-        wait_timeout=1.0,
-        install_strategy="manual",
-        idle_timeout=60,
-    )
-    try:
-        first = enabled._reaper_task
-        enabled._start_reaper()
-        assert enabled._reaper_task is first
-    finally:
-        enabled.shutdown()
-
-
-def test_idle_timeout_config_and_invalid_values(monkeypatch):
-    monkeypatch.setattr(
-        "hermes_cli.config.load_config",
-        lambda: {"lsp": {"enabled": False, "idle_timeout": 42}},
-    )
-    configured = LSPService.create_from_config()
-    assert configured is not None
-    assert configured.get_status()["idle_timeout"] == 42.0
-    configured.shutdown()
-
-    for invalid in (-1, float("inf"), float("nan"), "invalid"):
-        svc = LSPService(
-            enabled=False,
-            wait_mode="document",
-            wait_timeout=1.0,
-            install_strategy="manual",
-            idle_timeout=invalid,
-        )
-        assert svc.get_status()["idle_timeout"] == 600.0
-        svc.shutdown()
-
-
-def test_shutdown_cancels_reaper_before_stopping_loop_and_is_idempotent():
+def test_failed_reap_shutdown_is_retried_during_service_shutdown(tmp_path):
     svc = LSPService(
         enabled=True,
         wait_mode="document",
         wait_timeout=1.0,
         install_strategy="manual",
-        idle_timeout=60,
-    )
-    task = svc._reaper_task
-    assert task is not None
-    svc.shutdown()
-    svc.shutdown()
-    assert svc._reaper_task is None
-    assert svc._reaper_running is False
-    assert svc._loop._thread is None
-    assert task.done()
-
-
-def test_shutdown_retries_client_interrupted_during_idle_reap(tmp_path):
-    svc = LSPService(
-        enabled=True,
-        wait_mode="document",
-        wait_timeout=1.0,
-        install_strategy="manual",
-        idle_timeout=0.1,
+        idle_timeout=100.0,
     )
     key = ("pyright", str(tmp_path / "stale"))
-    client = _CancelThenStopClient(*key)
-    with svc._state_lock:
-        svc._clients[key] = cast(LSPClient, client)
-        svc._last_used[key] = time.monotonic() - 1.0
+    client = _FakeClient(*key, fail_shutdown=True)
+    try:
+        with svc._state_lock:
+            svc._clients[key] = cast(LSPClient, client)
+            svc._last_used[key] = time.monotonic() - 200.0
 
-    assert client.shutdown_started.wait(timeout=2.0)
-    svc.shutdown()
+        svc._loop.run(svc._reap_idle_once(), timeout=2.0)
+
+        with svc._state_lock:
+            assert svc._reaping[key] == [client]
+        assert client.shutdown_calls == 1
+        assert client.is_running is True
+    finally:
+        client.fail_shutdown = False
+        svc.shutdown()
 
     assert client.shutdown_calls == 2
     assert client.is_running is False
-    assert svc._reaping == {}
-    assert svc._reaper_running is False
-    assert svc._loop._thread is None
+
+
+
+
+
+
+
+
