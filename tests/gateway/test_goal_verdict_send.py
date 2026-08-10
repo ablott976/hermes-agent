@@ -153,3 +153,183 @@ async def test_goal_verdict_budget_exhausted_sends_pause(hermes_home):
     assert not adapter._pending_messages
 
 
+# Historical runtime regressions preserved during the upstream port.
+
+from unittest.mock import AsyncMock, MagicMock, patch
+
+
+@pytest.mark.asyncio
+async def test_goal_budget_rollover_is_deferred_until_fifo_head(hermes_home):
+    runner, adapter, session_entry, src = _make_runner_with_adapter()
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager, load_goal
+
+    runner._goal_max_turns_from_config = lambda: 2
+    runner._goal_auto_rollover_from_config = lambda: True
+    runner._goal_repeat_checkpoint_limit_from_config = lambda: 3
+
+    mgr = GoalManager(session_entry.session_id, default_max_turns=2)
+    state = mgr.set("continue across a fresh root", max_turns=2)
+    state.turns_used = 1
+    goals.save_goal(session_entry.session_id, state)
+
+    with patch(
+        "hermes_cli.goals.judge_goal",
+        return_value=("continue", "more work", False, None, False),
+    ):
+        await runner._post_turn_goal_continuation(
+            session_entry=session_entry,
+            source=src,
+            final_response="first slice completed; inspect the repository next",
+        )
+        await asyncio.sleep(0.05)
+
+    # A normal user event already ahead of this marker remains on the old root;
+    # migration happens only when the marker is actually consumed.
+    assert load_goal("fresh-goal-session") is None
+    original = load_goal(session_entry.session_id)
+    assert original is not None and original.status == "active"
+    pending = next(iter(adapter._pending_messages.values()))
+    assert pending.metadata["goal_session_rollover"] is True
+    assert pending.metadata["goal_rollover_from_session_id"] == session_entry.session_id
+    assert "gateway_session_id" not in pending.metadata
+
+
+@pytest.mark.asyncio
+async def test_user_stop_before_rollover_marker_cancels_fresh_session(hermes_home):
+    runner, _adapter, session_entry, src = _make_runner_with_adapter()
+    from hermes_cli.goals import GoalManager, clear_goal
+
+    class _Store:
+        def __init__(self):
+            self.created = 0
+
+        def get_or_create_session(self, source, force_new=False):
+            self.created += 1
+            raise AssertionError("rollover must not create a session after user stop")
+
+    runner.session_store = _Store()
+    GoalManager(session_entry.session_id).set("stop before rollover")
+    # This represents /goal stop being handled by the FIFO before its marker.
+    clear_goal(session_entry.session_id)
+
+    result = await runner._rollover_goal_at_fifo_head(
+        old_session_id=session_entry.session_id,
+        session_key=session_entry.session_key,
+        source=src,
+    )
+    assert result is None
+    assert runner.session_store.created == 0
+
+
+@pytest.mark.asyncio
+async def test_goal_rollover_at_fifo_head_migrates_state(hermes_home):
+    runner, _adapter, session_entry, src = _make_runner_with_adapter()
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager, load_goal
+
+    class _Store:
+        def __init__(self):
+            self.new_entry = SessionEntry(
+                session_key=session_entry.session_key,
+                session_id="fresh-goal-session",
+                created_at=session_entry.created_at,
+                updated_at=session_entry.updated_at,
+                platform=Platform.TELEGRAM,
+                chat_type="dm",
+            )
+
+        def get_or_create_session(self, source, force_new=False):
+            assert force_new is True
+            return self.new_entry
+
+        def switch_session(self, session_key, target_session_id):
+            return self.new_entry
+
+    runner.session_store = _Store()
+    state = GoalManager(session_entry.session_id, default_max_turns=2).set(
+        "continue across a fresh root",
+        max_turns=2,
+    )
+    state.turns_used = 2
+    state.checkpoint = "first slice completed; inspect the repository next"
+    goals.save_goal(session_entry.session_id, state)
+
+    child = await runner._rollover_goal_at_fifo_head(
+        old_session_id=session_entry.session_id,
+        session_key=session_entry.session_key,
+        source=src,
+    )
+    assert child is not None
+    migrated = load_goal("fresh-goal-session")
+    assert migrated is not None
+    assert migrated.status == "active"
+    assert migrated.turns_used == 0
+    assert migrated.rollovers_used == 1
+    assert migrated.checkpoint.startswith("first slice completed")
+
+
+@pytest.mark.asyncio
+async def test_top_level_rollover_marker_migrates_before_agent_turn(hermes_home):
+    """A FIFO marker drained as a fresh event must rotate before agent startup."""
+    runner, _adapter, session_entry, src = _make_runner_with_adapter()
+    fresh_entry = SessionEntry(
+        session_key=session_entry.session_key,
+        session_id="fresh-goal-session",
+        created_at=session_entry.created_at,
+        updated_at=session_entry.updated_at,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner._rollover_goal_at_fifo_head = AsyncMock(return_value=fresh_entry)
+    from gateway.run import MessageEvent, MessageType
+
+    marker = MessageEvent(
+        text="Continue the active goal from its checkpoint.",
+        message_type=MessageType.TEXT,
+        source=src,
+        metadata={
+            "goal_session_rollover": True,
+            "goal_rollover_from_session_id": session_entry.session_id,
+        },
+    )
+
+    entry = await runner._consume_goal_rollover_marker(
+        marker,
+        session_entry=session_entry,
+        source=src,
+    )
+
+    assert entry is fresh_entry
+    runner._rollover_goal_at_fifo_head.assert_awaited_once_with(
+        old_session_id=session_entry.session_id,
+        session_key=session_entry.session_key,
+        source=src,
+    )
+
+
+@pytest.mark.asyncio
+async def test_goal_rollover_marker_rejects_a_stale_root(hermes_home):
+    """A marker must never revive a goal after the session has moved on."""
+    runner, _adapter, session_entry, src = _make_runner_with_adapter()
+    runner._rollover_goal_at_fifo_head = AsyncMock()
+    from gateway.run import MessageEvent, MessageType
+
+    marker = MessageEvent(
+        text="Continue the active goal from its checkpoint.",
+        message_type=MessageType.TEXT,
+        source=src,
+        metadata={
+            "goal_session_rollover": True,
+            "goal_rollover_from_session_id": "superseded-session",
+        },
+    )
+
+    entry = await runner._consume_goal_rollover_marker(
+        marker,
+        session_entry=session_entry,
+        source=src,
+    )
+
+    assert entry is None
+    runner._rollover_goal_at_fifo_head.assert_not_awaited()

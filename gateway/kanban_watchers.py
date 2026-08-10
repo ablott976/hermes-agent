@@ -14,15 +14,35 @@ import asyncio
 import logging
 import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.i18n import t
+from agent.progress_copy import (
+    DEFAULT_HUMAN_PROGRESS_TEXT,
+    DEFAULT_HUMAN_PROGRESS_TITLE,
+    sanitize_human_progress_text,
+)
 
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+_KANBAN_PROGRESS_SEND_TIMEOUT_SECONDS = 15.0
+_KANBAN_PROGRESS_GUARD_BUSY_TIMEOUT_MS = 5_000
+_KANBAN_PROGRESS_GUARD_HOLD_SECONDS = _KANBAN_PROGRESS_SEND_TIMEOUT_SECONDS + 2.0
+
+
+class _KanbanProgressDeliveryGuard:
+    """Cross-thread handle for a board write transaction held during send."""
+
+    def __init__(self) -> None:
+        self.ready = threading.Event()
+        self.release = threading.Event()
+        self.status = "error"
+        self.thread: Optional[threading.Thread] = None
 
 
 def _resolve_auto_decompose_settings(
@@ -171,7 +191,13 @@ class GatewayKanbanWatchersMixin:
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected")
+        TERMINAL_KINDS = (
+            "completed", "blocked", "gave_up", "crashed", "timed_out",
+            "status", "archived", "unblocked", "block_loop_detected",
+            # Silent control boundaries: claiming these before progress drops
+            # every older update from a reclaimed run.
+            "reclaimed", "stale", "reconciled",
+        )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -335,6 +361,9 @@ class GatewayKanbanWatchersMixin:
                                             sub.get("task_id"), platform or "<missing>",
                                         )
                                         continue
+                                    # Terminal/status/reclaim transitions win. Their
+                                    # claim advances past older progress so it can
+                                    # never appear after a run has ended.
                                     old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
                                         conn,
                                         task_id=sub["task_id"],
@@ -344,8 +373,34 @@ class GatewayKanbanWatchersMixin:
                                         kinds=TERMINAL_KINDS,
                                     )
                                     if not events:
-                                        continue
+                                        old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
+                                            conn,
+                                            task_id=sub["task_id"],
+                                            platform=sub["platform"],
+                                            chat_id=sub["chat_id"],
+                                            thread_id=sub.get("thread_id") or "",
+                                            kinds=("progress",),
+                                        )
+                                        if not events:
+                                            continue
                                     task = _kb.get_task(conn, sub["task_id"])
+                                    if events[0].kind == "progress":
+                                        if not task or task.status != "running":
+                                            # Keep the cursor advanced: stale
+                                            # progress is intentionally discarded.
+                                            continue
+                                        current_run_id = getattr(task, "current_run_id", None)
+                                        current_progress = [
+                                            ev for ev in events
+                                            if ev.run_id is not None
+                                            and current_run_id is not None
+                                            and int(ev.run_id) == int(current_run_id)
+                                        ]
+                                        if not current_progress:
+                                            continue
+                                        # Newer progress supersedes older events
+                                        # claimed in the same watcher tick.
+                                        events = [current_progress[-1]]
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -421,12 +476,32 @@ class GatewayKanbanWatchersMixin:
                     )
                     for ev in d["events"]:
                         kind = ev.kind
+                        if kind != "progress":
+                            self._forget_kanban_progress_message(
+                                sub, ev.run_id, board_slug,
+                            )
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
-                        if kind == "completed":
+                        if kind == "progress":
+                            raw_progress = ""
+                            if ev.payload and ev.payload.get("text"):
+                                raw_progress = str(ev.payload["text"])
+                            progress = sanitize_human_progress_text(raw_progress)
+                            if not progress:
+                                progress = DEFAULT_HUMAN_PROGRESS_TEXT
+                            progress_title = sanitize_human_progress_text(
+                                title,
+                                max_chars=120,
+                            )
+                            if not progress_title:
+                                progress_title = DEFAULT_HUMAN_PROGRESS_TITLE
+                            # Deliberately omit task ids, board/profile names,
+                            # and all implementation metadata.
+                            msg = f"Kanban update\n{progress_title}\n{progress}"
+                        elif kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to
@@ -542,10 +617,53 @@ class GatewayKanbanWatchersMixin:
                             # so the counter is resolved (reset or bumped) by
                             # the self-post outcome, not by skipping the send.
                             continue
-                        try:
-                            _send_res = await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
+                        progress_guard = None
+                        if kind == "progress":
+                            guard_status, progress_guard = (
+                                await self._kanban_open_progress_delivery_guard(
+                                    sub,
+                                    ev.run_id,
+                                    board_slug,
+                                )
                             )
+                            if guard_status == "error":
+                                # Fail closed on a lock problem, preserving
+                                # retry by undoing this claim.
+                                await asyncio.to_thread(
+                                    self._kanban_rewind,
+                                    sub,
+                                    d["cursor"],
+                                    d.get("old_cursor", 0),
+                                    board_slug,
+                                )
+                                break
+                            if guard_status != "current":
+                                # A terminal/reclaim transition won the lock.
+                                # Leave this stale progress discarded.
+                                continue
+                        try:
+                            try:
+                                if kind == "progress":
+                                    _send_res = await asyncio.wait_for(
+                                        self._deliver_kanban_progress(
+                                            adapter=adapter,
+                                            sub=sub,
+                                            message=msg,
+                                            metadata=metadata,
+                                            run_id=ev.run_id,
+                                            board=board_slug,
+                                        ),
+                                        timeout=_KANBAN_PROGRESS_SEND_TIMEOUT_SECONDS,
+                                    )
+                                else:
+                                    _send_res = await adapter.send(
+                                        sub["chat_id"], msg, metadata=metadata,
+                                    )
+                            finally:
+                                if progress_guard is not None:
+                                    await self._kanban_close_progress_delivery_guard(
+                                        progress_guard
+                                    )
                             # A SendResult(success=False) without an exception
                             # (returned by push-capable adapters on a genuine
                             # transient failure) must count as a FAILED
@@ -856,6 +974,174 @@ class GatewayKanbanWatchersMixin:
             )
         finally:
             conn.close()
+
+    @staticmethod
+    def _kanban_progress_message_key(
+        sub: dict,
+        run_id: Optional[int],
+        board: Optional[str],
+    ) -> tuple[str, str, str, str, str, int]:
+        return (
+            str(board or ""),
+            str(sub.get("task_id") or ""),
+            str(sub.get("platform") or ""),
+            str(sub.get("chat_id") or ""),
+            str(sub.get("thread_id") or ""),
+            int(run_id or 0),
+        )
+
+    def _forget_kanban_progress_message(
+        self,
+        sub: dict,
+        run_id: Optional[int],
+        board: Optional[str],
+    ) -> None:
+        messages = getattr(self, "_kanban_progress_messages", None)
+        if not isinstance(messages, dict):
+            return
+        if run_id is not None:
+            messages.pop(
+                self._kanban_progress_message_key(sub, run_id, board),
+                None,
+            )
+            return
+        prefix = self._kanban_progress_message_key(sub, 0, board)[:-1]
+        for key in list(messages):
+            if key[:-1] == prefix:
+                messages.pop(key, None)
+
+    async def _deliver_kanban_progress(
+        self,
+        *,
+        adapter: Any,
+        sub: dict,
+        message: str,
+        metadata: dict,
+        run_id: Optional[int],
+        board: Optional[str],
+    ) -> Any:
+        """Edit this run's prior progress bubble, or send a new fallback."""
+        messages = getattr(self, "_kanban_progress_messages", None)
+        if not isinstance(messages, dict):
+            messages = {}
+            self._kanban_progress_messages = messages
+        key = self._kanban_progress_message_key(sub, run_id, board)
+        previous_message_id = messages.get(key)
+        can_edit = bool(
+            previous_message_id
+            and getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)
+            and callable(getattr(adapter, "edit_message", None))
+        )
+        if can_edit:
+            try:
+                result = await adapter.edit_message(
+                    sub["chat_id"],
+                    previous_message_id,
+                    message,
+                )
+            except Exception:
+                logger.debug(
+                    "kanban progress edit failed; falling back to send",
+                    exc_info=True,
+                )
+            else:
+                if getattr(result, "success", True) is not False:
+                    return result
+
+        result = await adapter.send(
+            sub["chat_id"],
+            message,
+            metadata=metadata,
+        )
+        if getattr(result, "success", True) is not False:
+            message_id = getattr(result, "message_id", None)
+            if message_id:
+                messages[key] = str(message_id)
+        return result
+
+    async def _kanban_open_progress_delivery_guard(
+        self,
+        sub: dict,
+        event_run_id: Optional[int],
+        board: Optional[str] = None,
+    ) -> tuple[str, Optional[_KanbanProgressDeliveryGuard]]:
+        """Serialize a progress send with terminal/reclaim board writes."""
+        from hermes_cli import kanban_db as _kb
+
+        guard = _KanbanProgressDeliveryGuard()
+
+        def _hold_board_write_lock() -> None:
+            conn = None
+            try:
+                conn = _kb.connect(board=board)
+                conn.execute(
+                    f"PRAGMA busy_timeout={_KANBAN_PROGRESS_GUARD_BUSY_TIMEOUT_MS}"
+                )
+                conn.execute("BEGIN IMMEDIATE")
+                if guard.release.is_set():
+                    return
+                task = _kb.get_task(conn, sub["task_id"])
+                current_run_id = getattr(task, "current_run_id", None) if task else None
+                if (
+                    not task
+                    or task.status != "running"
+                    or event_run_id is None
+                    or current_run_id is None
+                    or int(event_run_id) != int(current_run_id)
+                ):
+                    guard.status = "stale"
+                    return
+                guard.status = "current"
+                guard.ready.set()
+                # Bound the lock lifetime even if gateway cancellation wedges
+                # the coroutine before its finally block can release us.
+                guard.release.wait(_KANBAN_PROGRESS_GUARD_HOLD_SECONDS)
+            except Exception:
+                logger.debug("kanban progress delivery guard failed", exc_info=True)
+                guard.status = "error"
+            finally:
+                guard.ready.set()
+                if conn is not None:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    conn.close()
+
+        guard.thread = threading.Thread(
+            target=_hold_board_write_lock,
+            name="kanban-progress-delivery-guard",
+            daemon=True,
+        )
+        try:
+            guard.thread.start()
+        except Exception:
+            logger.debug("kanban progress delivery guard could not start", exc_info=True)
+            return "error", None
+        try:
+            ready = await asyncio.to_thread(
+                guard.ready.wait,
+                (_KANBAN_PROGRESS_GUARD_BUSY_TIMEOUT_MS / 1000.0) + 1.0,
+            )
+        except BaseException:
+            guard.release.set()
+            raise
+        if not ready or guard.status != "current":
+            await self._kanban_close_progress_delivery_guard(guard)
+            return (guard.status if ready else "error"), None
+        return "current", guard
+
+    async def _kanban_close_progress_delivery_guard(
+        self,
+        guard: _KanbanProgressDeliveryGuard,
+    ) -> None:
+        guard.release.set()
+        if guard.thread is not None:
+            await asyncio.to_thread(guard.thread.join, 2.0)
+            if guard.thread.is_alive():
+                logger.warning(
+                    "kanban progress delivery guard did not release promptly"
+                )
 
     async def _deliver_kanban_artifacts(
         self,

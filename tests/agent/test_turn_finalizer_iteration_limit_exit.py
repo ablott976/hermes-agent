@@ -235,3 +235,77 @@ def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch)
     assert persisted_roles == ["user", "assistant"]
 
 
+# Historical runtime regressions preserved during the upstream port.
+
+def test_empty_pending_verification_response_uses_summary_fallback(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent()
+
+    result = _finalize(
+        agent,
+        final_response=None,
+        exit_reason="unknown",
+        pending_verification_response="",
+    )
+
+    assert result["final_response"] == "summary from extra call"
+    assert result["turn_exit_reason"] == "max_iterations_reached(60/60)"
+    assert agent._handle_max_iterations_called is True
+
+
+def test_text_response_exit_not_rewritten_at_iteration_limit(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent(budget_remaining=5)
+    exit_reason = "text_response(finish_reason=stop)"
+
+    result = _finalize(
+        agent,
+        final_response="normal answer",
+        exit_reason=exit_reason,
+        api_call_count=59,
+    )
+
+    assert result["turn_exit_reason"] == exit_reason
+    assert agent._handle_max_iterations_called is False
+
+
+def test_terminal_verification_failure_is_persisted_as_one_correction(monkeypatch):
+    """When verification fails terminally (nudge present but budget exhausted),
+    the finalizer drops the synthetic nudge and the assistant candidate
+    persists as a single correction. No duplicate assistant appended. (#65919 §7)
+    """
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent()
+    report = "terminal failure correction"
+
+    result = finalize_turn(
+        agent,
+        final_response=report,
+        api_call_count=60,
+        interrupted=False,
+        failed=False,
+        messages=[
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": report},
+            # Synthetic nudge — should be dropped by _drop_verification_continuation_scaffolding.
+            {"role": "user", "content": "[System: run tests]", "_verification_stop_synthetic": True},
+        ],
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="task",
+        original_user_message="task",
+        _should_review_memory=False,
+        _turn_exit_reason="unknown",
+        _pending_verification_response=report,
+    )
+
+    # The nudge is dropped; the assistant candidate is the tail and matches
+    # final_response, so no duplicate is appended.
+    roles = [m["role"] for m in result["messages"]]
+    assert roles == ["user", "assistant"]
+    # The nudge is gone from persisted messages too.
+    assert agent.persisted_messages is not None
+    persisted_contents = [m.get("content") for m in agent.persisted_messages]
+    assert "[System: run tests]" not in persisted_contents
+    assert report in persisted_contents

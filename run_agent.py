@@ -6328,12 +6328,22 @@ class AIAgent:
     def _fire_streamed_codex_commentary(self, text: str) -> None:
         """Deliver a completed live Codex commentary message immediately."""
         cb = getattr(self, "interim_assistant_callback", None)
-        if cb is None or not isinstance(text, str):
+        capture_kanban_progress = bool(os.environ.get("HERMES_KANBAN_TASK"))
+        if (cb is None and not capture_kanban_progress) or not isinstance(text, str):
             return
         visible = self._strip_think_blocks(text).strip()
         if visible:
             visible = redact_sensitive_text(visible)
         if not visible or visible == "(empty)" or self._interim_text_was_delivered(visible):
+            return
+        if capture_kanban_progress:
+            try:
+                from tools.kanban_tools import set_current_worker_progress
+
+                set_current_worker_progress(visible)
+            except Exception:
+                logger.debug("kanban streamed progress capture failed", exc_info=True)
+        if cb is None:
             return
         try:
             cb(visible, already_streamed=False)
@@ -6354,8 +6364,11 @@ class AIAgent:
         when the only streamed text was unrelated mid-turn commentary. (#65919
         review: response-loss blocker)
         """
+        if not isinstance(assistant_msg, dict):
+            return
         cb = getattr(self, "interim_assistant_callback", None)
-        if cb is None or not isinstance(assistant_msg, dict):
+        capture_kanban_progress = bool(os.environ.get("HERMES_KANBAN_TASK"))
+        if cb is None and not capture_kanban_progress:
             return
         commentary_parts = self._extract_codex_interim_visible_parts(assistant_msg)
         undelivered_parts: List[str] = []
@@ -6380,6 +6393,15 @@ class AIAgent:
             or visible == "(empty)"
             or self._interim_text_was_delivered(visible)
         ):
+            return
+        if capture_kanban_progress:
+            try:
+                from tools.kanban_tools import set_current_worker_progress
+
+                set_current_worker_progress(visible)
+            except Exception:
+                logger.debug("kanban interim progress capture failed", exc_info=True)
+        if cb is None:
             return
         already_streamed = self._interim_content_was_streamed(visible)
         try:

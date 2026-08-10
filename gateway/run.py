@@ -5000,6 +5000,12 @@ class TurnRunner:
                     self._runner._enforce_agent_cache_cap()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, _sig)
 
+        # A goal slice is opt-in and only changes this turn's local budget.
+        # Cached agents were reset to the global cap above before this hook.
+        self._runner._apply_goal_slice_budget(
+            agent, ctx.session_id, max_iterations,
+        )
+
         # Per-message state — callbacks and reasoning config change every
         # turn and must not be baked into the cached agent constructor.
         # Gate on needs_progress_queue (tool_progress OR thinking_progress)
@@ -5756,6 +5762,7 @@ class TurnRunner:
                 "completed": result.get("completed"),
                 "interrupted": result.get("interrupted", False),
                 "interrupt_message": result.get("interrupt_message"),
+                "turn_exit_reason": result.get("turn_exit_reason"),
                 "error": result.get("error"),
                 "compression_exhausted": result.get("compression_exhausted", False),
                 "compression_deferred": result.get("compression_deferred", False),
@@ -5830,6 +5837,9 @@ class TurnRunner:
             "partial": ctx.result_holder[0].get("partial", False) if ctx.result_holder[0] else False,
             "error": ctx.result_holder[0].get("error") if ctx.result_holder[0] else None,
             "interrupt_message": ctx.result_holder[0].get("interrupt_message") if ctx.result_holder[0] else None,
+            "turn_exit_reason": (
+                ctx.result_holder[0].get("turn_exit_reason") if ctx.result_holder[0] else None
+            ),
             # Soft lock-contention defer (#69870 consumer): distinct from
             # compression_exhausted so the gateway never auto-resets a
             # session that a concurrent compressor is about to shrink.
@@ -16104,34 +16114,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "protect the transcript, this message was not processed. "
                     "Wait for the active turn to finish, then resend it."
                 )
-            # Goal continuation: after the agent returns a final response
-            # for this turn, check any standing /goal — the judge will
-            # either mark it done, pause it (budget), or enqueue a
-            # continuation prompt back through the adapter FIFO so the
-            # next turn makes more progress. Wrapped in try/except so a
-            # broken judge never breaks normal message handling.
-            try:
-                _final_text = ""
-                if isinstance(_agent_result, dict):
-                    _final_text = str(_agent_result.get("final_response") or "")
-                elif isinstance(_agent_result, str):
-                    _final_text = _agent_result
-                # Skip for empty responses (interrupted / errored) — the
-                # judge would almost always say "continue" and we'd loop
-                # on error. Let the user drive the next turn.
-                if _final_text.strip():
-                    try:
-                        session_entry = await self.async_session_store.get_or_create_session(source)
-                    except Exception:
-                        session_entry = None
-                    if session_entry is not None:
-                        await self._post_turn_goal_continuation(
-                            session_entry=session_entry,
-                            source=source,
-                            final_response=_final_text,
-                        )
-            except Exception as _goal_exc:
-                logger.debug("goal continuation hook failed: %s", _goal_exc)
             return _agent_result
         finally:
             # MoA one-shot restore must run on EVERY exit path, not just
@@ -16800,6 +16782,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if resolved_entry is None:
                 return
             session_entry = resolved_entry
+        session_entry = await self._consume_goal_rollover_marker(
+            event,
+            session_entry=session_entry,
+            source=source,
+        )
+        if session_entry is None:
+            return
+        session_key = session_entry.session_key
         self._cache_session_source(session_key, source)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             try:
@@ -18627,8 +18617,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 response = ""
 
-            # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
+            await self._handle_goal_after_agent_turn(
+                session_entry=session_entry,
+                source=source,
+                agent_result=agent_result,
+                final_response=response,
+                response_already_delivered=_already_sent,
+            )
+
+            # Auto voice reply: send TTS audio before the text response
             # Skip when streaming TTS already delivered audio for this turn (#60671).
             _stts_adapter = self._adapter_for_source(source)
             _streaming_tts_done = (
@@ -19185,13 +19183,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # ────────────────────────────────────────────────────────────────
     # /goal — persistent cross-turn goals (Ralph-style loop)
     # ────────────────────────────────────────────────────────────────
-    def _goal_max_turns_from_config(self) -> int:
-        """Resolve the configured /goal turn budget for gateway sessions.
-
-        GatewayRunner.config is a GatewayConfig dataclass, not the full
-        user config mapping. Top-level config blocks such as ``goals`` are
-        therefore only available through hermes_cli.config.load_config().
-        """
+    def _goal_config_from_config(self) -> dict:
+        """Return the current profile's ``goals`` mapping, fail-closed."""
         try:
             goals_cfg = (
                 (self.config or {}).get("goals", {})
@@ -19202,9 +19195,62 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from hermes_cli.config import load_config
 
                 goals_cfg = (load_config() or {}).get("goals") or {}
-            return int(goals_cfg.get("max_turns", 20) or 20)
+            return goals_cfg if isinstance(goals_cfg, dict) else {}
         except Exception:
+            return {}
+
+    def _goal_max_turns_from_config(self) -> int:
+        """Resolve the configured /goal continuation-turn budget."""
+        try:
+            return max(1, int(self._goal_config_from_config().get("max_turns", 20) or 20))
+        except (TypeError, ValueError):
             return 20
+
+    def _goal_slice_max_iterations_from_config(self, global_max: int) -> int:
+        """Return an opt-in per-/goal model-call cap, clamped to global max."""
+        try:
+            configured = int(
+                self._goal_config_from_config().get("max_iterations_per_turn", 0) or 0
+            )
+        except (TypeError, ValueError):
+            return 0
+        if configured <= 0 or global_max <= 0:
+            return 0
+        return min(configured, global_max)
+
+    def _goal_auto_rollover_from_config(self) -> bool:
+        value = self._goal_config_from_config().get("auto_rollover", False)
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _goal_repeat_checkpoint_limit_from_config(self) -> int:
+        try:
+            return max(1, int(
+                self._goal_config_from_config().get("repeat_checkpoint_limit", 3) or 3
+            ))
+        except (TypeError, ValueError):
+            return 3
+
+    def _apply_goal_slice_budget(
+        self, agent: Any, session_id: str, global_max_iterations: int,
+    ) -> None:
+        """Constrain only an active /goal turn; normal chats keep their cap."""
+        local_max = self._goal_slice_max_iterations_from_config(global_max_iterations)
+        if not local_max or not session_id:
+            return
+        try:
+            from hermes_cli.goals import GoalManager
+            if not GoalManager(
+                session_id=session_id,
+                default_max_turns=self._goal_max_turns_from_config(),
+            ).is_active():
+                return
+            agent.max_iterations = local_max
+            logger.info(
+                "Applying /goal slice budget %s/%s to session %s",
+                local_max, global_max_iterations, session_id,
+            )
+        except Exception as exc:
+            logger.debug("goal slice budget resolution failed: %s", exc)
 
     async def _get_goal_manager_for_event(self, event: "MessageEvent"):
         """Return a GoalManager bound to the session for this gateway event.
@@ -19342,6 +19388,80 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 getattr(result, "error", "unknown error"),
             )
 
+    @staticmethod
+    def _goal_continuation_payload(agent_result: Any) -> Optional[tuple[str, bool]]:
+        """Return ``(response_text, defer_status)`` for a safe goal boundary.
+
+        Substantive replies are judgeable. An empty reply is safe only when the
+        agent explicitly reports an ordinary iteration ceiling. Errors, partial
+        streams and user interrupts stay fail-closed to prevent retry loops.
+        """
+        if isinstance(agent_result, str):
+            return (agent_result, True) if agent_result.strip() else None
+        if not isinstance(agent_result, dict):
+            return None
+        if (
+            bool(agent_result.get("failed"))
+            or bool(agent_result.get("partial"))
+            or bool(agent_result.get("interrupted"))
+        ):
+            return None
+
+        final_text = str(agent_result.get("final_response") or "")
+        if final_text.strip():
+            return final_text, True
+
+        exit_reason = str(agent_result.get("turn_exit_reason") or "")
+        if exit_reason.startswith("max_iterations_reached("):
+            # No visible response will be delivered, so no post-delivery
+            # callback can fire for the status notice.
+            return "", False
+        return None
+
+    async def _handle_goal_after_agent_turn(
+        self,
+        *,
+        session_entry: Any,
+        source: Any,
+        agent_result: Any,
+        final_response: str,
+        response_already_delivered: bool,
+    ) -> None:
+        """Evaluate one standing goal while the adapter's turn is in-band."""
+        if not isinstance(agent_result, dict):
+            return
+        goal_result = dict(agent_result)
+        goal_result["final_response"] = final_response or ""
+        payload = self._goal_continuation_payload(goal_result)
+        if payload is None:
+            return
+        response_text, defer_status = payload
+
+        try:
+            await self._post_turn_goal_continuation(
+                session_entry=session_entry,
+                source=source,
+                final_response=response_text,
+                defer_status=(defer_status and not response_already_delivered),
+            )
+        except Exception as exc:
+            sid = str(getattr(session_entry, "session_id", "") or "")
+            logger.warning(
+                "goal continuation hook failed for session %s: %s",
+                sid or "unknown", exc, exc_info=True,
+            )
+            try:
+                if sid and self._goal_still_active_for_session(sid):
+                    await self._send_goal_status_notice(
+                        source,
+                        "⚠️ Goal remains active, but automatic continuation failed for this turn.",
+                    )
+            except Exception:
+                logger.warning(
+                    "goal continuation failure notice could not be delivered",
+                    exc_info=True,
+                )
+
     async def _defer_goal_status_notice_after_delivery(self, source: Any, message: str) -> None:
         """Send a /goal status line after the main response is delivered.
 
@@ -19385,12 +19505,143 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await _deliver()
 
+    async def _rollover_goal_session(
+        self,
+        *,
+        old_session_id: str,
+        session_key: str,
+        source: Any,
+    ) -> Any:
+        """Rotate one active goal to a fresh root at its FIFO head."""
+        old_session_id = str(old_session_id or "")
+        if not old_session_id or source is None:
+            return None
+        try:
+            new_entry = await self.async_session_store.get_or_create_session(
+                source, force_new=True,
+            )
+        except Exception as exc:
+            logger.warning("goal rollover: could not create fresh session: %s", exc)
+            return None
+        new_session_id = str(getattr(new_entry, "session_id", "") or "")
+        if not new_session_id or new_session_id == old_session_id:
+            logger.warning("goal rollover: fresh session was not created")
+            return None
+
+        is_topic_lane = (
+            getattr(source, "platform", None) == Platform.TELEGRAM
+            and getattr(source, "thread_id", None)
+            and hasattr(self, "_sync_telegram_topic_binding")
+        )
+
+        async def _restore_old_root() -> None:
+            try:
+                restored_entry = await self.async_session_store.switch_session(
+                    session_key, old_session_id,
+                )
+            except Exception as exc:
+                logger.error("goal rollover: failed to restore old session: %s", exc)
+                return
+            if is_topic_lane and restored_entry is not None:
+                try:
+                    await asyncio.to_thread(
+                        self._sync_telegram_topic_binding,
+                        source,
+                        restored_entry,
+                        reason="goal-budget-rollover-rollback",
+                    )
+                except Exception as exc:
+                    logger.error("goal rollover: failed to restore topic binding: %s", exc)
+
+        # A Telegram topic binding is a second routing source. Validate it
+        # before migrating state so a failed update cannot orphan the goal.
+        if is_topic_lane:
+            try:
+                await asyncio.to_thread(
+                    self._sync_telegram_topic_binding,
+                    source,
+                    new_entry,
+                    reason="goal-budget-rollover",
+                )
+            except Exception as exc:
+                logger.warning("goal rollover: topic binding update failed: %s", exc)
+                await _restore_old_root()
+                return None
+
+        try:
+            from hermes_cli.goals import migrate_goal_to_session
+            migrated = migrate_goal_to_session(
+                old_session_id,
+                new_session_id,
+                reason="goal-budget-rollover",
+                reset_turn_budget=True,
+            )
+        except Exception as exc:
+            logger.warning("goal rollover: state migration failed: %s", exc)
+            migrated = False
+        if not migrated:
+            await _restore_old_root()
+            return None
+        return new_entry
+
+    async def _rollover_goal_at_fifo_head(
+        self,
+        *,
+        old_session_id: str,
+        session_key: str,
+        source: Any,
+    ) -> Any:
+        """Consume a rollover marker only while its original goal is active."""
+        if not self._goal_still_active_for_session(old_session_id):
+            return None
+        return await self._rollover_goal_session(
+            old_session_id=old_session_id,
+            session_key=session_key,
+            source=source,
+        )
+
+    async def _consume_goal_rollover_marker(
+        self,
+        event: MessageEvent,
+        *,
+        session_entry: Any,
+        source: Any,
+    ) -> Any:
+        """Rotate a FIFO rollover marker before its top-level agent turn starts."""
+        metadata = getattr(event, "metadata", None) or {}
+        if not isinstance(metadata, dict) or not metadata.get("goal_session_rollover"):
+            return session_entry
+
+        old_session_id = str(getattr(session_entry, "session_id", "") or "").strip()
+        origin_session_id = str(
+            metadata.get("goal_rollover_from_session_id") or ""
+        ).strip()
+        if not old_session_id or not origin_session_id or origin_session_id != old_session_id:
+            logger.info(
+                "Discarding stale goal rollover from session %s",
+                origin_session_id or "unknown",
+            )
+            return None
+
+        new_entry = await self._rollover_goal_at_fifo_head(
+            old_session_id=old_session_id,
+            session_key=getattr(session_entry, "session_key", "") or "",
+            source=source,
+        )
+        if new_entry is None:
+            logger.info(
+                "Discarding goal rollover marker for session %s because migration was unavailable",
+                old_session_id,
+            )
+        return new_entry
+
     async def _post_turn_goal_continuation(
         self,
         *,
         session_entry: Any,
         source: Any,
         final_response: str,
+        defer_status: bool = True,
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
         enqueue a continuation prompt for the same session.
@@ -19428,6 +19679,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             final_response or "",
             user_initiated=True,
             background_processes=_bg_procs,
+            auto_rollover=self._goal_auto_rollover_from_config(),
+            repeat_checkpoint_limit=self._goal_repeat_checkpoint_limit_from_config(),
         )
         msg = decision.get("message") or ""
 
@@ -19438,9 +19691,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # an awaited post-delivery callback preserves delivery reliability
         # without reversing the user-visible ordering.
         if msg and source is not None:
-            await self._defer_goal_status_notice_after_delivery(source, msg)
+            if defer_status:
+                await self._defer_goal_status_notice_after_delivery(source, msg)
+            else:
+                await self._send_goal_status_notice(source, msg)
 
-        if not decision.get("should_continue"):
+        rollover_requested = bool(decision.get("should_rollover"))
+        if not decision.get("should_continue") and not rollover_requested:
             return
 
         prompt = decision.get("continuation_prompt") or ""
@@ -19453,16 +19710,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter = self._adapter_for_source(source)
             _quick_key = self._session_key_for_source(source)
             if adapter and _quick_key:
+                continuation_metadata = {}
+                if rollover_requested:
+                    # Marker only: migrate strictly when this event reaches the
+                    # FIFO head, after earlier real user messages.
+                    continuation_metadata["goal_session_rollover"] = True
+                    continuation_metadata["goal_rollover_from_session_id"] = sid
                 cont_event = MessageEvent(
                     text=prompt,
                     message_type=MessageType.TEXT,
                     source=source,
                     message_id=None,
                     channel_prompt=None,
+                    metadata=continuation_metadata,
                 )
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
-            logger.debug("goal continuation: enqueue failed: %s", exc)
+            logger.warning("goal continuation: enqueue failed: %s", exc, exc_info=True)
 
 
 

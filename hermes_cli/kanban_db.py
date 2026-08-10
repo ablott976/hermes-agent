@@ -7137,6 +7137,72 @@ def _defer_reclaim_for_live_worker(
         _append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
 
 
+def record_worker_progress(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    text: str,
+    expected_run_id: Optional[int],
+) -> str:
+    """Atomically append safe progress only for the active subscribed run.
+
+    The guards, persistent dedup check, and insert share one write transaction.
+    A terminal or reclaim transition therefore either happens before this call
+    (and suppresses it) or after the event is durably associated with its run.
+    """
+    progress_text = str(text or "").strip()[:600].rstrip()
+    if not progress_text:
+        return "empty"
+    if expected_run_id is None:
+        return "stale"
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return "stale"
+        if row["status"] != "running":
+            return "terminal"
+        current_run_id = row["current_run_id"]
+        if current_run_id is None or int(current_run_id) != int(expected_run_id):
+            return "stale"
+        run = conn.execute(
+            "SELECT status, ended_at FROM task_runs WHERE id = ? AND task_id = ?",
+            (int(expected_run_id), task_id),
+        ).fetchone()
+        if run is None or run["status"] != "running" or run["ended_at"] is not None:
+            return "stale"
+        if conn.execute(
+            "SELECT 1 FROM kanban_notify_subs WHERE task_id = ? LIMIT 1",
+            (task_id,),
+        ).fetchone() is None:
+            return "unsubscribed"
+
+        previous = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND run_id = ? AND kind = 'progress' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, int(expected_run_id)),
+        ).fetchone()
+        if previous is not None:
+            try:
+                previous_payload = json.loads(previous["payload"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                previous_payload = {}
+            if str(previous_payload.get("text") or "") == progress_text:
+                return "duplicate"
+
+        _append_event(
+            conn,
+            task_id,
+            "progress",
+            {"text": progress_text},
+            run_id=int(expected_run_id),
+        )
+    return "recorded"
+
+
 def heartbeat_worker(
     conn: sqlite3.Connection,
     task_id: str,

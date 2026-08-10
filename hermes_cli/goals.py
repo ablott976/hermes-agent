@@ -559,6 +559,13 @@ class GoalState:
     # 401 every call — track them separately so the loop auto-pauses instead
     # of burning every turn budget slot on an unreachable judge.
     consecutive_transport_failures: int = 0   # judge API/transport errors in a row
+    # Compact durable handoff for opt-in automatic session rollover. The
+    # fingerprint/counter are deterministic so repeated slices can stop without
+    # another model call.
+    checkpoint: str = ""
+    checkpoint_fingerprint: str = ""
+    repeated_checkpoint_count: int = 0
+    rollovers_used: int = 0
     # User-added criteria appended mid-loop via the /subgoal command.
     # When non-empty the judge prompt and continuation prompt both
     # include them so the agent works toward them and the judge factors
@@ -622,6 +629,10 @@ class GoalState:
             paused_reason=data.get("paused_reason"),
             consecutive_parse_failures=int(data.get("consecutive_parse_failures", 0) or 0),
             consecutive_transport_failures=int(data.get("consecutive_transport_failures", 0) or 0),
+            checkpoint=str(data.get("checkpoint") or ""),
+            checkpoint_fingerprint=str(data.get("checkpoint_fingerprint") or ""),
+            repeated_checkpoint_count=int(data.get("repeated_checkpoint_count", 0) or 0),
+            rollovers_used=int(data.get("rollovers_used", 0) or 0),
             subgoals=subgoals,
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
             waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
@@ -736,7 +747,13 @@ def clear_goal(session_id: str) -> None:
     save_goal(session_id, state)
 
 
-def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
+def migrate_goal_to_session(
+    old_session_id: str,
+    new_session_id: str,
+    *,
+    reason: str = "",
+    reset_turn_budget: bool = False,
+) -> bool:
     """Carry a persistent /goal from a parent session to its continuation.
 
     Context compression rotates ``session_id`` to a fresh child session,
@@ -761,6 +778,10 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
         # lineage that re-established its own goal).
         if load_goal(new_session_id) is not None:
             return False
+        if reset_turn_budget:
+            state.turns_used = 0
+            state.last_turn_at = 0.0
+            state.rollovers_used += 1
         save_goal(new_session_id, state)
         # Archive the parent's row so it isn't double-counted as active.
         clear_goal(old_session_id)
@@ -1696,6 +1717,8 @@ class GoalManager:
         *,
         user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
+        auto_rollover: bool = False,
+        repeat_checkpoint_limit: int = 3,
     ) -> Dict[str, Any]:
         """Run the judge and update state. Return a decision dict.
 
@@ -1752,28 +1775,95 @@ class GoalManager:
         state.turns_used += 1
         state.last_turn_at = time.time()
 
+        # Checkpoints are part of the opt-in rollover protocol, not a new
+        # default persistence surface. They never become synthetic instructions.
+        if auto_rollover:
+            checkpoint = _truncate(last_response or "", _JUDGE_RESPONSE_SNIPPET_CHARS)
+            fingerprint = (
+                hashlib.sha256(checkpoint.encode("utf-8", "replace")).hexdigest()
+                if checkpoint else ""
+            )
+            if fingerprint and fingerprint == state.checkpoint_fingerprint:
+                state.repeated_checkpoint_count += 1
+            else:
+                state.checkpoint_fingerprint = fingerprint
+                state.repeated_checkpoint_count = 1 if fingerprint else 0
+            state.checkpoint = checkpoint
+
+        def _slice_boundary(reason: str, *, gate_failed: bool = False) -> Optional[Dict[str, Any]]:
+            if state.turns_used < state.max_turns:
+                return None
+            try:
+                repeat_limit = max(1, int(repeat_checkpoint_limit))
+            except (TypeError, ValueError):
+                repeat_limit = 3
+            if auto_rollover and state.repeated_checkpoint_count >= repeat_limit:
+                state.status = "paused"
+                state.paused_reason = (
+                    "same checkpoint repeated "
+                    f"{state.repeated_checkpoint_count} times"
+                )
+                save_goal(self.session_id, state)
+                gate_suffix = " (a quality gate is still failing)." if gate_failed else "."
+                return {
+                    "status": "paused",
+                    "should_continue": False,
+                    "should_rollover": False,
+                    "continuation_prompt": None,
+                    "verdict": "gate_failed" if gate_failed else "continue",
+                    "reason": reason,
+                    "message": (
+                        "⏸ Goal paused — the same checkpoint repeated "
+                        f"{state.repeated_checkpoint_count} times without progress"
+                        f"{gate_suffix} Review the blocker or clear the goal before retrying."
+                    ),
+                }
+            if auto_rollover:
+                save_goal(self.session_id, state)
+                return {
+                    "status": "active",
+                    "should_continue": False,
+                    "should_rollover": True,
+                    "continuation_prompt": self.rollover_continuation_prompt(),
+                    "verdict": "gate_failed" if gate_failed else "continue",
+                    "reason": reason,
+                    "message": (
+                        "↻ Goal checkpointed"
+                        + (" with a failing quality gate" if gate_failed else "")
+                        + " — continuing in a fresh session."
+                    ),
+                }
+            state.status = "paused"
+            state.paused_reason = (
+                f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
+            )
+            save_goal(self.session_id, state)
+            gate_suffix = " (a quality gate is still failing)." if gate_failed else "."
+            return {
+                "status": "paused",
+                "should_continue": False,
+                "should_rollover": False,
+                "continuation_prompt": None,
+                "verdict": "gate_failed" if gate_failed else "continue",
+                "reason": reason,
+                "message": (
+                    f"⏸ Goal paused — {state.turns_used}/{state.max_turns} turns used"
+                    f"{gate_suffix} Use /goal resume to keep going, or /goal clear to stop."
+                ),
+            }
+
         # Quality gates run BEFORE the LLM judge: a failing gate is
         # deterministic evidence the goal is not done, so the judge call is
         # skipped entirely and the gate's output drives the next turn. Gate
         # continuations respect the same turn budget as judge continuations.
         gate_decision = self._check_gates()
         if gate_decision is not None:
-            if gate_decision.get("should_continue") and state.turns_used >= state.max_turns:
-                state.status = "paused"
-                state.paused_reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
-                save_goal(self.session_id, state)
-                return {
-                    "status": "paused",
-                    "should_continue": False,
-                    "continuation_prompt": None,
-                    "verdict": "gate_failed",
-                    "reason": gate_decision.get("reason", ""),
-                    "message": (
-                        f"⏸ Goal paused — {state.turns_used}/{state.max_turns} turns used "
-                        f"(a quality gate is still failing). "
-                        "Use /goal resume to keep going, or /goal clear to stop."
-                    ),
-                }
+            if gate_decision.get("should_continue"):
+                boundary = _slice_boundary(
+                    str(gate_decision.get("reason") or ""), gate_failed=True,
+                )
+                if boundary is not None:
+                    return boundary
             return gate_decision
 
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
@@ -1901,21 +1991,9 @@ class GoalManager:
                 ),
             }
 
-        if state.turns_used >= state.max_turns:
-            state.status = "paused"
-            state.paused_reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
-            save_goal(self.session_id, state)
-            return {
-                "status": "paused",
-                "should_continue": False,
-                "continuation_prompt": None,
-                "verdict": "continue",
-                "reason": reason,
-                "message": (
-                    f"⏸ Goal paused — {state.turns_used}/{state.max_turns} turns used. "
-                    "Use /goal resume to keep going, or /goal clear to stop."
-                ),
-            }
+        boundary = _slice_boundary(reason)
+        if boundary is not None:
+            return boundary
 
         save_goal(self.session_id, state)
         return {
@@ -1953,6 +2031,17 @@ class GoalManager:
                 subgoals_block=self._state.render_subgoals_block(),
             )
         return CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
+
+    def rollover_continuation_prompt(self) -> Optional[str]:
+        """Return a fresh-root continuation without replaying checkpoint text."""
+        prompt = self.next_continuation_prompt()
+        if not prompt:
+            return None
+        return (
+            f"{prompt}\n\n"
+            "This is a fresh bounded slice. Inspect the durable workspace or current "
+            "runtime state before acting; do not assume unfinished work is complete."
+        )
 
     def render_contract(self) -> str:
         """Public helper for the /goal show + /goal draft slash commands."""

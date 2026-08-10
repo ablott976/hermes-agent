@@ -199,3 +199,180 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
     assert adapter._pending_messages[adapter_key].text.startswith(
         "[Continuing toward your standing goal]"
     )
+
+
+# Historical runtime regressions preserved during the upstream port.
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        ({"final_response": "progress"}, ("progress", True)),
+        (
+            {
+                "final_response": "",
+                "turn_exit_reason": "max_iterations_reached(12/12)",
+                "failed": False,
+                "interrupted": False,
+            },
+            ("", False),
+        ),
+        (
+            {
+                "final_response": "",
+                "turn_exit_reason": "max_iterations_reached(12/12)",
+                "failed": True,
+            },
+            None,
+        ),
+        (
+            {
+                "final_response": "",
+                "turn_exit_reason": "max_iterations_reached(12/12)",
+                "interrupted": True,
+            },
+            None,
+        ),
+        ({"final_response": "", "turn_exit_reason": "provider_error"}, None),
+        ({"final_response": ""}, None),
+        ({"final_response": "provider failed", "failed": True}, None),
+        ({"final_response": "partial output", "partial": True}, None),
+        ({"final_response": "stopped", "interrupted": True}, None),
+    ],
+)
+def test_goal_continuation_payload_only_accepts_safe_empty_budget_boundaries(
+    result, expected
+):
+    from gateway.run import GatewayRunner
+
+    assert GatewayRunner._goal_continuation_payload(result) == expected
+
+
+@pytest.mark.asyncio
+async def test_streamed_goal_response_drains_without_returning_body_or_user_nudge(
+    hermes_home,
+):
+    """Streaming returns None from the agent handler because the body was
+    already delivered. The in-band goal hook must still enqueue before the
+    adapter reaches its pending-message drain."""
+    from datetime import datetime
+    from unittest.mock import MagicMock, patch
+    import uuid
+
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionEntry
+    from hermes_cli.goals import GoalManager
+
+    src = _slack_thread_source()
+    key = build_session_key(src)
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")},
+    )
+    runner._queued_events = {}
+    session_entry = SessionEntry(
+        session_key=key,
+        session_id=f"goal-stream-{uuid.uuid4().hex[:8]}",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.SLACK,
+        chat_type="channel",
+    )
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store._generate_session_key.return_value = key
+    adapter = _DrainProbeAdapter()
+    runner.adapters = {Platform.SLACK: adapter}
+    GoalManager(session_entry.session_id).set("ship it")
+
+    handled: list[str] = []
+
+    async def handler(event):
+        handled.append(event.text)
+        if len(handled) == 1:
+            await runner._handle_goal_after_agent_turn(
+                session_entry=session_entry,
+                source=src,
+                agent_result={
+                    "final_response": "streamed progress",
+                    "already_sent": True,
+                    "failed": False,
+                    "partial": False,
+                    "interrupted": False,
+                },
+                final_response="streamed progress",
+                response_already_delivered=True,
+            )
+        # Mirror the real streaming branch: the adapter handler receives None.
+        return None
+
+    adapter.set_message_handler(handler)
+    event = MessageEvent(text="do the thing", message_type=MessageType.TEXT, source=src)
+    with patch(
+        "hermes_cli.goals.judge_goal",
+        return_value=("continue", "still needs work", False, None, False),
+    ):
+        await adapter._process_message_background(event, key)
+        for _ in range(40):
+            if len(handled) >= 2:
+                break
+            await asyncio.sleep(0.05)
+
+    assert len(handled) == 2
+    assert handled[0] == "do the thing"
+    assert handled[1].startswith(CONTINUATION_TEXT)
+    state = GoalManager(session_entry.session_id).state
+    assert state is not None
+    assert state.turns_used == 1
+    assert any("Continuing toward goal" in message for message in adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_empty_budget_boundary_enqueues_and_sends_status_without_delivery_callback(
+    hermes_home,
+):
+    """A 12/12 turn with no final text has no main message after which a
+    deferred status callback could fire. It must announce and enqueue now."""
+    from datetime import datetime
+    from unittest.mock import MagicMock
+    import uuid
+
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionEntry
+    from hermes_cli.goals import GoalManager
+
+    src = _slack_thread_source()
+    adapter_key = build_session_key(src)
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")},
+    )
+    runner._queued_events = {}
+    session_entry = SessionEntry(
+        session_key=adapter_key,
+        session_id=f"goal-empty-{uuid.uuid4().hex[:8]}",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.SLACK,
+        chat_type="channel",
+    )
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store._generate_session_key.return_value = adapter_key
+    adapter = _DrainProbeAdapter()
+    runner.adapters = {Platform.SLACK: adapter}
+
+    GoalManager(session_entry.session_id).set("ship it")
+    await runner._post_turn_goal_continuation(
+        session_entry=session_entry,
+        source=src,
+        final_response="",
+        defer_status=False,
+    )
+
+    assert adapter_key in adapter._pending_messages
+    assert adapter._pending_messages[adapter_key].text.startswith(
+        "[Continuing toward your standing goal]"
+    )
+    assert any("Continuing toward goal" in message for message in adapter.sent)
