@@ -12,6 +12,7 @@ import asyncio
 import atexit
 import concurrent.futures
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -35,6 +36,7 @@ except ImportError:
         msvcrt = None
 from pathlib import Path
 from typing import Any, List, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -290,8 +292,80 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim
+from cron.jobs import (
+    _PERSISTENT_PROMPT_CONTRACT_VERSION,
+    SESSION_MODE_PERSISTENT,
+    advance_next_runs,
+    claim_dispatch,
+    claim_persistent_rollover,
+    claim_persistent_rollover_recovery,
+    get_due_jobs,
+    heartbeat_persistent_rollover_lease,
+    heartbeat_run_claim,
+    mark_job_run,
+    mark_persistent_prompt_contract_delivered,
+    normalize_session_mode,
+    release_persistent_rollover_lease,
+    reset_persistent_contract_fork_state,
+    reset_persistent_silence_state,
+    save_job_output,
+    set_persistent_session_state,
+)
 from cron.executions import create_execution, finish_execution, mark_execution_running
+
+
+_DEFAULT_AGENT_MAX_TURNS = 500
+_DEFAULT_PERSISTENT_MAX_TURNS = 12
+
+
+def _positive_int(value: Any, default: int) -> int:
+    """Return a positive integer or a conservative default."""
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _resolve_cron_max_iterations(job: dict, cfg: Any) -> int:
+    """Resolve the per-tick budget without widening the global agent limit."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    raw_agent_cfg = cfg.get("agent")
+    agent_cfg = raw_agent_cfg if isinstance(raw_agent_cfg, dict) else {}
+    global_limit = _positive_int(
+        agent_cfg.get("max_turns") or cfg.get("max_turns"),
+        _DEFAULT_AGENT_MAX_TURNS,
+    )
+    if (
+        normalize_session_mode(job.get("session_mode"), strict=False)
+        != SESSION_MODE_PERSISTENT
+    ):
+        return global_limit
+
+    raw_cron_cfg = cfg.get("cron")
+    cron_cfg = raw_cron_cfg if isinstance(raw_cron_cfg, dict) else {}
+    persistent_limit = _positive_int(
+        cron_cfg.get("persistent_max_turns"),
+        _DEFAULT_PERSISTENT_MAX_TURNS,
+    )
+    return min(global_limit, persistent_limit)
+
+
+def _resolve_persistent_rollover_runs(cfg: Any) -> int:
+    """Return the opt-in planned-root interval, or 0 when disabled/invalid."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    raw_cron_cfg = cfg.get("cron")
+    cron_cfg = raw_cron_cfg if isinstance(raw_cron_cfg, dict) else {}
+    raw = cron_cfg.get("persistent_rollover_runs", 0)
+    if isinstance(raw, bool):
+        return 0
+    if isinstance(raw, int):
+        return raw if raw > 0 else 0
+    if isinstance(raw, str) and re.fullmatch(r"[1-9][0-9]*", raw.strip()):
+        return int(raw.strip())
+    return 0
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -2601,8 +2675,15 @@ def _build_job_prompt(
     job: dict,
     prerun_script: Optional[tuple] = None,
     extra_prompt: Optional[str] = None,
+    *,
+    continuation: bool = False,
+    persistent_prompt_contract_migration: bool = False,
 ) -> str:
-    """Build the effective prompt for a cron job, optionally loading one or more skills first.
+    """Build a cron bootstrap/fresh prompt or a compact persistent continuation.
+
+    Persistent continuations retain their original prompt and skill bodies in
+    durable history, so only runtime data, a bounded milestone instruction, and
+    an optional one-time prompt-contract migration are appended on later ticks.
 
     Args:
         job: The cron job dict.
@@ -2615,8 +2696,12 @@ def _build_job_prompt(
             #57331 — salvaged from #57342 by @liuhao1024). Appended to the
             stored prompt under a ``## Run Context`` header for this single
             fire only — never persisted to the job definition.
+        continuation: Build the next turn without repeating the stored prompt
+            or attached skills.
+        persistent_prompt_contract_migration: Reinject bootstrap-only economy
+            guidance once for a durable root created by older code.
     """
-    user_prompt = str(job.get("prompt") or "")
+    user_prompt = "" if continuation else str(job.get("prompt") or "")
     if extra_prompt:
         user_prompt = f"{user_prompt}\n\n## Run Context\n{extra_prompt}"
     prompt = user_prompt
@@ -2716,8 +2801,52 @@ def _build_job_prompt(
         prompt = f"{notepad_section}{prompt}"
         has_injected_data = True
 
-    # Always prepend cron execution guidance so the agent knows how
-    # delivery works and can suppress delivery when appropriate.
+    persistent_tick_hint = ""
+    persistent_bootstrap_hint = ""
+    if (
+        normalize_session_mode(job.get("session_mode"), strict=False)
+        == SESSION_MODE_PERSISTENT
+    ):
+        persistent_tick_hint = (
+            "[PERSISTENT TICK CONTRACT: Execute exactly one bounded milestone "
+            "from the current plan or handoff, then stop. Read only the current "
+            "state and file ranges needed for that milestone, and rerun checks "
+            "only when their source fingerprint changed. Keep any configured hot "
+            "state current-only and archive history outside it. Before responding, "
+            "update the existing checkpoint; do not invent a new state file. End "
+            "with a compact changed/checks/next_action/blockers handoff.]\n\n"
+        )
+        persistent_bootstrap_hint = (
+            "[PERSISTENT CONTEXT ECONOMY: Keep this job prompt stable. Mutable "
+            "phase, SHA, PR, checkpoint, and next-action values belong only in "
+            "durable state. Keep hot state as a current snapshot (target 5-10 KB, "
+            "never above 20 KB); archive append-only history outside the default "
+            "read path. Read large plans, registries, and logs by relevant range. "
+            "Do not repeat a green check when neither its source fingerprint nor "
+            "environment changed. Preload only indispensable skills and toolsets.]\n\n"
+        )
+
+    if continuation:
+        continuation_hint = (
+            "[CRON CONTINUATION: Resume the same task from the exact point where "
+            "the previous turn ended; do not restate or reconstruct the full plan. "
+            "Your final response is delivered automatically. If there is genuinely "
+            'nothing new to report, respond with exactly "[SILENT]".]\n\n'
+        )
+        prompt = continuation_hint + prompt
+        if persistent_tick_hint:
+            if persistent_prompt_contract_migration:
+                prompt += "\n\n" + persistent_bootstrap_hint
+            prompt += "\n\n" + persistent_tick_hint
+        return _scan_assembled_cron_prompt(
+            prompt,
+            job,
+            has_skills=False,
+            has_injected_data=has_injected_data,
+            user_prompt=user_prompt,
+        )
+
+    # Bootstrap/fresh runs receive the complete delivery contract.
     cron_hint = (
         "[IMPORTANT: You are running as a scheduled cron job. "
         "DELIVERY: Your final response will be automatically delivered "
@@ -2730,6 +2859,8 @@ def _build_job_prompt(
         "findings normally, or say [SILENT] and nothing more.]\n\n"
     )
     prompt = cron_hint + prompt
+    if persistent_tick_hint:
+        prompt += "\n\n" + persistent_bootstrap_hint + persistent_tick_hint
     if skills is None:
         legacy = job.get("skill")
         skills = [legacy] if legacy else []
@@ -2906,6 +3037,382 @@ def _scan_assembled_cron_prompt(
         )
         raise CronPromptInjectionBlocked(scan_error)
     return assembled
+
+
+def _canonical_digest(value: Any) -> str:
+    """Return a stable digest without persisting sensitive contract material."""
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _base_url_contract(value: Any) -> str:
+    """Keep routing identity while excluding URL credentials and query data."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = urlsplit(text)
+        host = parsed.hostname or ""
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        netloc = host
+        if parsed.port is not None:
+            netloc = f"{netloc}:{parsed.port}"
+        return urlunsplit((parsed.scheme.lower(), netloc, parsed.path, "", ""))
+    except (TypeError, ValueError):
+        return "[invalid-url]"
+
+
+def _persistent_skill_contract(job: dict) -> list[dict[str, Any]]:
+    """Fingerprint configured skill identities/availability, not their bodies."""
+    skills = job.get("skills")
+    if skills is None:
+        skills = [job.get("skill")] if job.get("skill") else []
+    elif isinstance(skills, str):
+        skills = [skills]
+
+    contract: list[dict[str, Any]] = []
+    if not skills:
+        return contract
+
+    from agent.skill_bundles import (
+        build_bundle_invocation_message,
+        resolve_bundle_command_key,
+    )
+    from agent.skill_utils import normalize_skill_lookup_name
+    from tools.skills_tool import skill_view
+
+    for raw_name in skills:
+        name = str(raw_name or "").strip()
+        if not name:
+            continue
+        identity = name
+        state = "missing"
+        bundle_members: dict[str, list[str]] = {}
+        try:
+            bundle_key = resolve_bundle_command_key(name.lstrip("/"))
+            if bundle_key:
+                identity = f"bundle:{bundle_key}"
+                bundle_payload = build_bundle_invocation_message(
+                    bundle_key,
+                    user_instruction="",
+                    task_id=str(job.get("id") or "") or None,
+                    return_member_ids=True,
+                )
+                if bundle_payload:
+                    state = "bundle"
+                    _, loaded_names, missing_names = bundle_payload
+                    bundle_members = {
+                        "loaded": [str(member) for member in loaded_names],
+                        "missing": [str(member) for member in missing_names],
+                    }
+            else:
+                identity = normalize_skill_lookup_name(name)
+                loaded = json.loads(skill_view(identity))
+                if loaded.get("success"):
+                    state = "skill"
+        except Exception:
+            logger.warning(
+                "Could not fingerprint configured cron skill %s for job %s",
+                name,
+                job.get("id") or "<unknown>",
+                exc_info=True,
+            )
+            state = "error"
+        contract.append({"name": identity, "state": state, **bundle_members})
+    return contract
+
+
+def _persistent_tool_contract(tools: Any) -> list[dict[str, Any]]:
+    """Return the semantic tool contract used for replay compatibility."""
+    contract: list[dict[str, Any]] = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        function = function if isinstance(function, dict) else {}
+        name = str(function.get("name") or tool.get("name") or "").strip()
+        if not name:
+            continue
+        parameters = function.get("parameters")
+        if not isinstance(parameters, dict):
+            parameters = {}
+        contract.append({
+            "name": name,
+            "parameters": parameters,
+            "strict": bool(function.get("strict", False)),
+        })
+    return sorted(contract, key=lambda item: (item["name"], _canonical_digest(item)))
+
+
+def _persistent_runtime_contract(
+    job: dict,
+    agent: Any,
+    workdir: Optional[str],
+) -> dict[str, Any]:
+    """Build a component-digest map for persistent replay compatibility."""
+    context_from = job.get("context_from")
+    if isinstance(context_from, str):
+        context_from = [context_from]
+
+    system_parts: dict[str, Any] = {}
+    build_parts = getattr(agent, "_build_system_prompt_parts", None)
+    if callable(build_parts):
+        try:
+            built = build_parts(None)
+            if isinstance(built, dict):
+                system_parts = {
+                    "stable": str(built.get("stable") or ""),
+                    "context": str(built.get("context") or ""),
+                }
+        except Exception:
+            logger.warning(
+                "Could not build runtime-contract prompt parts for persistent cron job %s",
+                job.get("id") or "<unknown>",
+                exc_info=True,
+            )
+            system_parts = {"state": "error"}
+
+    raw_components = {
+        "prompt": str(job.get("prompt") or ""),
+        "skills": _persistent_skill_contract(job),
+        "script": str(job.get("script") or ""),
+        "context_from": [str(item) for item in (context_from or [])],
+        "model": str(getattr(agent, "model", "") or ""),
+        "provider": str(getattr(agent, "provider", "") or ""),
+        "base_url": _base_url_contract(getattr(agent, "base_url", "")),
+        "api_mode": str(getattr(agent, "api_mode", "") or ""),
+        "system_contract": system_parts,
+        "tool_contract": _persistent_tool_contract(getattr(agent, "tools", None) or []),
+        "workdir": str(workdir or ""),
+    }
+    return {
+        "version": 4,
+        **{name: _canonical_digest(value) for name, value in raw_components.items()},
+    }
+
+
+def _persistent_runtime_fingerprint(job: dict, agent: Any, workdir: Optional[str]) -> str:
+    """Hash the non-secret persistent runtime component map."""
+    return _canonical_digest(_persistent_runtime_contract(job, agent, workdir))
+
+
+def _load_persistent_cron_history(session_db: Any, root_session_id: str):
+    """Resolve, sanitize, and rewind an interrupted persistent conversation."""
+    if not session_db or not root_session_id:
+        return None, []
+    try:
+        tip_session_id = session_db.resolve_resume_session_id(root_session_id)
+        if not tip_session_id or not session_db.get_session(tip_session_id):
+            return None, []
+        history = session_db.get_messages_as_conversation(tip_session_id) or []
+        from agent.replay_cleanup import sanitize_replay_history
+
+        history = list(sanitize_replay_history(history))
+        while history and history[-1].get("role") == "user":
+            recent_users = session_db.list_recent_user_messages(tip_session_id, limit=1)
+            if not recent_users or recent_users[0].get("id") is None:
+                raise RuntimeError(
+                    "Could not identify the unanswered persistent cron user tail"
+                )
+            logger.warning(
+                "Persistent cron session %s had an unanswered user tail; "
+                "soft-deleting it before resume",
+                tip_session_id,
+            )
+            rewind = session_db.rewind_to_message(
+                tip_session_id,
+                recent_users[0]["id"],
+            )
+            if int(rewind.get("rewound_count") or 0) < 1:
+                raise RuntimeError(
+                    "Could not soft-delete the unanswered persistent cron user tail"
+                )
+            history = session_db.get_messages_as_conversation(tip_session_id) or []
+            history = list(sanitize_replay_history(history))
+        return tip_session_id, history
+    except Exception:
+        logger.warning(
+            "Could not restore persistent cron session root %s",
+            root_session_id,
+            exc_info=True,
+        )
+        return None, []
+
+
+def _persistent_cron_title(session_db: Any, root_session_id: str, title_base: str) -> str:
+    """Build a stable title that remains unique across controlled forks."""
+    created = None
+    try:
+        row = session_db.get_session(root_session_id) if session_db else None
+        started_at = row.get("started_at") if isinstance(row, dict) else None
+        if started_at is not None:
+            created = datetime.fromtimestamp(float(started_at), tz=_hermes_now().tzinfo)
+    except (TypeError, ValueError, OSError):
+        created = None
+    if created is None:
+        match = re.search(r"_(\d{8})_(\d{6})(?:_|$)", root_session_id or "")
+        if match:
+            try:
+                created = datetime.strptime(
+                    "".join(match.groups()), "%Y%m%d%H%M%S"
+                ).replace(tzinfo=_hermes_now().tzinfo)
+            except ValueError:
+                created = None
+    if created is None:
+        return f"{title_base} · continuing"
+    milliseconds = created.microsecond // 1000
+    return (
+        f"{title_base} · continuing since "
+        f"{created.strftime('%b %d %H:%M:%S')}.{milliseconds:03d}"
+    )
+
+
+def _persistent_workspace_progress_snapshot(
+    job: dict,
+    *,
+    session_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Capture conservative scheduler-owned evidence of durable progress."""
+    if (
+        normalize_session_mode(job.get("session_mode"), strict=False)
+        != SESSION_MODE_PERSISTENT
+    ):
+        return None
+    session_id = str(session_id or job.get("session_root_id") or "").strip()
+    raw_workdir = str(job.get("workdir") or "").strip()
+    if not session_id or not raw_workdir:
+        return None
+    workdir = Path(raw_workdir).expanduser()
+    if not workdir.is_dir():
+        return None
+
+    try:
+        head_result = subprocess.run(
+            ["git", "-C", str(workdir), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            creationflags=windows_hide_flags(),
+        )
+        if head_result.returncode != 0:
+            return None
+        head = head_result.stdout.strip()
+        if not head:
+            return None
+
+        from agent.verification_evidence import verification_status
+        from agent.verification_stop import _filter_verifiable_paths
+
+        status = verification_status(session_id=session_id, cwd=workdir)
+        changed_paths = sorted({
+            str(path) for path in (status.get("changed_paths") or []) if str(path)
+        })
+        verifiable_paths = sorted(set(_filter_verifiable_paths(changed_paths)))
+        verifiable_stats: list[tuple[str, int | None, int | None]] = []
+        for raw_path in verifiable_paths:
+            path = Path(raw_path)
+            if not path.is_absolute():
+                path = workdir / path
+            try:
+                file_stat = path.stat()
+                verifiable_stats.append((
+                    raw_path,
+                    int(file_stat.st_size),
+                    int(file_stat.st_mtime_ns),
+                ))
+            except OSError:
+                verifiable_stats.append((raw_path, None, None))
+
+        evidence = status.get("evidence")
+        if isinstance(evidence, dict):
+            evidence_token = tuple(
+                evidence.get(field)
+                for field in (
+                    "id",
+                    "created_at",
+                    "canonical_command",
+                    "kind",
+                    "scope",
+                    "status",
+                    "exit_code",
+                )
+            )
+        else:
+            evidence_token = None
+
+        check_sidecars: list[tuple[str, int, int]] = []
+        plans_dir = workdir / ".hermes" / "plans"
+        if plans_dir.is_dir():
+            for sidecar in sorted(plans_dir.glob("*.check-cache.json")):
+                try:
+                    sidecar_stat = sidecar.stat()
+                except OSError:
+                    continue
+                check_sidecars.append((
+                    sidecar.name,
+                    int(sidecar_stat.st_size),
+                    int(sidecar_stat.st_mtime_ns),
+                ))
+
+        fingerprint = _canonical_digest({
+            "head": head,
+            "verification_event": evidence_token,
+            "verifiable_paths": verifiable_stats,
+            "check_sidecars": check_sidecars,
+        })
+        def _local_agent_path(raw_path: str) -> bool:
+            path = Path(raw_path)
+            try:
+                relative = path.resolve().relative_to(workdir.resolve()) if path.is_absolute() else path
+            except (OSError, ValueError):
+                return False
+            return bool(relative.parts and relative.parts[0] == ".hermes")
+
+        local_artifact_only = bool(changed_paths) and all(
+            _local_agent_path(path) for path in changed_paths
+        )
+        return {
+            "fingerprint": fingerprint,
+            "local_artifact_edit": (
+                str(status.get("last_edit_at") or "") if local_artifact_only else ""
+            ),
+        }
+    except Exception:
+        logger.debug(
+            "Job '%s': persistent progress snapshot unavailable",
+            job.get("id", "?"),
+            exc_info=True,
+        )
+        return None
+
+
+def _record_persistent_progress_delta(
+    run_metadata: dict[str, Any],
+    before: dict[str, Any] | None,
+    after: dict[str, Any] | None,
+) -> None:
+    """Attach a conservative progress decision to scheduler-owned metadata."""
+    if before is None or after is None or run_metadata.get("planned_rollover") is True:
+        return
+    run_metadata["meaningful_progress"] = before.get("fingerprint") != after.get(
+        "fingerprint"
+    )
+    run_metadata["local_artifact_only_write"] = bool(
+        after.get("local_artifact_edit")
+        and after.get("local_artifact_edit") != before.get("local_artifact_edit")
+    )
+
+
+def _new_cron_session_id(job_id: str, *, persistent: bool = False) -> str:
+    base = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    return f"{base}_{uuid.uuid4().hex[:8]}" if persistent else base
 
 
 def _guard_job_credential_exfil(job: dict) -> None:
@@ -3096,11 +3603,14 @@ def _preflight_check_skills(job: dict) -> Optional[str]:
     if not skill_names:
         return None
 
+    from agent.skill_utils import normalize_skill_lookup_name
     from tools.skills_tool import skill_view
 
     for skill_name in skill_names:
         try:
-            payload = json.loads(skill_view(skill_name))
+            payload = json.loads(
+                skill_view(normalize_skill_lookup_name(skill_name))
+            )
         except Exception:
             continue  # unreadable/missing skill → existing skip handling
         if not isinstance(payload, dict) or not payload.get("success"):
@@ -3168,6 +3678,7 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None,
     extra_prompt: Optional[str] = None,
+    run_metadata: Optional[dict[str, Any]] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -3406,7 +3917,6 @@ def run_job(
                 )
         if _session_db_timeout is None:
             try:
-                from hermes_cli.config import load_config
                 _cfg = load_config() or {}
                 _cron_cfg = _cfg.get("cron", {}) if isinstance(_cfg, dict) else {}
                 _configured = _cron_cfg.get("session_db_timeout_seconds")
@@ -3442,6 +3952,191 @@ def run_job(
     except Exception as e:
         logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
 
+    def _close_early_session_store() -> None:
+        if _session_db is None:
+            return
+        try:
+            _session_db.close()
+        except Exception:
+            logger.debug(
+                "Job '%s': failed to close early session store", job_id, exc_info=True
+            )
+
+    _session_mode = normalize_session_mode(job.get("session_mode"), strict=False)
+    _persistent_job = _session_mode == SESSION_MODE_PERSISTENT
+    if run_metadata is not None:
+        run_metadata.clear()
+        run_metadata.update({"persistent": _persistent_job, "agent_ran": False})
+    _persistent_root = str(job.get("session_root_id") or "").strip()
+    _stored_runtime_fingerprint = str(
+        job.get("session_runtime_fingerprint") or ""
+    ).strip()
+    _stored_runtime_contract = job.get("session_runtime_contract")
+    if not isinstance(_stored_runtime_contract, dict):
+        _stored_runtime_contract = None
+    _contract_update_token = str(
+        job.get("persistent_contract_update_pending") or ""
+    )
+    _rollover_lease_owner = ""
+
+    def _release_rollover_lease_if_owned() -> None:
+        nonlocal _rollover_lease_owner
+        if not _rollover_lease_owner:
+            return
+        owner = _rollover_lease_owner
+        _rollover_lease_owner = ""
+        if not release_persistent_rollover_lease(job_id, expected_owner=owner):
+            logger.warning(
+                "Job '%s': rollover lease was no longer owned at teardown",
+                job_id,
+            )
+
+    if _persistent_job:
+        try:
+            _successful_runs = max(
+                0, int(job.get("persistent_successful_runs") or 0)
+            )
+        except (TypeError, ValueError):
+            _successful_runs = 0
+        try:
+            _rollover_checkpoint = max(
+                0, int(job.get("persistent_rollover_checkpoint") or 0)
+            )
+        except (TypeError, ValueError):
+            _rollover_checkpoint = 0
+        _rollover_lease = job.get("persistent_rollover_lease")
+        _rollover_lease = _rollover_lease if isinstance(_rollover_lease, dict) else {}
+        _snapshot_rollover_owner = str(_rollover_lease.get("owner") or "").strip()
+        _pending_rollover_recovery = bool(
+            _successful_runs > 0
+            and _rollover_checkpoint == _successful_runs
+            and (_snapshot_rollover_owner or _contract_update_token)
+        )
+        if _pending_rollover_recovery:
+            _recovery = claim_persistent_rollover_recovery(
+                job_id,
+                expected_successful_runs=_successful_runs,
+                expected_owner=_snapshot_rollover_owner,
+            )
+            if _recovery is None:
+                raise RuntimeError(
+                    "Persistent cron job disappeared before rollover recovery"
+                )
+            _recovery_status = _recovery.get("_persistent_rollover_recovery")
+            if _recovery_status != "applied":
+                logger.info(
+                    "Job '%s': planned rollover bootstrap is owned by another "
+                    "runner; deferring without a model call (status=%s)",
+                    job_id,
+                    _recovery_status,
+                )
+                if run_metadata is not None:
+                    run_metadata["deferred"] = True
+                _close_early_session_store()
+                return True, "", SILENT_MARKER, None
+            job = _recovery
+            _rollover_lease_owner = str(
+                job.get("_persistent_rollover_owner") or ""
+            ).strip()
+            _persistent_root = str(job.get("session_root_id") or "").strip()
+            _stored_runtime_fingerprint = str(
+                job.get("session_runtime_fingerprint") or ""
+            ).strip()
+            _stored_runtime_contract = job.get("session_runtime_contract")
+            if not isinstance(_stored_runtime_contract, dict):
+                _stored_runtime_contract = None
+            _contract_update_token = str(
+                job.get("persistent_contract_update_pending") or ""
+            )
+            if run_metadata is not None:
+                run_metadata["planned_rollover"] = True
+        elif _persistent_root:
+            try:
+                _rollover_cfg = load_config() or {}
+            except Exception:
+                _rollover_cfg = {}
+            _rollover_runs = _resolve_persistent_rollover_runs(_rollover_cfg)
+            _rollover_due = bool(
+                _rollover_runs
+                and _successful_runs > 0
+                and _successful_runs % _rollover_runs == 0
+                and _rollover_checkpoint != _successful_runs
+            )
+            if _rollover_due:
+                _claimed_rollover = claim_persistent_rollover(
+                    job_id,
+                    expected_root_id=_persistent_root,
+                    expected_successful_runs=_successful_runs,
+                    rollover_runs=_rollover_runs,
+                )
+                if _claimed_rollover is None:
+                    raise RuntimeError(
+                        "Persistent cron job disappeared before rollover could be claimed"
+                    )
+                _claim_status = _claimed_rollover.get("_persistent_rollover_claim")
+                if _claim_status == "stale":
+                    logger.info(
+                        "Job '%s': planned rollover was claimed by a newer runner; "
+                        "deferring without a model call",
+                        job_id,
+                    )
+                    if run_metadata is not None:
+                        run_metadata["deferred"] = True
+                    _close_early_session_store()
+                    return True, "", SILENT_MARKER, None
+                if _claim_status == "applied":
+                    job = _claimed_rollover
+                    _rollover_lease_owner = str(
+                        job.get("_persistent_rollover_owner") or ""
+                    ).strip()
+                    _persistent_root = ""
+                    _stored_runtime_fingerprint = str(
+                        job.get("session_runtime_fingerprint") or ""
+                    ).strip()
+                    _stored_runtime_contract = job.get("session_runtime_contract")
+                    if not isinstance(_stored_runtime_contract, dict):
+                        _stored_runtime_contract = None
+                    _contract_update_token = str(
+                        job.get("persistent_contract_update_pending") or ""
+                    )
+                    if run_metadata is not None:
+                        run_metadata["planned_rollover"] = True
+                    logger.info(
+                        "Job '%s': claimed planned persistent rollover after %d "
+                        "successful runs; bootstrapping one bounded root",
+                        job_id,
+                        _successful_runs,
+                    )
+
+    try:
+        _prompt_contract_version = max(
+            0, int(job.get("persistent_prompt_contract_version") or 0)
+        )
+    except (TypeError, ValueError):
+        _prompt_contract_version = 0
+    _needs_prompt_contract_migration = bool(
+        _persistent_job
+        and _prompt_contract_version < _PERSISTENT_PROMPT_CONTRACT_VERSION
+    )
+    _persistent_resume_matched = False
+    _persistent_tip = None
+    _conversation_history: list[dict[str, Any]] = []
+    if _persistent_job:
+        if _session_db is None:
+            error_msg = "Persistent cron sessions require the SQLite session store"
+            logger.error("Job '%s': %s", job_id, error_msg)
+            _release_rollover_lease_if_owned()
+            return False, "", "", error_msg
+        if _persistent_root:
+            try:
+                _persistent_tip, _conversation_history = _load_persistent_cron_history(
+                    _session_db, _persistent_root
+                )
+            except BaseException:
+                _release_rollover_lease_if_owned()
+                raise
+    _resume_persistent_turn = bool(_persistent_tip and _conversation_history)
+
     # Wake-gate: if this job has a pre-check script, run it BEFORE building
     # the prompt so a ``{"wakeAgent": false}`` response can short-circuit
     # the whole agent run. We pass the result into _build_job_prompt so
@@ -3462,12 +4157,27 @@ def run_job(
                 f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 "Script gate returned `wakeAgent=false` — agent skipped.\n"
             )
+            _close_early_session_store()
+            _release_rollover_lease_if_owned()
             return True, silent_doc, SILENT_MARKER, None
 
     try:
-        prompt = _build_job_prompt(
-            job, prerun_script=prerun_script, extra_prompt=extra_prompt
-        )
+        if _resume_persistent_turn:
+            prompt = _build_job_prompt(
+                job,
+                prerun_script=prerun_script,
+                extra_prompt=extra_prompt,
+                continuation=True,
+                persistent_prompt_contract_migration=(
+                    _needs_prompt_contract_migration
+                ),
+            )
+        else:
+            prompt = _build_job_prompt(
+                job,
+                prerun_script=prerun_script,
+                extra_prompt=extra_prompt,
+            )
     except CronPromptInjectionBlocked as block_exc:
         # Assembled prompt (user prompt + loaded skill content) tripped the
         # injection scanner. Refuse to run the agent this tick and surface
@@ -3490,13 +4200,25 @@ def run_job(
             "and the match is a false positive, rephrase the content to avoid "
             "the threat pattern (`tools/cronjob_tools.py::_CRON_THREAT_PATTERNS`)."
         )
+        _close_early_session_store()
+        _release_rollover_lease_if_owned()
         return False, blocked_doc, "", str(block_exc)
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
+        _close_early_session_store()
+        _release_rollover_lease_if_owned()
         return True, "", SILENT_MARKER, None
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    _cron_session_id = _persistent_tip or _new_cron_session_id(
+        job_id, persistent=_persistent_job
+    )
 
-    logger.info("Running job '%s' (ID: %s)", job_name, job_id)
+    logger.info(
+        "Running job '%s' (ID: %s, session_mode=%s, resume=%s)",
+        job_name,
+        job_id,
+        _session_mode,
+        bool(_persistent_tip),
+    )
     logger.info("Prompt: %s", prompt[:100])
 
     agent = None
@@ -3795,8 +4517,15 @@ def run_job(
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 500
+        # Persistent jobs advance one bounded milestone per tick instead of
+        # inheriting a profile-wide budget large enough to finish the plan.
+        max_iterations = _resolve_cron_max_iterations(job, _cfg)
+        if _persistent_job:
+            logger.info(
+                "Persistent cron tick budget job=%s max_iterations=%d",
+                job_id,
+                max_iterations,
+            )
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
@@ -4112,7 +4841,138 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
-        
+
+        # Persistent cron already has a bounded tick contract and no live user
+        # to approve auxiliary memory/skill review model calls.
+        setattr(agent, "_memory_nudge_interval", 0)
+        setattr(agent, "_skill_nudge_interval", 0)
+
+        if _persistent_job:
+            assert _session_db is not None  # guarded before prompt construction
+            _runtime_contract = _persistent_runtime_contract(
+                job, agent, _job_workdir
+            )
+            _runtime_fingerprint = _canonical_digest(_runtime_contract)
+            _contract_matches = bool(
+                _resume_persistent_turn
+                and _stored_runtime_fingerprint
+                and _stored_runtime_fingerprint == _runtime_fingerprint
+            )
+            if _contract_matches:
+                _persistent_resume_matched = True
+                _session_db.reopen_session(_cron_session_id)
+                logger.info(
+                    "Job '%s': resuming persistent session tip %s with %d messages",
+                    job_id,
+                    _cron_session_id,
+                    len(_conversation_history),
+                )
+                setattr(agent, "session_id", _cron_session_id)
+                if _stored_runtime_contract is None:
+                    migrated = set_persistent_session_state(
+                        job_id,
+                        _persistent_root,
+                        _runtime_fingerprint,
+                        runtime_contract=_runtime_contract,
+                        contract_update_token=_contract_update_token,
+                        preserve_fork_budget=bool(_rollover_lease_owner),
+                    )
+                    if migrated and not migrated.get(
+                        "_persistent_state_write_applied", True
+                    ):
+                        return True, "", SILENT_MARKER, None
+            else:
+                if _stored_runtime_contract is None:
+                    changed_components = ["legacy_or_missing_component_map"]
+                else:
+                    changed_components = sorted(
+                        name
+                        for name in set(_stored_runtime_contract)
+                        | set(_runtime_contract)
+                        if name != "version"
+                        and _stored_runtime_contract.get(name)
+                        != _runtime_contract.get(name)
+                    )
+                if _persistent_root:
+                    logger.warning(
+                        "Job '%s': starting a new persistent root because the "
+                        "conversation contract changed or prior state was incomplete; "
+                        "changed_components=%s",
+                        job_id,
+                        changed_components,
+                    )
+                if _persistent_tip:
+                    _cron_session_id = _new_cron_session_id(
+                        job_id, persistent=True
+                    )
+                    setattr(agent, "session_id", _cron_session_id)
+                _conversation_history = []
+                # The compact prompt was built optimistically before provider
+                # and tools were known. A drift fork bootstraps the new contract
+                # with the original prompt and skill bodies exactly once.
+                if _resume_persistent_turn:
+                    prompt = _build_job_prompt(
+                        job,
+                        prerun_script=prerun_script,
+                        extra_prompt=extra_prompt,
+                        continuation=False,
+                    )
+                    if prompt is None:
+                        return True, "", SILENT_MARKER, None
+                persisted = set_persistent_session_state(
+                    job_id,
+                    _cron_session_id,
+                    _runtime_fingerprint,
+                    runtime_contract=_runtime_contract,
+                    unexpected_fork=bool(
+                        _persistent_root
+                        and _stored_runtime_fingerprint
+                        and (
+                            not _resume_persistent_turn
+                            or _stored_runtime_fingerprint
+                            != _runtime_fingerprint
+                        )
+                    ),
+                    contract_update_token=_contract_update_token,
+                    preserve_fork_budget=bool(_rollover_lease_owner),
+                )
+                if persisted is None:
+                    raise RuntimeError(
+                        "Persistent cron job disappeared before session state could be saved"
+                    )
+                if not persisted.get("_persistent_state_write_applied", True):
+                    logger.info(
+                        "Job '%s': contract update changed during dispatch; "
+                        "deferring to the next tick",
+                        job_id,
+                    )
+                    if run_metadata is not None:
+                        run_metadata["deferred"] = True
+                    return True, "", SILENT_MARKER, None
+                if not persisted.get("enabled", True) and (
+                    "contract changed"
+                    in str(persisted.get("paused_reason") or "").lower()
+                ):
+                    pause_message = (
+                        "Cron pausado automáticamente: el contrato de la "
+                        "conversación cambió en dos ticks consecutivos. No se "
+                        "inició otro bootstrap."
+                    )
+                    return True, pause_message, pause_message, None
+                _persistent_root = str(
+                    persisted.get("session_root_id") or _cron_session_id
+                )
+                _stored_runtime_fingerprint = _runtime_fingerprint
+
+        _progress_before = (
+            _persistent_workspace_progress_snapshot(
+                job,
+                session_id=str(getattr(agent, "session_id", "") or ""),
+            )
+            if _persistent_job and run_metadata is not None
+            else None
+        )
+
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
@@ -4140,6 +5000,7 @@ def run_job(
             str(_run_claim.get("by") or "") if isinstance(_run_claim, dict) else ""
         )
         _last_claim_heartbeat = time.monotonic()
+        _last_rollover_heartbeat = time.monotonic()
 
         def _heartbeat_run_claim_if_due():
             nonlocal _last_claim_heartbeat
@@ -4156,6 +5017,33 @@ def run_job(
                     "Job '%s': run_claim heartbeat failed", job_name, exc_info=True
                 )
 
+        def _heartbeat_rollover_lease_if_due() -> None:
+            nonlocal _last_rollover_heartbeat
+            if not _rollover_lease_owner:
+                return
+            _mono = time.monotonic()
+            if _mono - _last_rollover_heartbeat < _RUN_CLAIM_HEARTBEAT_SECONDS:
+                return
+            _last_rollover_heartbeat = _mono
+            if not heartbeat_persistent_rollover_lease(
+                job_id, expected_owner=_rollover_lease_owner
+            ):
+                request_hard_interrupt(agent, "Persistent rollover lease was lost")
+                raise RuntimeError(
+                    "Persistent rollover lease was lost before the tick completed"
+                )
+
+        if _rollover_lease_owner:
+            # Recheck ownership at the final trust boundary so a lease that
+            # expired during setup cannot produce a duplicate model call.
+            if not heartbeat_persistent_rollover_lease(
+                job_id, expected_owner=_rollover_lease_owner
+            ):
+                raise RuntimeError(
+                    "Persistent rollover lease was lost before model execution"
+                )
+            _last_rollover_heartbeat = time.monotonic()
+
         _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Preserve scheduler-scoped ContextVar state (for example skill-declared
         # env passthrough registrations) when the cron run hops into the worker
@@ -4164,13 +5052,26 @@ def run_job(
         # Tag this fire and time the run_conversation call for the usage_audit.jsonl entry.
         _audit_fire_id = uuid.uuid4().hex
         _audit_t_start = time.monotonic()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        if _conversation_history:
+            _cron_future = _cron_pool.submit(
+                _cron_context.run,
+                agent.run_conversation,
+                prompt,
+                None,
+                _conversation_history,
+            )
+        else:
+            # Preserve the historical single-argument call for fresh/bootstrap
+            # runs and lightweight fake agents.
+            _cron_future = _cron_pool.submit(
+                _cron_context.run, agent.run_conversation, prompt
+            )
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:
-                # Unlimited — no inactivity watchdog, but a one-shot still
-                # needs its run_claim heartbeat, so poll instead of blocking.
-                if _is_oneshot:
+                # Unlimited — no inactivity watchdog, but durable claims still
+                # need heartbeats, so poll whenever either claim is active.
+                if _is_oneshot or _rollover_lease_owner:
                     result = None
                     while True:
                         done, _ = concurrent.futures.wait(
@@ -4180,6 +5081,7 @@ def run_job(
                             result = _cron_future.result()
                             break
                         _heartbeat_run_claim_if_due()
+                        _heartbeat_rollover_lease_if_due()
                 else:
                     result = _cron_future.result()
             else:
@@ -4192,6 +5094,7 @@ def run_job(
                         result = _cron_future.result()
                         break
                     _heartbeat_run_claim_if_due()
+                    _heartbeat_rollover_lease_if_due()
                     # Agent still running — check inactivity.
                     _idle_secs = 0.0
                     if hasattr(agent, "get_activity_summary"):
@@ -4322,6 +5225,64 @@ def run_job(
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
+
+        tick_usage = ""
+        if _persistent_job:
+            elapsed_seconds = max(0.0, time.monotonic() - _audit_t_start)
+            result_messages = result.get("messages")
+            if not isinstance(result_messages, list):
+                result_messages = []
+            new_messages = result_messages[len(_conversation_history) :]
+            if "turn_tool_calls" in result:
+                tool_calls = int(result.get("turn_tool_calls") or 0)
+            else:
+                tool_calls = sum(
+                    len(message.get("tool_calls") or [])
+                    for message in new_messages
+                    if isinstance(message, dict)
+                )
+            tick_usage = (
+                "\n## Tick usage\n\n"
+                f"- Input: {int(result.get('input_tokens') or 0):,}\n"
+                f"- Cache read: {int(result.get('cache_read_tokens') or 0):,}\n"
+                f"- Output: {int(result.get('output_tokens') or 0):,}\n"
+                f"- Model calls: {int(result.get('api_calls') or 0):,}\n"
+                f"- Tool calls: {tool_calls:,}\n"
+                f"- Elapsed: {elapsed_seconds:.1f}s\n"
+            )
+            logger.info(
+                "Persistent cron tick usage job=%s input=%s cache_read=%s "
+                "output=%s model_calls=%s tool_calls=%s elapsed=%.1fs",
+                job_id,
+                int(result.get("input_tokens") or 0),
+                int(result.get("cache_read_tokens") or 0),
+                int(result.get("output_tokens") or 0),
+                int(result.get("api_calls") or 0),
+                tool_calls,
+                elapsed_seconds,
+            )
+            if run_metadata is not None:
+                run_metadata.update({"agent_ran": True, "tool_calls": tool_calls})
+                _record_persistent_progress_delta(
+                    run_metadata,
+                    _progress_before,
+                    _persistent_workspace_progress_snapshot(
+                        job,
+                        session_id=str(getattr(agent, "session_id", "") or ""),
+                    ),
+                )
+            if _needs_prompt_contract_migration:
+                mark_persistent_prompt_contract_delivered(
+                    job_id,
+                    expected_root_id=_persistent_root,
+                    version=_PERSISTENT_PROMPT_CONTRACT_VERSION,
+                )
+            if _persistent_resume_matched and not _rollover_lease_owner:
+                reset_persistent_contract_fork_state(
+                    job_id,
+                    contract_update_token=_contract_update_token,
+                )
+
         
         output = f"""# Cron Job: {job_name}
 
@@ -4332,6 +5293,7 @@ def run_job(
 ## Prompt
 
 {prompt}
+{tick_usage}
 
 ## Response
 
@@ -4458,8 +5420,17 @@ def run_job(
             # across runs; _set_cron_session_title dedupes (#50537) and the
             # except-fallback below guarantees a non-blank title (#50535).
             try:
-                _title_base = " ".join(job_name.split())[:60].strip() or f"cron {job_id}"
-                _cron_title = f"{_title_base} · {_hermes_now().strftime('%b %d %H:%M')}"
+                if _persistent_job:
+                    _title_base = (
+                        " ".join(job_name.split())[:60].strip()
+                        or f"cron {job_id}"
+                    )
+                    _cron_title = _persistent_cron_title(
+                        _session_db, _final_cron_session_id, _title_base
+                    )
+                else:
+                    _title_base = " ".join(job_name.split())[:60].strip() or f"cron {job_id}"
+                    _cron_title = f"{_title_base} · {_hermes_now().strftime('%b %d %H:%M')}"
                 if not _set_cron_session_title(
                     _session_db, _final_cron_session_id, _cron_title
                 ):
@@ -4488,7 +5459,8 @@ def run_job(
                         continue
             try:
                 _session_db.end_session(
-                    _final_cron_session_id, "cron_complete"
+                    _final_cron_session_id,
+                    "cron_waiting" if _persistent_job else "cron_complete",
                 )
             except (Exception, KeyboardInterrupt) as e:
                 logger.debug("Job '%s': failed to end session: %s", job_id, e)
@@ -4496,6 +5468,7 @@ def run_job(
                 _session_db.close()
             except (Exception, KeyboardInterrupt) as e:
                 logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
+        _release_rollover_lease_if_owned()
         # Release subprocesses, terminal sandboxes, browser daemons, and the
         # main OpenAI/httpx client held by this ephemeral cron agent. Without
         # this, a gateway that ticks cron every N minutes leaks fds per job
@@ -4605,11 +5578,19 @@ def run_one_job(
         # below once delivery is done. Defense-in-depth alongside the
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
+        _run_metadata: dict[str, Any] = {}
+        _persistent_run = (
+            normalize_session_mode(job.get("session_mode"), strict=False)
+            == SESSION_MODE_PERSISTENT
+        )
         try:
-            success, output, final_response, error = run_job(
-                job, defer_agent_teardown=_deferred_agents,
-                extra_prompt=extra_prompt,
-            )
+            _run_job_kwargs: dict[str, Any] = {
+                "defer_agent_teardown": _deferred_agents,
+                "extra_prompt": extra_prompt,
+            }
+            if _persistent_run:
+                _run_job_kwargs["run_metadata"] = _run_metadata
+            success, output, final_response, error = run_job(job, **_run_job_kwargs)
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
             # it down here so a failed run never leaks its async resources
@@ -4621,6 +5602,11 @@ def run_one_job(
             raise
         finally:
             reset_secret_scope(_scope_token)
+
+        if _run_metadata.get("deferred") is True:
+            for _deferred_agent in _deferred_agents:
+                _teardown_cron_agent(_deferred_agent, job["id"])
+            return True
 
         # Everything from here through delivery runs with the agent still live
         # (deferred teardown). Wrap it ALL in a try/finally so that if any step
@@ -4694,7 +5680,10 @@ def run_one_job(
             # a real report that merely quoted "[SILENT]" mid-sentence (#51438,
             # #46917).  Keeps the intentional bracketed-prefix / trailing-line
             # tolerance the cron contract relies on.
-            if should_deliver and success and _is_cron_silence_response(deliver_content):
+            is_silence_response = bool(
+                success and _is_cron_silence_response(deliver_content)
+            )
+            if should_deliver and is_silence_response:
                 logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                 should_deliver = False
 
@@ -4722,14 +5711,34 @@ def run_one_job(
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-        if not _consume_interrupted_flag(job["id"]):
+        if _consume_interrupted_flag(job["id"]):
+            reset_persistent_silence_state(job["id"])
+        else:
+            _mark_kwargs: dict[str, Any] = {
+                "delivery_error": delivery_error,
+            }
+            if _persistent_run:
+                silent_no_progress = bool(
+                    is_silence_response
+                    and int(_run_metadata.get("tool_calls") or 0) == 0
+                )
+                local_state_no_progress = bool(
+                    _run_metadata.get("meaningful_progress") is False
+                    and _run_metadata.get("local_artifact_only_write") is True
+                )
+                _mark_kwargs["persistent_no_progress"] = bool(
+                    success
+                    and _run_metadata.get("agent_ran") is True
+                    and (silent_no_progress or local_state_no_progress)
+                )
             if blocked_config:
                 mark_job_run(
-                    job["id"], success, error, delivery_error=delivery_error,
+                    job["id"], success, error,
                     status="blocked_config",
+                    **_mark_kwargs,
                 )
             else:
-                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                mark_job_run(job["id"], success, error, **_mark_kwargs)
         normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
         if delivery_error:
             delivery_outcome = "failed"

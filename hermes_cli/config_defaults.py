@@ -2307,6 +2307,12 @@ DEFAULT_CONFIG = {
         # wedges the job's dispatch guard forever. Also overridable via
         # HERMES_CRON_SESSION_DB_TIMEOUT env var. 0 = unlimited (skip the bound).
         "session_db_timeout_seconds": 10,
+        # Persistent jobs are continuations: each tick advances one bounded
+        # milestone rather than inheriting the profile-wide agent turn budget.
+        "persistent_max_turns": 12,
+        # Opt-in successful-run interval for rotating a persistent root. Zero
+        # disables planned rollover (the safe/default continuity behavior).
+        "persistent_rollover_runs": 0,
     },
 
     # Kanban multi-agent coordination — controls the dispatcher loop that

@@ -1565,6 +1565,7 @@ class CLICommandsMixin:
                 "all": False,
                 "prompt": None,
                 "schedule": None,
+                "session_mode": None,
                 "positionals": [],
             }
             i = 0
@@ -1604,6 +1605,13 @@ class CLICommandsMixin:
                 elif token == "--schedule" and i + 1 < len(tokens):
                     opts["schedule"] = tokens[i + 1]
                     i += 2
+                elif token == "--session-mode" and i + 1 < len(tokens):
+                    session_mode = tokens[i + 1].strip().lower()
+                    if session_mode not in {"fresh", "persistent"}:
+                        print("(._.) --session-mode must be fresh or persistent")
+                        return None
+                    opts["session_mode"] = session_mode
+                    i += 2
                 else:
                     opts["positionals"].append(token)
                     i += 1
@@ -1619,7 +1627,7 @@ class CLICommandsMixin:
             print()
             print("  Commands:")
             print("    /cron list")
-            print('    /cron add "every 2h" "Check server status" [--skill blogwatcher]')
+            print('    /cron add "every 2h" "Check server status" [--skill blogwatcher] [--session-mode persistent]')
             print('    /cron edit <job_id> --schedule "every 4h" --prompt "New task"')
             print("    /cron edit <job_id> --skill blogwatcher --skill maps")
             print("    /cron edit <job_id> --remove-skill blogwatcher")
@@ -1696,6 +1704,7 @@ class CLICommandsMixin:
                 deliver=opts["deliver"],
                 repeat=opts["repeat"],
                 skills=skills or None,
+                session_mode=opts["session_mode"],
             )
             if result.get("success"):
                 print(f"(^_^)b Created job: {result['job_id']}")
@@ -1742,6 +1751,7 @@ class CLICommandsMixin:
                 deliver=opts["deliver"],
                 repeat=opts["repeat"],
                 skills=final_skills,
+                session_mode=opts["session_mode"],
             )
             if result.get("success"):
                 job = result["job"]

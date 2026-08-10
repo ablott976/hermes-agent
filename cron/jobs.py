@@ -372,10 +372,92 @@ def _jobs_lock():
             _jobs_lock_state.load_stamp = None
 
 # Fields on a cron job that must never change after creation. ``id`` is used
-# as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
-# updated lets an unsafe value (``../escape``, absolute path, nested) leak
-# into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+# as a filesystem path component under ``OUTPUT_DIR``; the remaining fields
+# are scheduler-owned continuation state. Allowing callers to rewrite them can
+# make one job resume another job's conversation or bypass fork/rollover guards.
+_IMMUTABLE_JOB_FIELDS = frozenset({
+    "id",
+    "persistent_contract_forks",
+    "persistent_contract_update_pending",
+    "persistent_prompt_contract_version",
+    "persistent_rollover_lease",
+    "persistent_planned_rollovers",
+    "persistent_rollover_checkpoint",
+    "persistent_successful_runs",
+    "persistent_silent_ticks",
+    "session_root_id",
+    "session_runtime_contract",
+    "session_runtime_fingerprint",
+})
+_INTERNAL_JOB_FIELDS = frozenset({
+    "persistent_contract_forks",
+    "persistent_contract_update_pending",
+    "persistent_prompt_contract_version",
+    "persistent_rollover_lease",
+    "persistent_planned_rollovers",
+    "persistent_rollover_checkpoint",
+    "persistent_successful_runs",
+    "persistent_silent_ticks",
+    "session_root_id",
+    "session_runtime_contract",
+    "session_runtime_fingerprint",
+})
+
+_PERSISTENT_SILENT_PAUSE_THRESHOLD = 2
+_PERSISTENT_CONTRACT_FORK_PAUSE_THRESHOLD = 2
+_PERSISTENT_PROMPT_CONTRACT_VERSION = 1
+_PERSISTENT_CONTRACT_UPDATE_FIELDS = frozenset({
+    "base_url",
+    "context_from",
+    "enabled_toolsets",
+    "model",
+    "prompt",
+    "provider",
+    "script",
+    "skill",
+    "skills",
+    "workdir",
+})
+_PERSISTENT_RUNTIME_CONTRACT_COMPONENTS = frozenset({
+    "api_mode",
+    "base_url",
+    "context_from",
+    "model",
+    "prompt",
+    "provider",
+    "script",
+    "skills",
+    "system_contract",
+    "tool_contract",
+    "workdir",
+})
+
+SESSION_MODE_FRESH = "fresh"
+SESSION_MODE_PERSISTENT = "persistent"
+_SESSION_MODES = frozenset({SESSION_MODE_FRESH, SESSION_MODE_PERSISTENT})
+
+
+def public_job_view(job: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Return a copy safe for normal API/UI output."""
+    if job is None:
+        return None
+    return {key: value for key, value in job.items() if key not in _INTERNAL_JOB_FIELDS}
+
+
+def normalize_session_mode(value: Any, *, strict: bool = True) -> str:
+    """Return a supported cron conversation mode; missing means ``fresh``."""
+    if value is None:
+        return SESSION_MODE_FRESH
+    if isinstance(value, str):
+        mode = value.strip().lower()
+        if mode in _SESSION_MODES:
+            return mode
+    if strict:
+        raise ValueError(
+            "session_mode must be 'fresh' or 'persistent' "
+            f"(got {value!r})"
+        )
+    return SESSION_MODE_FRESH
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -475,6 +557,18 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     # half-paused record (enabled=true + state/paused_at) cannot render as
     # "paused" while the fleet is still live. See effective_job_state().
     normalized["state"] = effective_job_state(normalized)
+
+    session_mode = normalize_session_mode(
+        normalized.get("session_mode"), strict=False
+    )
+    # Script-only jobs cannot own a model conversation. Treat any hand-edited
+    # legacy persistent value as fresh and drop unusable continuation metadata
+    # from the normalized runtime/public view.
+    if bool(normalized.get("no_agent")):
+        session_mode = SESSION_MODE_FRESH
+        for field in _INTERNAL_JOB_FIELDS:
+            normalized.pop(field, None)
+    normalized["session_mode"] = session_mode
 
     return normalized
 
@@ -1598,6 +1692,7 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    session_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1655,6 +1750,9 @@ def create_job(
         monitor_url: Optional http(s) URL used as the monitor source instead
                 of a script — fetched with a bounded GET each tick. Same
                 hash-suppression semantics as ``monitor_script``.
+        session_mode: ``fresh`` (default) creates an independent conversation
+                per tick. ``persistent`` resumes one durable conversation/root
+                across ticks and is intended for finite continuable work.
 
     Returns:
         The created job dict
@@ -1691,6 +1789,7 @@ def create_job(
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
     normalized_monitor_url = normalized_monitor_url or None
+    normalized_session_mode = normalize_session_mode(session_mode)
 
     # Monitor-mode validation: exactly one source, and monitor mode only
     # makes sense when there IS an agent to suppress/wake.
@@ -1704,6 +1803,8 @@ def create_job(
         normalized_no_agent,
         normalized_script,
     )
+    if normalized_no_agent and normalized_session_mode == SESSION_MODE_PERSISTENT:
+        raise ValueError("session_mode='persistent' cannot be used with no_agent=True")
 
     # Normalize context_from: accept str or list of str, store as list or None
     if isinstance(context_from, str):
@@ -1795,13 +1896,17 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    # Omit the historical default from storage; read paths normalize a missing
+    # key to fresh so existing job records stay compact and compatible.
+    if normalized_session_mode == SESSION_MODE_PERSISTENT:
+        job["session_mode"] = SESSION_MODE_PERSISTENT
 
     with _jobs_lock():
         jobs = load_jobs()
         jobs.append(job)
         save_jobs(jobs)
 
-    return job
+    return _normalize_job_record(job)
 
 
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:
@@ -1869,6 +1974,7 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
 
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
+    updates = dict(updates or {})
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
     # path component under OUTPUT_DIR — letting an update change it leaks
     # path-escape values into output writes/deletes.
@@ -1877,6 +1983,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         raise ValueError(
             f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}"
         )
+    if "session_mode" in updates:
+        updates["session_mode"] = normalize_session_mode(updates["session_mode"])
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -1929,6 +2037,29 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 normalized_skills = _normalize_skill_list(updated.get("skill"), updated.get("skills"))
                 updated["skills"] = normalized_skills
                 updated["skill"] = normalized_skills[0] if normalized_skills else None
+
+            session_mode = normalize_session_mode(updated.get("session_mode"))
+            if bool(updated.get("no_agent")) and session_mode == SESSION_MODE_PERSISTENT:
+                raise ValueError("session_mode='persistent' cannot be used with no_agent=True")
+            if session_mode == SESSION_MODE_FRESH:
+                # Switching back to fresh must never revive a stale root later.
+                updated.pop("session_mode", None)
+                for field in _INTERNAL_JOB_FIELDS:
+                    updated.pop(field, None)
+            else:
+                updated["session_mode"] = SESSION_MODE_PERSISTENT
+                if _PERSISTENT_CONTRACT_UPDATE_FIELDS.intersection(updates):
+                    # Explicit contract updates authorize exactly one controlled
+                    # fork and rotate the CAS token captured by in-flight runners.
+                    updated["persistent_contract_update_pending"] = uuid.uuid4().hex
+                    updated.pop("persistent_contract_forks", None)
+                # Explicit activation/resume gets a fresh churn/no-progress budget.
+                if (
+                    "session_mode" in updates
+                    or ("enabled" in updates and bool(updates.get("enabled")))
+                ):
+                    updated.pop("persistent_contract_forks", None)
+                    updated.pop("persistent_silent_ticks", None)
 
             if schedule_changed:
                 updated_schedule = updated["schedule"]
@@ -2085,6 +2216,415 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
+def _normalize_persistent_runtime_contract(value: Any) -> Dict[str, Any]:
+    """Validate the scheduler-owned digest map before durable storage."""
+    if not isinstance(value, dict) or value.get("version") != 4:
+        raise ValueError("persistent runtime contract must use version 4")
+    unexpected = set(value) - ({"version"} | _PERSISTENT_RUNTIME_CONTRACT_COMPONENTS)
+    missing = _PERSISTENT_RUNTIME_CONTRACT_COMPONENTS - set(value)
+    if unexpected or missing:
+        raise ValueError("persistent runtime contract has invalid components")
+    normalized: Dict[str, Any] = {"version": 4}
+    for name in sorted(_PERSISTENT_RUNTIME_CONTRACT_COMPONENTS):
+        digest = str(value.get(name) or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError(
+                f"persistent runtime contract component {name!r} must be a SHA-256 digest"
+            )
+        normalized[name] = digest
+    return normalized
+
+
+def claim_persistent_rollover(
+    job_id: str,
+    *,
+    expected_root_id: str,
+    expected_successful_runs: int,
+    rollover_runs: int,
+) -> Optional[Dict[str, Any]]:
+    """Atomically claim one opt-in persistent-root rollover."""
+    if isinstance(rollover_runs, bool) or not isinstance(rollover_runs, int):
+        raise ValueError("persistent rollover interval must be a positive integer")
+    if rollover_runs <= 0:
+        raise ValueError("persistent rollover interval must be a positive integer")
+    expected_root = str(expected_root_id or "").strip()
+    try:
+        expected_success_count = max(0, int(expected_successful_runs))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("expected successful-run count must be non-negative") from exc
+
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job.get("id") != job_id:
+                continue
+            if normalize_session_mode(
+                job.get("session_mode"), strict=False
+            ) != SESSION_MODE_PERSISTENT:
+                raise ValueError(
+                    "persistent rollover can only be claimed on a persistent job"
+                )
+            updated = dict(job)
+            live_root = str(updated.get("session_root_id") or "").strip()
+            try:
+                live_successful_runs = max(
+                    0, int(updated.get("persistent_successful_runs") or 0)
+                )
+            except (TypeError, ValueError):
+                live_successful_runs = 0
+            status = "not_due"
+            rollover_owner = ""
+            if live_root != expected_root or live_successful_runs != expected_success_count:
+                status = "stale"
+            else:
+                try:
+                    checkpoint = max(
+                        0, int(updated.get("persistent_rollover_checkpoint") or 0)
+                    )
+                except (TypeError, ValueError):
+                    checkpoint = 0
+                due = bool(
+                    live_root
+                    and live_successful_runs > 0
+                    and live_successful_runs % rollover_runs == 0
+                    and checkpoint != live_successful_runs
+                )
+                if due:
+                    rollover_owner = uuid.uuid4().hex
+                    try:
+                        rollover_count = max(
+                            0, int(updated.get("persistent_planned_rollovers") or 0)
+                        ) + 1
+                    except (TypeError, ValueError):
+                        rollover_count = 1
+                    updated["persistent_rollover_checkpoint"] = live_successful_runs
+                    updated["persistent_planned_rollovers"] = rollover_count
+                    updated["persistent_rollover_lease"] = {
+                        "owner": rollover_owner,
+                        "at": _hermes_now().isoformat(),
+                    }
+                    updated["persistent_contract_update_pending"] = uuid.uuid4().hex
+                    updated.pop("session_root_id", None)
+                    updated.pop("persistent_silent_ticks", None)
+                    jobs[i] = updated
+                    save_jobs(jobs)
+                    status = "applied"
+            result = _normalize_job_record(updated)
+            result["_persistent_rollover_claim"] = status
+            if status == "applied":
+                result["_persistent_rollover_owner"] = rollover_owner
+            return result
+    return None
+
+
+def claim_persistent_rollover_recovery(
+    job_id: str,
+    *,
+    expected_successful_runs: int,
+    expected_owner: str,
+    lease_ttl_seconds: float = 900.0,
+) -> Optional[Dict[str, Any]]:
+    """CAS-claim an abandoned planned-rollover bootstrap before a model call."""
+    try:
+        successful_runs = max(0, int(expected_successful_runs))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("expected successful-run count must be non-negative") from exc
+    try:
+        ttl = max(0.0, float(lease_ttl_seconds))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("rollover lease TTL must be a non-negative number") from exc
+    snapshot_owner = str(expected_owner or "").strip()
+
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job.get("id") != job_id:
+                continue
+            if normalize_session_mode(
+                job.get("session_mode"), strict=False
+            ) != SESSION_MODE_PERSISTENT:
+                raise ValueError(
+                    "persistent rollover recovery requires a persistent job"
+                )
+            updated = dict(job)
+            try:
+                live_successful_runs = max(
+                    0, int(updated.get("persistent_successful_runs") or 0)
+                )
+            except (TypeError, ValueError):
+                live_successful_runs = 0
+            try:
+                checkpoint = max(
+                    0, int(updated.get("persistent_rollover_checkpoint") or 0)
+                )
+            except (TypeError, ValueError):
+                checkpoint = 0
+            lease = updated.get("persistent_rollover_lease")
+            lease = lease if isinstance(lease, dict) else {}
+            live_owner = str(lease.get("owner") or "").strip()
+            update_token = str(
+                updated.get("persistent_contract_update_pending") or ""
+            ).strip()
+            rollover_pending = bool(
+                successful_runs > 0
+                and live_successful_runs == successful_runs
+                and checkpoint == successful_runs
+                and (live_owner or update_token)
+            )
+            new_owner = ""
+            if not rollover_pending or live_owner != snapshot_owner:
+                status = "stale"
+            else:
+                lease_age = float("inf")
+                raw_at = str(lease.get("at") or "").strip()
+                if live_owner and raw_at:
+                    try:
+                        lease_at = datetime.fromisoformat(raw_at.replace("Z", "+00:00"))
+                        lease_age = max(0.0, (_hermes_now() - lease_at).total_seconds())
+                    except (TypeError, ValueError):
+                        lease_age = float("inf")
+                if live_owner and lease_age < ttl:
+                    status = "busy"
+                else:
+                    new_owner = uuid.uuid4().hex
+                    updated["persistent_rollover_lease"] = {
+                        "owner": new_owner,
+                        "at": _hermes_now().isoformat(),
+                    }
+                    updated["persistent_contract_update_pending"] = uuid.uuid4().hex
+                    jobs[i] = updated
+                    save_jobs(jobs)
+                    status = "applied"
+            result = _normalize_job_record(updated)
+            result["_persistent_rollover_recovery"] = status
+            if status == "applied":
+                result["_persistent_rollover_owner"] = new_owner
+            return result
+    return None
+
+
+def heartbeat_persistent_rollover_lease(job_id: str, *, expected_owner: str) -> bool:
+    """Refresh a live rollover bootstrap lease owned by this runner."""
+    owner = str(expected_owner or "").strip()
+    if not owner:
+        return False
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job.get("id") != job_id:
+                continue
+            lease = job.get("persistent_rollover_lease")
+            lease = lease if isinstance(lease, dict) else {}
+            if str(lease.get("owner") or "").strip() != owner:
+                return False
+            updated = dict(job)
+            updated["persistent_rollover_lease"] = {
+                "owner": owner,
+                "at": _hermes_now().isoformat(),
+            }
+            jobs[i] = updated
+            save_jobs(jobs)
+            return True
+    return False
+
+
+def release_persistent_rollover_lease(job_id: str, *, expected_owner: str) -> bool:
+    """Release a rollover bootstrap lease without touching contract state."""
+    owner = str(expected_owner or "").strip()
+    if not owner:
+        return False
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job.get("id") != job_id:
+                continue
+            lease = job.get("persistent_rollover_lease")
+            lease = lease if isinstance(lease, dict) else {}
+            if str(lease.get("owner") or "").strip() != owner:
+                return False
+            updated = dict(job)
+            updated.pop("persistent_rollover_lease", None)
+            jobs[i] = updated
+            save_jobs(jobs)
+            return True
+    return False
+
+
+def set_persistent_session_state(
+    job_id: str,
+    root_session_id: str,
+    runtime_fingerprint: str,
+    *,
+    runtime_contract: Optional[Dict[str, Any]] = None,
+    unexpected_fork: bool = False,
+    contract_update_token: Optional[str] = None,
+    preserve_fork_budget: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Persist continuation state atomically and enforce the root-fork fuse."""
+    root = str(root_session_id or "").strip()
+    fingerprint = str(runtime_fingerprint or "").strip()
+    if not root or not fingerprint:
+        raise ValueError("persistent session state requires a root id and fingerprint")
+    contract = (
+        _normalize_persistent_runtime_contract(runtime_contract)
+        if runtime_contract is not None
+        else None
+    )
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job.get("id") != job_id:
+                continue
+            if normalize_session_mode(
+                job.get("session_mode"), strict=False
+            ) != SESSION_MODE_PERSISTENT:
+                raise ValueError(
+                    "persistent session state can only be set on a persistent job"
+                )
+            updated = dict(job)
+            live_update_token = str(
+                updated.get("persistent_contract_update_pending") or ""
+            )
+            if live_update_token != str(contract_update_token or ""):
+                stale = _normalize_job_record(updated)
+                stale["_persistent_state_write_applied"] = False
+                return stale
+            root_changed = updated.get("session_root_id") != root
+            explicit_update = bool(live_update_token)
+            if explicit_update:
+                updated.pop("persistent_contract_update_pending", None)
+            legacy_contract = not isinstance(updated.get("session_runtime_contract"), dict)
+            count_unexpected = bool(
+                root_changed
+                and unexpected_fork
+                and not explicit_update
+                and not legacy_contract
+            )
+            if count_unexpected:
+                try:
+                    fork_count = max(
+                        0, int(updated.get("persistent_contract_forks") or 0)
+                    ) + 1
+                except (TypeError, ValueError):
+                    fork_count = 1
+                updated["persistent_contract_forks"] = fork_count
+                if fork_count >= _PERSISTENT_CONTRACT_FORK_PAUSE_THRESHOLD:
+                    updated.update({
+                        "enabled": False,
+                        "state": "paused",
+                        "next_run_at": None,
+                        "paused_at": _hermes_now().isoformat(),
+                        "paused_reason": (
+                            "Persistent conversation contract changed on two "
+                            "consecutive ticks; paused before another full bootstrap."
+                        ),
+                    })
+                    jobs[i] = updated
+                    save_jobs(jobs)
+                    paused = _normalize_job_record(updated)
+                    paused["_persistent_state_write_applied"] = True
+                    return paused
+            elif root_changed and not preserve_fork_budget:
+                updated.pop("persistent_contract_forks", None)
+            if root_changed:
+                updated.pop("persistent_silent_ticks", None)
+            updated["session_root_id"] = root
+            updated["session_runtime_fingerprint"] = fingerprint
+            if contract is not None:
+                updated["session_runtime_contract"] = contract
+            jobs[i] = updated
+            save_jobs(jobs)
+            persisted = _normalize_job_record(updated)
+            persisted["_persistent_state_write_applied"] = True
+            return persisted
+    return None
+
+
+def mark_persistent_prompt_contract_delivered(
+    job_id: str,
+    *,
+    expected_root_id: str,
+    version: int = _PERSISTENT_PROMPT_CONTRACT_VERSION,
+) -> bool:
+    """CAS-record bootstrap-only prompt guidance after a successful turn."""
+    root = str(expected_root_id or "").strip()
+    if not root:
+        return False
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        raise ValueError("persistent prompt contract version must be a positive integer")
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job.get("id") != job_id:
+                continue
+            if normalize_session_mode(
+                job.get("session_mode"), strict=False
+            ) != SESSION_MODE_PERSISTENT:
+                return False
+            if str(job.get("session_root_id") or "").strip() != root:
+                return False
+            try:
+                current = max(
+                    0, int(job.get("persistent_prompt_contract_version") or 0)
+                )
+            except (TypeError, ValueError):
+                current = 0
+            if current >= version:
+                return True
+            updated = dict(job)
+            updated["persistent_prompt_contract_version"] = version
+            jobs[i] = updated
+            save_jobs(jobs)
+            return True
+    return False
+
+
+def reset_persistent_contract_fork_state(
+    job_id: str,
+    *,
+    contract_update_token: Optional[str] = None,
+) -> bool:
+    """Clear anti-churn state after a compatible current-snapshot resume."""
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            live_update_token = str(
+                job.get("persistent_contract_update_pending") or ""
+            )
+            if live_update_token != str(contract_update_token or ""):
+                return False
+            changed = False
+            for field in (
+                "persistent_contract_update_pending",
+                "persistent_contract_forks",
+            ):
+                if field in job:
+                    job.pop(field, None)
+                    changed = True
+            if not changed:
+                return False
+            save_jobs(jobs)
+            return True
+    return False
+
+
+def reset_persistent_silence_state(job_id: str) -> bool:
+    """Clear scheduler-owned no-progress state without completing a run."""
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            if "persistent_silent_ticks" not in job:
+                return False
+            job.pop("persistent_silent_ticks", None)
+            save_jobs(jobs)
+            return True
+    return False
+
+
 def _set_preflight_alerted(job_id: str, value: bool) -> bool:
     """Set/clear the preflight alert-dedup marker; return the PRIOR value.
 
@@ -2120,9 +2660,15 @@ def clear_preflight_alerted(job_id: str) -> None:
     _set_preflight_alerted(job_id, False)
 
 
-def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None,
-                 status: Optional[str] = None):
+def mark_job_run(
+    job_id: str,
+    success: bool,
+    error: Optional[str] = None,
+    delivery_error: Optional[str] = None,
+    status: Optional[str] = None,
+    *,
+    persistent_no_progress: bool = False,
+):
     """
     Mark a job as having been run.
     
@@ -2137,6 +2683,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
     the pre-dispatch configuration validation refused to run the agent
     (T1-26), so `cronjob list` distinguishes "your config is broken" from
     "the run itself failed".
+
+    ``persistent_no_progress`` is scheduler-owned. Two consecutive successful,
+    workspace-scoped persistent ticks with no verifiable progress auto-pause
+    the job; fresh, unscoped and script-only jobs ignore the flag.
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -2162,6 +2712,37 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 # is claimable again. No-op if the job never carried a claim.
                 if job.get("run_claim") is not None:
                     job["run_claim"] = None
+
+                persistent_agent_job = (
+                    normalize_session_mode(job.get("session_mode"), strict=False)
+                    == SESSION_MODE_PERSISTENT
+                    and not bool(job.get("no_agent"))
+                )
+                if persistent_agent_job and success:
+                    try:
+                        successful_runs = max(
+                            0, int(job.get("persistent_successful_runs") or 0)
+                        ) + 1
+                    except (TypeError, ValueError):
+                        successful_runs = 1
+                    job["persistent_successful_runs"] = successful_runs
+
+                workspace_scoped_persistent = bool(
+                    persistent_agent_job
+                    and str(job.get("workdir") or "").strip()
+                )
+                if workspace_scoped_persistent and success and persistent_no_progress:
+                    try:
+                        prior_silent_ticks = max(
+                            0, int(job.get("persistent_silent_ticks") or 0)
+                        )
+                    except (TypeError, ValueError):
+                        prior_silent_ticks = 0
+                    silent_ticks = prior_silent_ticks + 1
+                    job["persistent_silent_ticks"] = silent_ticks
+                else:
+                    silent_ticks = 0
+                    job.pop("persistent_silent_ticks", None)
                 
                 # Increment completed count.  Finite one-shot jobs are
                 # pre-claimed by claim_dispatch() BEFORE the side effect runs
@@ -2200,6 +2781,25 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         job["next_run_at"] = None
                         save_jobs(jobs)
                         return
+
+                if silent_ticks >= _PERSISTENT_SILENT_PAUSE_THRESHOLD:
+                    job["enabled"] = False
+                    job["state"] = "paused"
+                    job["paused_at"] = now
+                    job["paused_reason"] = (
+                        "Paused automatically after two consecutive runs with no "
+                        "verifiable progress."
+                    )
+                    job["next_run_at"] = None
+                    save_jobs(jobs)
+                    logger.info(
+                        "Job '%s' (%s) auto-paused after %d persistent "
+                        "ticks without verifiable progress",
+                        job.get("name", job_id),
+                        job_id,
+                        silent_ticks,
+                    )
+                    return
                 
                 # Recurring jobs are pre-advanced before execution for crash
                 # safety. Preserve a still-future occurrence instead of
