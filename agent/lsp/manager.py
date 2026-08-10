@@ -176,6 +176,8 @@ class LSPService:
         self._broken: set = set()
         self._spawning: Dict[Tuple[str, str], asyncio.Future] = {}
         self._last_used: Dict[Tuple[str, str], float] = {}
+        self._in_flight: Dict[Tuple[str, str], int] = {}
+        self._reaping: Dict[Tuple[str, str], List[LSPClient]] = {}
         self._state_lock = threading.Lock()
         self._idle_reaper_task: Optional[asyncio.Task] = None
 
@@ -451,6 +453,7 @@ class LSPService:
         with self._state_lock:
             client = self._clients.pop(key, None)
             self._last_used.pop(key, None)
+            self._in_flight.pop(key, None)
         if client is not None:
             try:
                 # Fire-and-forget shutdown — give it a second to cleanup,
@@ -478,22 +481,24 @@ class LSPService:
     # ------------------------------------------------------------------
 
     async def _snapshot_async(self, file_path: str) -> List[Dict[str, Any]]:
-        client = await self._get_or_spawn(file_path)
+        client = await self._get_or_spawn(file_path, claim=True)
         if client is None:
             return []
         try:
-            version = await client.open_file(file_path, language_id=language_id_for(file_path))
-            fresh = await client.wait_for_diagnostics(file_path, version, mode=self._wait_mode)
-        except Exception as e:  # noqa: BLE001
-            logger.debug("snapshot open/wait failed: %s", e)
-            return []
-        self._touch(client)
-        if not fresh:
-            # No fresh data for the pre-edit content — an empty baseline
-            # is safe: worst case the delta filter removes less, never
-            # more.  Never seed the baseline from stale stores.
-            return []
-        return list(client.diagnostics_for(file_path, fresh_only=True))
+            try:
+                version = await client.open_file(file_path, language_id=language_id_for(file_path))
+                fresh = await client.wait_for_diagnostics(file_path, version, mode=self._wait_mode)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("snapshot open/wait failed: %s", e)
+                return []
+            if not fresh:
+                # No fresh data for the pre-edit content — an empty baseline
+                # is safe: worst case the delta filter removes less, never
+                # more.  Never seed the baseline from stale stores.
+                return []
+            return list(client.diagnostics_for(file_path, fresh_only=True))
+        finally:
+            self._release_client(client)
 
     async def _open_and_wait_async(self, file_path: str) -> Optional[List[Dict[str, Any]]]:
         """Open + wait for FRESH diagnostics.
@@ -504,22 +509,24 @@ class LSPService:
         content, it's clean", ``None`` means "no verdict" — the caller
         must not substitute stale data for either.
         """
-        client = await self._get_or_spawn(file_path)
+        client = await self._get_or_spawn(file_path, claim=True)
         if client is None:
             return None
         try:
-            version = await client.open_file(file_path, language_id=language_id_for(file_path))
-            await client.save_file(file_path)
-            fresh = await client.wait_for_diagnostics(
-                file_path, version, mode=self._wait_mode, timeout=self._wait_timeout
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.debug("open/wait failed for %s: %s", file_path, e)
-            return None
-        self._touch(client)
-        if not fresh:
-            return None
-        return list(client.diagnostics_for(file_path, fresh_only=True))
+            try:
+                version = await client.open_file(file_path, language_id=language_id_for(file_path))
+                await client.save_file(file_path)
+                fresh = await client.wait_for_diagnostics(
+                    file_path, version, mode=self._wait_mode, timeout=self._wait_timeout
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("open/wait failed for %s: %s", file_path, e)
+                return None
+            if not fresh:
+                return None
+            return list(client.diagnostics_for(file_path, fresh_only=True))
+        finally:
+            self._release_client(client)
 
     async def _current_diags_async(self, file_path: str) -> List[Dict[str, Any]]:
         ws, gated = resolve_workspace_for_file(file_path)
@@ -532,7 +539,9 @@ class LSPService:
             return []
         return list(client.diagnostics_for(file_path, fresh_only=True))
 
-    async def _get_or_spawn(self, file_path: str) -> Optional[LSPClient]:
+    async def _get_or_spawn(
+        self, file_path: str, *, claim: bool = False
+    ) -> Optional[LSPClient]:
         srv = find_server_for_file(file_path)
         if srv is None:
             return None
@@ -556,15 +565,23 @@ class LSPService:
         with self._state_lock:
             client = self._clients.get(key)
             if client is not None and client.is_running:
-                self._last_used[key] = time.time()
+                if claim:
+                    self._in_flight[key] = self._in_flight.get(key, 0) + 1
                 eventlog.log_active(srv.server_id, per_server_root)
                 return client
             spawning = self._spawning.get(key)
         if spawning is not None:
             try:
-                return await spawning
+                client = await spawning
             except Exception:  # noqa: BLE001
                 return None
+            if client is None or not claim:
+                return client
+            with self._state_lock:
+                if self._clients.get(key) is client and client.is_running:
+                    self._in_flight[key] = self._in_flight.get(key, 0) + 1
+                    return client
+            return await self._get_or_spawn(file_path, claim=True)
 
         # Begin spawn
         loop = asyncio.get_running_loop()
@@ -607,7 +624,9 @@ class LSPService:
                 return None
             with self._state_lock:
                 self._clients[key] = client
-                self._last_used[key] = time.time()
+                self._last_used[key] = time.monotonic()
+                if claim:
+                    self._in_flight[key] = self._in_flight.get(key, 0) + 1
             eventlog.log_active(srv.server_id, per_server_root)
             spawn_future.set_result(client)
             return client
@@ -618,18 +637,17 @@ class LSPService:
     async def _start_idle_reaper(self) -> None:
         self._idle_reaper_task = asyncio.create_task(self._idle_reaper_loop())
 
-    def _touch(self, client: LSPClient) -> None:
-        """Refresh the last-used timestamp for a client we just used.
-
-        Guarded on membership so a reaped-mid-operation client can't
-        resurrect an orphan ``_last_used`` entry after the reaper popped
-        the key.  All writers and the reaper run on the background loop
-        thread; the lock keeps this consistent with the reader anyway.
-        """
+    def _release_client(self, client: LSPClient) -> None:
+        """Release one operation claim and refresh activity atomically."""
         key = (client.server_id, client.workspace_root)
         with self._state_lock:
-            if key in self._clients:
-                self._last_used[key] = time.time()
+            count = self._in_flight.get(key, 0)
+            if count <= 1:
+                self._in_flight.pop(key, None)
+            else:
+                self._in_flight[key] = count - 1
+            if self._clients.get(key) is client:
+                self._last_used[key] = time.monotonic()
 
     async def _idle_reaper_loop(self) -> None:
         interval = min(60.0, self._idle_timeout)
@@ -646,25 +664,38 @@ class LSPService:
                 logger.debug("LSP idle reaper sweep error: %s", e)
 
     async def _reap_idle_once(self) -> None:
-        cutoff = time.time() - self._idle_timeout
+        cutoff = time.monotonic() - self._idle_timeout
         with self._state_lock:
             idle_keys = [
                 key
                 for key in self._clients
-                if self._last_used.get(key, 0) < cutoff
+                if self._in_flight.get(key, 0) == 0
+                and self._last_used.get(key, 0) < cutoff
             ]
             clients = [self._clients.pop(key) for key in idle_keys]
-            for key in idle_keys:
+            for key, client in zip(idle_keys, clients):
                 self._last_used.pop(key, None)
+                self._in_flight.pop(key, None)
+                self._reaping.setdefault(key, []).append(client)
         if clients:
             eventlog.log_reaped(
                 [(c.server_id, c.workspace_root) for c in clients],
                 self._idle_timeout,
             )
-            await asyncio.gather(
+            results = await asyncio.gather(
                 *(client.shutdown() for client in clients),
                 return_exceptions=True,
             )
+            with self._state_lock:
+                for key, client, result in zip(idle_keys, clients, results):
+                    if isinstance(result, BaseException):
+                        continue
+                    pending = self._reaping.get(key)
+                    if pending is None or client not in pending:
+                        continue
+                    pending.remove(client)
+                    if not pending:
+                        self._reaping.pop(key, None)
 
     async def _shutdown_async(self) -> None:
         reaper = self._idle_reaper_task
@@ -673,10 +704,13 @@ class LSPService:
             reaper.cancel()
             await asyncio.gather(reaper, return_exceptions=True)
         with self._state_lock:
-            clients = list(self._clients.values())
+            pending_reaps = [client for clients in self._reaping.values() for client in clients]
+            clients = list(dict.fromkeys([*self._clients.values(), *pending_reaps]))
             self._clients.clear()
+            self._reaping.clear()
             self._broken.clear()
             self._last_used.clear()
+            self._in_flight.clear()
         await asyncio.gather(
             *(c.shutdown() for c in clients),
             return_exceptions=True,

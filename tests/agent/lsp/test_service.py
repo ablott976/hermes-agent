@@ -10,9 +10,11 @@ from __future__ import annotations
 import sys
 import time
 from pathlib import Path
+from typing import cast
 
 import pytest
 
+from agent.lsp.client import LSPClient
 from agent.lsp.manager import LSPService
 from agent.lsp.servers import (
     SERVERS,
@@ -217,6 +219,87 @@ def test_reaper_survives_sweep_error(mock_pyright):
         assert not svc._idle_reaper_task.done()
     finally:
         svc.shutdown()
+
+
+class _FakeClient:
+    def __init__(self, server_id: str, workspace_root: str, *, fail_shutdown=False):
+        self.server_id = server_id
+        self.workspace_root = workspace_root
+        self.state = "running"
+        self.is_running = True
+        self.fail_shutdown = fail_shutdown
+        self.shutdown_calls = 0
+
+    async def shutdown(self):
+        self.shutdown_calls += 1
+        if self.fail_shutdown:
+            raise RuntimeError("expected shutdown failure")
+        self.state = "stopped"
+        self.is_running = False
+
+
+def test_client_claim_blocks_reaping_until_operation_finishes(mock_pyright):
+    repo = mock_pyright
+    file_path = repo / "x.py"
+    file_path.write_text("print('hi')\n")
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=1.0,
+        install_strategy="manual",
+        idle_timeout=100.0,
+    )
+    try:
+        client = svc._loop.run(
+            svc._get_or_spawn(str(file_path), claim=True), timeout=3.0
+        )
+        assert client is not None
+        key = (client.server_id, client.workspace_root)
+        with svc._state_lock:
+            assert svc._in_flight[key] == 1
+            svc._last_used[key] = time.monotonic() - 200.0
+
+        svc._loop.run(svc._reap_idle_once(), timeout=2.0)
+        with svc._state_lock:
+            assert svc._clients[key] is client
+
+        svc._release_client(client)
+        with svc._state_lock:
+            svc._last_used[key] = time.monotonic() - 200.0
+        svc._loop.run(svc._reap_idle_once(), timeout=2.0)
+        with svc._state_lock:
+            assert key not in svc._clients
+    finally:
+        svc.shutdown()
+
+
+def test_failed_reap_shutdown_is_retried_during_service_shutdown(tmp_path):
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=1.0,
+        install_strategy="manual",
+        idle_timeout=100.0,
+    )
+    key = ("pyright", str(tmp_path / "stale"))
+    client = _FakeClient(*key, fail_shutdown=True)
+    try:
+        with svc._state_lock:
+            svc._clients[key] = cast(LSPClient, client)
+            svc._last_used[key] = time.monotonic() - 200.0
+
+        svc._loop.run(svc._reap_idle_once(), timeout=2.0)
+
+        with svc._state_lock:
+            assert svc._reaping[key] == [client]
+        assert client.shutdown_calls == 1
+        assert client.is_running is True
+    finally:
+        client.fail_shutdown = False
+        svc.shutdown()
+
+    assert client.shutdown_calls == 2
+    assert client.is_running is False
 
 
 
