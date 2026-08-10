@@ -371,6 +371,15 @@ class TestFailureAttribution:
     """
 
     def _make_pool(self, tmp_path, monkeypatch, entries):
+        # This fixture asserts exact pool cardinality. Do not let a developer's
+        # live Anthropic or Claude Code credentials auto-seed extra entries.
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            lambda: None,
+        )
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir(parents=True, exist_ok=True)
