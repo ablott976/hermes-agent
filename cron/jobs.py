@@ -838,15 +838,27 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
         minutes = schedule.get("minutes")
         if minutes is None:
             return None
+        try:
+            interval = timedelta(minutes=float(minutes))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        interval_seconds = interval.total_seconds()
+        if interval_seconds <= 0:
+            return None
         if last_run_at:
             try:
                 last = _ensure_aware(datetime.fromisoformat(last_run_at))
-                next_run = last + timedelta(minutes=minutes)
+                next_run = last + interval
+                if next_run <= now:
+                    missed = int(
+                        (now - next_run).total_seconds() // interval_seconds
+                    ) + 1
+                    next_run += interval * missed
             except Exception:
-                next_run = now + timedelta(minutes=minutes)
+                next_run = now + interval
         else:
             # First run is now + interval
-            next_run = now + timedelta(minutes=minutes)
+            next_run = now + interval
         return next_run.isoformat()
 
     elif kind == "cron":
@@ -2130,7 +2142,8 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
-                now = _hermes_now().isoformat()
+                now_dt = _hermes_now()
+                now = now_dt.isoformat()
                 job["last_run_at"] = now
                 job["last_status"] = status or ("ok" if success else "error")
                 job["last_error"] = error if not success else None
@@ -2188,8 +2201,37 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         save_jobs(jobs)
                         return
                 
-                # Compute next run
-                job["next_run_at"] = compute_next_run(job["schedule"], now)
+                # Recurring jobs are pre-advanced before execution for crash
+                # safety. Preserve a still-future occurrence instead of
+                # rebasing it from completion time: a delayed tick plus a few
+                # seconds of runtime must not shift an interval's cadence.
+                schedule = job["schedule"]
+                kind = schedule.get("kind")
+                precomputed = job.get("next_run_at")
+                recurring_candidate = (
+                    compute_next_run(schedule, now)
+                    if kind in {"cron", "interval"}
+                    else None
+                )
+                precomputed_is_future = False
+                if kind in {"cron", "interval"} and precomputed:
+                    try:
+                        precomputed_is_future = _ensure_aware(
+                            datetime.fromisoformat(precomputed)
+                        ) > now_dt
+                    except Exception:
+                        precomputed_is_future = False
+                if kind in {"cron", "interval"} and recurring_candidate is None:
+                    job["next_run_at"] = None
+                elif precomputed_is_future:
+                    job["next_run_at"] = precomputed
+                elif kind == "interval" and precomputed:
+                    job["next_run_at"] = compute_next_run(schedule, precomputed)
+                else:
+                    job["next_run_at"] = recurring_candidate or compute_next_run(
+                        schedule,
+                        now,
+                    )
 
                 # If no next run, decide whether this is terminal completion
                 # (one-shot) or a transient failure (recurring schedule couldn't
@@ -2394,6 +2436,10 @@ def advance_next_runs(job_ids) -> int:
     or unknown jobs; they are skipped exactly as the per-job form skips
     them. Returns the number of jobs whose ``next_run_at`` was advanced.
 
+    Interval jobs advance from their stored scheduled slot, skipping missed
+    slots as needed without rebasing cadence on dispatch time. A stored future
+    occurrence is already crash-safe and is left unchanged.
+
     Crash semantics: the batch persists once at the end, so a crash
     mid-batch re-fires the whole set on restart (at-least-once burst)
     rather than advancing a prefix — acceptable given the sub-10ms window,
@@ -2404,7 +2450,8 @@ def advance_next_runs(job_ids) -> int:
         return 0
     with _jobs_lock():
         jobs = load_jobs()
-        now = _hermes_now().isoformat()
+        now_dt = _hermes_now()
+        now = now_dt.isoformat()
         advanced = 0
         for job in jobs:
             if job["id"] not in ids:
@@ -2412,7 +2459,18 @@ def advance_next_runs(job_ids) -> int:
             kind = job.get("schedule", {}).get("kind")
             if kind not in {"cron", "interval"}:
                 continue
-            new_next = compute_next_run(job["schedule"], now)
+            stored_next = job.get("next_run_at")
+            if stored_next:
+                try:
+                    if _ensure_aware(datetime.fromisoformat(stored_next)) > now_dt:
+                        # get_due_jobs() or another tick already persisted the
+                        # crash-safe future occurrence. Advancing it again
+                        # would skip a slot.
+                        continue
+                except Exception:
+                    pass
+            anchor = stored_next if kind == "interval" and stored_next else now
+            new_next = compute_next_run(job["schedule"], anchor)
             if new_next and new_next != job.get("next_run_at"):
                 job["next_run_at"] = new_next
                 advanced += 1
@@ -2885,8 +2943,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     if new_next:
                         logger.info(
                             "Job '%s' missed its scheduled time (%s, grace=%ds). "
-                            "Running now; next run provisionally set to: %s "
-                            "(re-anchored on completion)",
+                            "Running now; next run set to: %s",
                             job.get("name", job.get("id", "?")),
                             next_run,
                             grace,
@@ -2898,8 +2955,8 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                         # NOT redundant: it (a) protects the crash window between
                         # here and mark_job_run, and (b) covers the external
                         # fire_due provider path, which does not call
-                        # advance_next_run. mark_job_run re-anchors next_run_at off
-                        # the actual completion time, so this value is provisional.
+                        # advance_next_run. The built-in pre-advance and
+                        # mark_job_run both preserve this future occurrence.
                         for rj in raw_jobs:
                             if rj["id"] == job["id"]:
                                 rj["next_run_at"] = new_next

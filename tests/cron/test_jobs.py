@@ -175,6 +175,17 @@ class TestComputeNextRun:
         # Should be ~60 minutes from now
         assert next_dt > datetime.now().astimezone() + timedelta(minutes=59)
 
+    def test_interval_skips_missed_slots_without_reanchoring(self, monkeypatch):
+        now = datetime(2026, 7, 16, 22, 2, 19, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        result = compute_next_run(
+            {"kind": "interval", "minutes": 1},
+            last_run_at="2026-07-16T22:00:27+00:00",
+        )
+
+        assert result == "2026-07-16T22:02:27+00:00"
+
 
 # =========================================================================
 # Job CRUD (with tmp file storage)
@@ -474,6 +485,53 @@ class TestMarkJobRun:
         updated = get_job(job["id"])
         assert updated["last_status"] == "error"
         assert updated["last_error"] == "timeout"
+
+    @pytest.mark.parametrize(
+        ("success", "error", "expected_status"),
+        [(True, None, "ok"), (False, "timeout", "error")],
+        ids=["success", "failure"],
+    )
+    def test_preserves_future_precomputed_occurrence_after_run(
+        self,
+        tmp_cron_dir,
+        monkeypatch,
+        success,
+        error,
+        expected_status,
+    ):
+        completion = datetime(2026, 7, 16, 22, 2, 22, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: completion)
+        job = create_job(prompt="Cadence check", schedule="every 1m")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = "2026-07-16T22:03:00+00:00"
+        save_jobs(jobs)
+
+        mark_job_run(job["id"], success=success, error=error)
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["next_run_at"] == "2026-07-16T22:03:00+00:00"
+        assert updated["last_status"] == expected_status
+        assert updated["last_error"] == error
+        assert updated["repeat"]["completed"] == 1
+
+    def test_expired_preadvance_keeps_interval_slot_cadence(
+        self,
+        tmp_cron_dir,
+        monkeypatch,
+    ):
+        completion = datetime(2026, 7, 16, 22, 4, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: completion)
+        job = create_job(prompt="Long cadence check", schedule="every 1m")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = "2026-07-16T22:02:27+00:00"
+        save_jobs(jobs)
+
+        mark_job_run(job["id"], success=True)
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["next_run_at"] == "2026-07-16T22:04:27+00:00"
 
     def test_delivery_error_tracked_separately(self, tmp_cron_dir):
         """Agent succeeds but delivery fails — both tracked independently."""
@@ -1253,6 +1311,44 @@ class TestAdvanceNextRuns:
         for jid in one_ids:
             # one-shots keep their (past) next_run_at for restart retry
             assert datetime.fromisoformat(get_job(jid)["next_run_at"]) < datetime.now()
+
+    def test_delayed_tick_advances_interval_from_planned_slot(
+        self,
+        tmp_cron_dir,
+        monkeypatch,
+    ):
+        from cron.jobs import advance_next_runs
+
+        now = datetime(2026, 7, 16, 22, 2, 19, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        job = create_job(prompt="Cadence check", schedule="every 1m")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = "2026-07-16T22:02:00+00:00"
+        save_jobs(jobs)
+
+        assert advance_next_runs([job["id"]]) == 1
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["next_run_at"] == "2026-07-16T22:03:00+00:00"
+
+    def test_future_preadvance_is_not_advanced_again(
+        self,
+        tmp_cron_dir,
+        monkeypatch,
+    ):
+        from cron.jobs import advance_next_runs
+
+        now = datetime(2026, 7, 16, 22, 2, 19, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        job = create_job(prompt="Cadence check", schedule="every 1m")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = "2026-07-16T22:03:00+00:00"
+        save_jobs(jobs)
+
+        assert advance_next_runs([job["id"]]) == 0
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["next_run_at"] == "2026-07-16T22:03:00+00:00"
 
     def test_batch_single_load_and_save(self, tmp_cron_dir, monkeypatch):
         """I/O pin: the whole due set costs one load + one save, not N+N.

@@ -4923,9 +4923,9 @@ def tick(
 
         # Advance next_run_at for all recurring jobs FIRST, under the file lock,
         # before any execution begins.  This preserves at-most-once semantics.
-        # For parallel jobs that are already running, the advance keeps
-        # bumping next_run_at forward so the grace window never expires.
-        # mark_job_run() overwrites next_run_at on completion.
+        # Interval advances stay anchored to the planned occurrence, and a
+        # future occurrence already persisted by catch-up or another tick is
+        # preserved through completion.
         # Batched: one load + one save for the whole due set, not one per job.
         advance_next_runs([job["id"] for job in due_jobs])
 
