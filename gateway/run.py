@@ -19675,12 +19675,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             _bg_procs = None
 
-        decision = mgr.evaluate_after_turn(
-            final_response or "",
-            user_initiated=True,
-            background_processes=_bg_procs,
-            auto_rollover=self._goal_auto_rollover_from_config(),
-            repeat_checkpoint_limit=self._goal_repeat_checkpoint_limit_from_config(),
+        # evaluate_after_turn calls judge_goal() which makes a synchronous
+        # HTTP request to the auxiliary LLM. Running it on the event-loop
+        # thread would block platform heartbeats, so offload it while retaining
+        # profile-scoped contextvars used by credential resolution.
+        decision = await self._run_in_executor_with_context(
+            lambda: mgr.evaluate_after_turn(
+                final_response or "",
+                user_initiated=True,
+                background_processes=_bg_procs,
+                auto_rollover=self._goal_auto_rollover_from_config(),
+                repeat_checkpoint_limit=self._goal_repeat_checkpoint_limit_from_config(),
+            ),
         )
         msg = decision.get("message") or ""
 
@@ -28071,6 +28077,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
 def main():
     """CLI entry point for the gateway."""
+    # Advertise the agent harness to child processes (AI_AGENT is the
+    # cross-agent standard; HERMES_AGENT the Hermes-specific marker — see
+    # _advertise_agent_env in hermes_cli/main.py, kept inline here to avoid
+    # importing that module's startup side effects). The value must equal our
+    # public agent-harness registry id (``hermes-agent``) — standard-var
+    # matching is exact. setdefault so an outer harness is never clobbered.
+    os.environ.setdefault("AI_AGENT", "hermes-agent")
+    os.environ.setdefault("HERMES_AGENT", "true")
+
     # Force UTF-8 stdio on Windows — gateway logs and startup banner would
     # otherwise UnicodeEncodeError on cp1252 consoles.  No-op on POSIX.
     try:
