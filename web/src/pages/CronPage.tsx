@@ -143,7 +143,6 @@ function emptyCronJobForm(): CronJobEditorState {
     context_from: "",
     enabled_toolsets: [],
     workdir: "",
-    session_mode: "fresh",
     scheduleState: { ...DEFAULT_SCHEDULE_STATE },
   };
 }
@@ -263,15 +262,9 @@ function CronAdvancedFields({
               type="checkbox"
               className="accent-foreground"
               checked={form.no_agent}
-              onChange={(e) =>
-                onChange({
-                  ...form,
-                  no_agent: e.target.checked,
-                  session_mode: e.target.checked ? "fresh" : form.session_mode,
-                })
-              }
+              onChange={(e) => update("no_agent", e.target.checked)}
             />
-            Script only: deliver the script output without an agent
+            no_agent: run the script only and deliver stdout verbatim
           </label>
           <div className="grid gap-1">
             <Label htmlFor={`${idPrefix}-script`}>Script</Label>
@@ -284,36 +277,14 @@ function CronAdvancedFields({
           </div>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <div className="grid gap-1">
-            <Label htmlFor={`${idPrefix}-workdir`}>Workdir</Label>
-            <Input
-              id={`${idPrefix}-workdir`}
-              value={form.workdir}
-              onChange={(e) => update("workdir", e.target.value)}
-              placeholder="/absolute/project/path"
-            />
-          </div>
-          <div className="grid gap-1">
-            <Label htmlFor={`${idPrefix}-session-mode`}>Conversation</Label>
-            <Select
-              id={`${idPrefix}-session-mode`}
-              value={form.session_mode}
-              disabled={form.no_agent}
-              onValueChange={(value) =>
-                update(
-                  "session_mode",
-                  value === "persistent" ? "persistent" : "fresh",
-                )
-              }
-            >
-              <SelectOption value="fresh">Separate each run</SelectOption>
-              <SelectOption value="persistent">Continue across runs</SelectOption>
-            </Select>
-            <p className="text-xs text-muted-foreground">
-              Continue across runs is best for finite work that advances in stages.
-            </p>
-          </div>
+        <div className="grid gap-1">
+          <Label htmlFor={`${idPrefix}-workdir`}>Workdir</Label>
+          <Input
+            id={`${idPrefix}-workdir`}
+            value={form.workdir}
+            onChange={(e) => update("workdir", e.target.value)}
+            placeholder="/absolute/project/path"
+          />
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -1007,8 +978,20 @@ export default function CronPage() {
 
         {jobs.length === 0 && (
           <Card>
-            <CardContent className="py-8 text-center text-sm text-muted-foreground">
-              {t.cron.noJobs}
+            <CardContent className="flex flex-col items-center gap-3 py-8 text-center text-sm text-muted-foreground">
+              <span>{t.cron.noJobs}</span>
+              <Button
+                className="uppercase"
+                size="sm"
+                onClick={() => {
+                  setCreateProfile(
+                    selectedProfile === "all" ? "default" : selectedProfile,
+                  );
+                  setCreateModalOpen(true);
+                }}
+              >
+                {t.common.create}
+              </Button>
             </CardContent>
           </Card>
         )}
@@ -1051,9 +1034,6 @@ export default function CronPage() {
                     )}
                     {mode !== "agent" && (
                       <Badge tone="outline">{mode}</Badge>
-                    )}
-                    {job.session_mode === "persistent" && (
-                      <Badge tone="outline">continues</Badge>
                     )}
                     {modelDisplay && (
                       <Badge tone="outline" title={modelDisplay}>

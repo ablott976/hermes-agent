@@ -24,7 +24,6 @@ function form(overrides: Partial<CronJobFormState> = {}): CronJobFormState {
     context_from: "",
     enabled_toolsets: [],
     workdir: "",
-    session_mode: "fresh",
     ...overrides,
   };
 }
@@ -69,19 +68,7 @@ describe("buildCronJobPayload", () => {
       context_from: null,
       enabled_toolsets: null,
       workdir: null,
-      session_mode: "fresh",
     });
-  });
-
-  it("keeps persistent mode for agent jobs and forces script-only jobs to fresh", () => {
-    expect(
-      buildCronJobPayload(form({ session_mode: "persistent" })).session_mode,
-    ).toBe("persistent");
-    expect(
-      buildCronJobPayload(
-        form({ session_mode: "persistent", no_agent: true, script: "watch.py" }),
-      ).session_mode,
-    ).toBe("fresh");
   });
 });
 
@@ -115,18 +102,7 @@ describe("cronJobFormFromJob", () => {
       schedule: "every 1h",
       context_from: "upstream-a\nupstream-b",
       enabled_toolsets: ["web"],
-      session_mode: "fresh",
     });
-  });
-
-  it("restores persistent conversation mode", () => {
-    const job: CronJob = {
-      id: "continuing-job",
-      enabled: true,
-      session_mode: "persistent",
-    };
-
-    expect(cronJobFormFromJob(job).session_mode).toBe("persistent");
   });
 
   it("prefers one-shot run_at over the human display string", () => {

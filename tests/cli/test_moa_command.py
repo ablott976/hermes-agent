@@ -1,4 +1,3 @@
-import inspect
 import queue
 from unittest.mock import patch
 
@@ -74,41 +73,43 @@ def test_moa_non_preset_is_one_shot_prompt():
     assert cli._pending_moa_restore_model["provider"] != "moa"
 
 
-def test_moa_one_shot_restores_route_and_cleanup_runs_from_finally():
-    cli = _make_cli()
-    original_route = {
-        "requested_provider": cli.requested_provider,
-        "provider": cli.provider,
-        "model": cli.model,
-        "api_key": cli.api_key,
-        "base_url": cli.base_url,
-        "api_mode": cli.api_mode,
-    }
-    with patch("cli._cprint"):
-        cli.process_command("/moa inspect the failure")
-
-    cli.agent = object()
-    cli._restore_model_after_moa_turn()
-
-    for key, value in original_route.items():
-        assert getattr(cli, key) == value
-    assert cli.agent is None
-    assert cli._pending_moa_restore_model is None
-    assert cli._pending_moa_disable_after_turn is False
-
-    chat_source = inspect.getsource(HermesCLI.chat)
-    run_index = chat_source.index("result = self.agent.run_conversation(")
-    except_index = chat_source.index("except Exception as exc:", run_index)
-    finally_index = chat_source.index("finally:", except_index)
-    restore_index = chat_source.index("self._restore_model_after_moa_turn()", finally_index)
-    flush_index = chat_source.index("self._flush_credit_notices()", restore_index)
-    assert run_index < except_index < finally_index < restore_index < flush_index
 
 
-def test_decode_legacy_encoded_moa_turn_still_works():
-    from hermes_cli.moa_config import build_moa_turn_prompt
+class TestNormalizeMoaModel:
+    """#56828: `-Q -m moa:<preset>` must route through the MoA virtual provider.
 
-    encoded = build_moa_turn_prompt("hello", _make_cli().config["moa"], preset="review")
-    prompt, cfg = decode_moa_turn(encoded)
-    assert prompt == "hello"
-    assert cfg["reference_models"] == [{"provider": "openrouter", "model": "deepseek/deepseek-v4-pro"}]
+    ``_normalize_moa_model`` maps the model string to (provider, preset); the
+    __init__ wiring then forces ``requested_provider="moa"`` so the existing
+    resolve_runtime_provider / agent_init MoA path runs in non-interactive mode.
+    """
+
+    def test_moa_prefix_maps_to_provider_and_preset(self):
+        from cli import _normalize_moa_model
+        assert _normalize_moa_model("moa:strategy") == ("moa", "strategy")
+
+
+
+
+    def test_none_model_unchanged(self):
+        from cli import _normalize_moa_model
+        assert _normalize_moa_model(None) == (None, None)
+
+    def test_colon_model_that_is_not_moa_unchanged(self):
+        from cli import _normalize_moa_model
+        # A provider:model form for a real provider must not be hijacked.
+        assert _normalize_moa_model("openrouter:deepseek/deepseek-v4") == (
+            None,
+            "openrouter:deepseek/deepseek-v4",
+        )
+
+    def test_override_wins_over_explicit_provider(self):
+        # __init__ resolves requested_provider as
+        # ``_moa_provider_override or provider or ...``, so a moa: prefix must
+        # take precedence over an explicit --provider (the #56828 deepseek case
+        # where MoA was silently ignored).
+        from cli import _normalize_moa_model
+        override, model = _normalize_moa_model("moa:strategy")
+        requested_provider = override or "deepseek" or "auto"
+        assert requested_provider == "moa"
+        assert model == "strategy"
+
