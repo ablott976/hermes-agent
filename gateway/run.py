@@ -19675,12 +19675,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             _bg_procs = None
 
-        decision = mgr.evaluate_after_turn(
-            final_response or "",
-            user_initiated=True,
-            background_processes=_bg_procs,
-            auto_rollover=self._goal_auto_rollover_from_config(),
-            repeat_checkpoint_limit=self._goal_repeat_checkpoint_limit_from_config(),
+        # evaluate_after_turn calls judge_goal() which makes a synchronous
+        # HTTP request to the auxiliary LLM. Running it on the event-loop
+        # thread would block platform heartbeats, so offload it while retaining
+        # profile-scoped contextvars used by credential resolution.
+        decision = await self._run_in_executor_with_context(
+            lambda: mgr.evaluate_after_turn(
+                final_response or "",
+                user_initiated=True,
+                background_processes=_bg_procs,
+                auto_rollover=self._goal_auto_rollover_from_config(),
+                repeat_checkpoint_limit=self._goal_repeat_checkpoint_limit_from_config(),
+            ),
         )
         msg = decision.get("message") or ""
 
