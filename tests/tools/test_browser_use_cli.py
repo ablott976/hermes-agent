@@ -377,6 +377,30 @@ class TestBackendCdpResolution:
         assert "bu:r7k2" in result["output"]
 
 
+class TestImplicitSessionIsolation:
+    def test_default_name_is_stable_and_profile_scoped(self, monkeypatch):
+        monkeypatch.setenv("HERMES_PROFILE", "profile-a")
+        first = bu_cli._default_session_name("task-1")
+        assert first == bu_cli._default_session_name("task-1")
+        monkeypatch.setenv("HERMES_PROFILE", "profile-b")
+        assert first != bu_cli._default_session_name("task-1")
+        assert len(first) <= 64
+
+    def test_default_name_is_task_scoped(self, monkeypatch):
+        monkeypatch.setenv("HERMES_PROFILE", "profile-a")
+        assert bu_cli._default_session_name("task-1") != bu_cli._default_session_name("task-2")
+
+    def test_browser_exec_exports_implicit_isolated_name(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_PROFILE", "profile-a")
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "bu:$BU_NAME"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        monkeypatch.setattr(bu_cli, "_resolve_backend_cdp", lambda env, task_id: None)
+        result = json.loads(bu_cli.browser_exec("print(1)", task_id="task-1"))
+        expected = bu_cli._default_session_name("task-1")
+        assert result["success"] is True
+        assert f"bu:{expected}" in result["output"]
+
+
 class TestProviderPickerIntegration:
     """The `hermes tools` Browser Automation picker row (browser_backend
     marker) must enter/leave CLI mode cleanly and highlight correctly."""
