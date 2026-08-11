@@ -26,6 +26,7 @@ def _clean_env(monkeypatch):
     monkeypatch.delenv("BU_NAME", raising=False)
     monkeypatch.delenv("BU_AUTOSPAWN", raising=False)
     monkeypatch.delenv("BROWSER_USE_API_KEY", raising=False)
+    monkeypatch.delenv("BH_RUNTIME_DIR", raising=False)
     yield
 
 
@@ -399,6 +400,34 @@ class TestImplicitSessionIsolation:
         expected = bu_cli._default_session_name("task-1")
         assert result["success"] is True
         assert f"bu:{expected}" in result["output"]
+
+    @pytest.mark.skipif(os.name == "nt", reason="AF_UNIX runtime dir is POSIX-only")
+    def test_implicit_runtime_dir_is_short_private_and_stable(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_PROFILE", "profile-with-a-deliberately-long-name")
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "runtime:$BH_RUNTIME_DIR"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        monkeypatch.setattr(bu_cli, "_resolve_backend_cdp", lambda env, task_id: None)
+        first = json.loads(bu_cli.browser_exec("print(1)", task_id="task-1"))
+        second = json.loads(bu_cli.browser_exec("print(1)", task_id="task-1"))
+        runtime = first["output"].strip().split("runtime:", 1)[1]
+        assert runtime == second["output"].strip().split("runtime:", 1)[1]
+        assert runtime.startswith("/tmp/hbu-")
+        assert len(runtime.encode()) + len("/bu.sock") < 104
+        assert stat.S_IMODE(os.stat(runtime).st_mode) == 0o700
+
+    def test_explicit_session_does_not_force_runtime_override(self, tmp_path, monkeypatch):
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "runtime:${BH_RUNTIME_DIR-unset}"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        result = json.loads(bu_cli.browser_exec("print(1)", session="r7k2"))
+        assert "runtime:unset" in result["output"]
+
+    def test_operator_runtime_override_wins(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("BH_RUNTIME_DIR", str(tmp_path / "operator-runtime"))
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "runtime:$BH_RUNTIME_DIR"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        monkeypatch.setattr(bu_cli, "_resolve_backend_cdp", lambda env, task_id: None)
+        result = json.loads(bu_cli.browser_exec("print(1)", task_id="task-1"))
+        assert f"runtime:{tmp_path / 'operator-runtime'}" in result["output"]
 
 
 class TestProviderPickerIntegration:

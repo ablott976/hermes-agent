@@ -199,6 +199,33 @@ def _default_session_name(task_id: Optional[str]) -> str:
     return f"hermes-{safe_profile}-{digest}"
 
 
+def _implicit_runtime_dir(session_name: str) -> Optional[str]:
+    """Return a short, private POSIX IPC directory for an implicit daemon.
+
+    Browser Harness uses AF_UNIX on POSIX (104-byte ``sun_path`` on macOS).
+    Profile homes and the isolated BU_NAME can legitimately be long, so its
+    default runtime path can exceed that hard OS limit. A per-session
+    ``BH_RUNTIME_DIR`` makes Browser Harness use the short ``bu.sock`` stem;
+    workspaces, screenshots, and logs remain in their persistent locations.
+    """
+    if os.name == "nt":
+        return None
+    from pathlib import Path
+    import stat as statlib
+
+    uid = getattr(os, "geteuid", lambda: 0)()
+    digest = hashlib.sha256(session_name.encode("utf-8")).hexdigest()[:16]
+    path = Path("/tmp") / f"hbu-{uid}-{digest}"
+    path.mkdir(mode=0o700, parents=False, exist_ok=True)
+    info = path.lstat()
+    if path.is_symlink() or not statlib.S_ISDIR(info.st_mode):
+        raise RuntimeError(f"unsafe Browser Use runtime path: {path}")
+    if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+        raise RuntimeError(f"Browser Use runtime path is owned by another user: {path}")
+    os.chmod(path, 0o700)
+    return str(path)
+
+
 def _find_screenshot(stdout: str, since: float) -> Optional[str]:
     """Return the last screenshot path printed during this exec, or None.
 
@@ -371,6 +398,16 @@ def browser_exec(
         # Namespace implicit sessions so independent Hermes profiles/tasks
         # never share tabs, cookies, or browser state by accident.
         env["BU_NAME"] = _default_session_name(task_id)
+        # Browser Harness' default AF_UNIX path can exceed macOS' 104-byte
+        # limit for deep profile homes. Keep an explicit operator override;
+        # otherwise use a stable, private, per-daemon short runtime dir.
+        if "BH_RUNTIME_DIR" not in env:
+            try:
+                runtime_dir = _implicit_runtime_dir(env["BU_NAME"])
+            except Exception as e:
+                return tool_error(f"Could not prepare Browser Use IPC isolation: {e}")
+            if runtime_dir:
+                env["BH_RUNTIME_DIR"] = runtime_dir
 
     workspace = _workspace_dir(task_id)
     if workspace:
