@@ -4,6 +4,7 @@ When browser.backend is "browser-use", the model gets ``browser_exec`` tool
 instead of default browser tools
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -166,6 +167,36 @@ def _workspace_dir(task_id: Optional[str]) -> Optional[str]:
     except Exception as e:
         logger.debug("browser_exec workspace unavailable: %s", e)
         return None
+
+
+def _default_session_name(task_id: Optional[str]) -> str:
+    """Return a stable Browser Use daemon name isolated by profile and task.
+
+    Browser Use otherwise falls back to the process-independent name
+    ``default``. On a multi-profile Hermes host that would let unrelated
+    gateways attach to the same daemon and browser context. Keep explicit
+    ``session=`` names untouched, but namespace implicit sessions by the
+    resolved Hermes home plus task id.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = str(get_hermes_home().expanduser().resolve())
+    except Exception:
+        home = str(os.environ.get("HERMES_HOME") or "hermes-default")
+    profile = str(os.environ.get("HERMES_PROFILE") or "").strip()
+    if not profile:
+        try:
+            from pathlib import Path
+
+            path = Path(home)
+            profile = path.name if path.parent.name == "profiles" else "default"
+        except Exception:
+            profile = "default"
+    safe_profile = _TASK_ID_SAFE_RE.sub("-", profile).strip("-._")[:32] or "default"
+    identity = f"{home}\0{task_id or 'default'}".encode("utf-8", errors="surrogatepass")
+    digest = hashlib.sha256(identity).hexdigest()[:16]
+    return f"hermes-{safe_profile}-{digest}"
 
 
 def _find_screenshot(stdout: str, since: float) -> Optional[str]:
@@ -336,6 +367,10 @@ def browser_exec(
         backend_err = _resolve_backend_cdp(env, task_id)
         if backend_err:
             return tool_error(backend_err)
+        # The CLI defaults to one machine-global daemon named ``default``.
+        # Namespace implicit sessions so independent Hermes profiles/tasks
+        # never share tabs, cookies, or browser state by accident.
+        env["BU_NAME"] = _default_session_name(task_id)
 
     workspace = _workspace_dir(task_id)
     if workspace:
