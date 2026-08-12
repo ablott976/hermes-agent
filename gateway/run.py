@@ -19389,15 +19389,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
     @staticmethod
-    def _goal_continuation_payload(agent_result: Any) -> Optional[tuple[str, bool]]:
-        """Return ``(response_text, defer_status)`` for a safe goal boundary.
+    def _goal_continuation_payload(
+        agent_result: Any,
+    ) -> Optional[tuple[str, bool, bool]]:
+        """Return goal text, status ordering, and typed iteration-boundary state.
 
-        Substantive replies are judgeable. An empty reply is safe only when the
-        agent explicitly reports an ordinary iteration ceiling. Errors, partial
-        streams and user interrupts stay fail-closed to prevent retry loops.
+        Substantive replies are normally judgeable. When the agent explicitly
+        reports an ordinary iteration ceiling, preserve any summary as the
+        durable checkpoint but mark the boundary so the goal manager does not
+        mistake temporary tool exhaustion for a terminal user-input blocker.
+        Errors, partial streams and user interrupts stay fail-closed.
         """
         if isinstance(agent_result, str):
-            return (agent_result, True) if agent_result.strip() else None
+            return (agent_result, True, False) if agent_result.strip() else None
         if not isinstance(agent_result, dict):
             return None
         if (
@@ -19407,15 +19411,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ):
             return None
 
+        exit_reason = str(agent_result.get("turn_exit_reason") or "")
+        iteration_limit_reached = exit_reason.startswith("max_iterations_reached(")
         final_text = str(agent_result.get("final_response") or "")
         if final_text.strip():
-            return final_text, True
+            return final_text, True, iteration_limit_reached
 
-        exit_reason = str(agent_result.get("turn_exit_reason") or "")
-        if exit_reason.startswith("max_iterations_reached("):
+        if iteration_limit_reached:
             # No visible response will be delivered, so no post-delivery
             # callback can fire for the status notice.
-            return "", False
+            return "", False, True
         return None
 
     async def _handle_goal_after_agent_turn(
@@ -19435,7 +19440,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         payload = self._goal_continuation_payload(goal_result)
         if payload is None:
             return
-        response_text, defer_status = payload
+        response_text, defer_status, iteration_limit_reached = payload
 
         try:
             await self._post_turn_goal_continuation(
@@ -19443,6 +19448,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=source,
                 final_response=response_text,
                 defer_status=(defer_status and not response_already_delivered),
+                iteration_limit_reached=iteration_limit_reached,
             )
         except Exception as exc:
             sid = str(getattr(session_entry, "session_id", "") or "")
@@ -19642,6 +19648,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: Any,
         final_response: str,
         defer_status: bool = True,
+        iteration_limit_reached: bool = False,
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
         enqueue a continuation prompt for the same session.
@@ -19686,6 +19693,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 background_processes=_bg_procs,
                 auto_rollover=self._goal_auto_rollover_from_config(),
                 repeat_checkpoint_limit=self._goal_repeat_checkpoint_limit_from_config(),
+                iteration_limit_reached=iteration_limit_reached,
             ),
         )
         msg = decision.get("message") or ""

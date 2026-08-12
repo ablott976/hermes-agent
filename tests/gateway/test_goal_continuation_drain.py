@@ -206,7 +206,16 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
 @pytest.mark.parametrize(
     ("result", "expected"),
     [
-        ({"final_response": "progress"}, ("progress", True)),
+        ({"final_response": "progress"}, ("progress", True, False)),
+        (
+            {
+                "final_response": "I need another execution because tools stopped.",
+                "turn_exit_reason": "max_iterations_reached(12/12)",
+                "failed": False,
+                "interrupted": False,
+            },
+            ("I need another execution because tools stopped.", True, True),
+        ),
         (
             {
                 "final_response": "",
@@ -214,7 +223,7 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
                 "failed": False,
                 "interrupted": False,
             },
-            ("", False),
+            ("", False, True),
         ),
         (
             {
@@ -245,6 +254,42 @@ def test_goal_continuation_payload_only_accepts_safe_empty_budget_boundaries(
     from gateway.run import GatewayRunner
 
     assert GatewayRunner._goal_continuation_payload(result) == expected
+
+
+@pytest.mark.asyncio
+async def test_budget_summary_keeps_typed_iteration_boundary_for_goal_manager():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._post_turn_goal_continuation = AsyncMock()
+    source = _slack_thread_source()
+    session_entry = SimpleNamespace(session_id="goal-budget-summary")
+    summary = "Tools stopped at the per-turn limit; another execution is needed."
+
+    await runner._handle_goal_after_agent_turn(
+        session_entry=session_entry,
+        source=source,
+        agent_result={
+            "final_response": summary,
+            "turn_exit_reason": "max_iterations_reached(12/12)",
+            "failed": False,
+            "partial": False,
+            "interrupted": False,
+        },
+        final_response=summary,
+        response_already_delivered=False,
+    )
+
+    runner._post_turn_goal_continuation.assert_awaited_once_with(
+        session_entry=session_entry,
+        source=source,
+        final_response=summary,
+        defer_status=True,
+        iteration_limit_reached=True,
+    )
 
 
 @pytest.mark.asyncio
