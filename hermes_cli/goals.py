@@ -1719,6 +1719,7 @@ class GoalManager:
         background_processes: Optional[List[Dict[str, Any]]] = None,
         auto_rollover: bool = False,
         repeat_checkpoint_limit: int = 3,
+        iteration_limit_reached: bool = False,
     ) -> Dict[str, Any]:
         """Run the judge and update state. Return a decision dict.
 
@@ -1730,6 +1731,11 @@ class GoalManager:
         snapshot for this session. It's handed to the judge so it can decide
         to WAIT on an in-flight process (CI poller, build, ...) instead of
         re-poking the agent — the automatic counterpart to ``/goal wait``.
+
+        ``iteration_limit_reached`` is trusted runtime provenance from the
+        just-finished agent turn. It means the per-turn tool/API slice ended,
+        not that the standing goal is blocked, so the textual checkpoint must
+        not be allowed to turn that ordinary boundary into a DONE verdict.
 
         Decision keys:
           - ``status``: current goal status after update
@@ -1865,6 +1871,27 @@ class GoalManager:
                 if boundary is not None:
                     return boundary
             return gate_decision
+
+        if iteration_limit_reached:
+            reason = "per-turn iteration limit reached; continuing in the next goal slice"
+            state.last_verdict = "continue"
+            state.last_reason = reason
+            state.consecutive_parse_failures = 0
+            state.consecutive_transport_failures = 0
+            boundary = _slice_boundary(reason)
+            if boundary is not None:
+                return boundary
+            save_goal(self.session_id, state)
+            return {
+                "status": "active",
+                "should_continue": True,
+                "continuation_prompt": self.next_continuation_prompt(),
+                "verdict": "continue",
+                "reason": reason,
+                "message": (
+                    f"↻ Continuing toward goal ({state.turns_used}/{state.max_turns}): {reason}"
+                ),
+            }
 
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal,

@@ -137,6 +137,48 @@ class TestGoalManager:
         assert "port goal command to hermes" in prompt
         assert prompt.strip()  # non-empty
 
+    def test_iteration_boundary_bypasses_terminal_block_judgement(self, hermes_home):
+        """A tool-slice summary is a checkpoint, not a completed/blocked goal."""
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="iteration-boundary", default_max_turns=5)
+        mgr.set("finish the verified change")
+        summary = "I need another execution because the tool limit was reached."
+
+        with patch.object(goals, "judge_goal") as judge:
+            decision = mgr.evaluate_after_turn(
+                summary,
+                auto_rollover=True,
+                iteration_limit_reached=True,
+            )
+
+        judge.assert_not_called()
+        assert decision["verdict"] == "continue"
+        assert decision["should_continue"] is True
+        assert mgr.state.status == "active"
+        assert mgr.state.turns_used == 1
+        assert mgr.state.checkpoint == summary
+
+    def test_real_user_input_block_remains_terminal_when_judge_says_done(
+        self, hermes_home
+    ):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="real-block", default_max_turns=5)
+        mgr.set("finish the verified change")
+        with patch.object(
+            goals,
+            "judge_goal",
+            return_value=("done", "needs user credentials", False, None, False),
+        ):
+            decision = mgr.evaluate_after_turn("I need credentials from the user.")
+
+        assert decision["verdict"] == "done"
+        assert decision["should_continue"] is False
+        assert mgr.state.status == "done"
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Smoke: CommandDef is wired
