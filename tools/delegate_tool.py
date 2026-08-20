@@ -3193,6 +3193,9 @@ def delegate_task(
 
     # Load config
     cfg = _load_config()
+    model_override, model_error = _validate_model_override(model, cfg)
+    if model_error:
+        return tool_error(model_error)
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
@@ -3220,8 +3223,8 @@ def delegate_task(
     # Per-call model override: lets the caller pick a different model for
     # this delegation without touching config.yaml. Provider/base_url stay
     # from the delegation config (cliproxy by default).
-    if model:
-        creds["model"] = model
+    if model_override:
+        creds["model"] = model_override
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -4072,6 +4075,69 @@ def _load_config() -> dict:
         return {}
 
 
+def _get_allowed_model_overrides(cfg: Optional[dict] = None) -> Optional[List[str]]:
+    """Return the operator allowlist for model-facing overrides.
+
+    ``None`` means the key is absent and preserves unrestricted per-call
+    overrides for backward compatibility. An explicitly configured empty
+    value disables model-facing overrides. Order is preserved so the schema
+    can present operator-defined capability tiers predictably.
+    """
+    config = cfg if isinstance(cfg, dict) else _load_config()
+    if "allowed_models" not in config:
+        return None
+
+    raw = config.get("allowed_models")
+    if isinstance(raw, str):
+        text = raw.strip()
+        if text.startswith("["):
+            try:
+                decoded = json.loads(text)
+            except (TypeError, ValueError):
+                decoded = None
+            candidates = decoded if isinstance(decoded, list) else raw.split(",")
+        else:
+            candidates = raw.split(",")
+    elif isinstance(raw, (list, tuple, set)):
+        candidates = raw
+    else:
+        return []
+
+    models: List[str] = []
+    seen = set()
+    for value in candidates:
+        if not isinstance(value, str):
+            continue
+        model = value.strip()
+        if model and model not in seen:
+            seen.add(model)
+            models.append(model)
+    return models
+
+
+def _validate_model_override(
+    model: Any, cfg: dict
+) -> tuple[Optional[str], Optional[str]]:
+    """Normalize a per-call model override and enforce the operator allowlist."""
+    if model is None:
+        return None, None
+    if not isinstance(model, str):
+        return None, "Delegation model override must be a string."
+
+    normalized = model.strip()
+    if not normalized:
+        return None, None
+
+    allowed = _get_allowed_model_overrides(cfg)
+    if allowed is not None and normalized not in allowed:
+        allowed_text = ", ".join(allowed) if allowed else "none"
+        return None, (
+            f"Delegation model '{normalized}' is not allowed by "
+            f"delegation.allowed_models (allowed: {allowed_text})."
+        )
+    return normalized, None
+
+
 # ---------------------------------------------------------------------------
 # OpenAI Function-Calling Schema
 # ---------------------------------------------------------------------------
@@ -4097,10 +4163,12 @@ def _build_top_level_description() -> str:
         "transcript paths, and the completed result (one consolidated message "
         "for a batch) re-enters the conversation on its own. Do NOT wait or "
         "poll; continue other work.\n\n"
-        "USE FOR: reasoning-heavy subtasks, work that would flood your context "
-        "with intermediate data, or independent parallel workstreams.\n"
+        "USE FOR: model-specialized bounded execution, reasoning-heavy subtasks, "
+        "work that would flood your context with intermediate data, or "
+        "independent parallel workstreams.\n"
         "DO NOT USE FOR (use these instead):\n"
-        "- Mechanical multi-step work with no reasoning needed -> execute_code\n"
+        "- Mechanical work that fits one deterministic script -> execute_code; "
+        "otherwise an operator-allowed worker model may be delegated\n"
         "- A single tool call -> call the tool directly\n"
         "- Tasks needing user interaction -> subagents cannot ask questions\n"
         "- Durable work that must survive this session -> cronjob or "
@@ -4120,7 +4188,8 @@ def _build_top_level_description() -> str:
         "memory, send_message, or cronjob; orchestrators regain only "
         "delegate_task.\n"
         "- Children inherit the parent model and fallback chain unless pinned "
-        "globally via delegation.provider / delegation.model in config.yaml. "
+        "globally via delegation.provider / delegation.model in config.yaml or "
+        "selected per call from delegation.allowed_models. "
         "Results are returned as an array, one entry per task."
     )
 
@@ -4192,6 +4261,19 @@ def _build_dynamic_schema_overrides() -> dict:
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
+    allowed_models = _get_allowed_model_overrides()
+    if allowed_models is not None:
+        if allowed_models:
+            overrides_params["properties"]["model"]["enum"] = allowed_models
+            overrides_params["properties"]["model"]["description"] = (
+                "Optional model override for every child in this delegation. "
+                "Provider/base_url stay from config. Operator-allowed models: "
+                + ", ".join(allowed_models)
+                + "."
+            )
+        else:
+            # An explicit empty allowlist disables the model-facing override.
+            overrides_params["properties"].pop("model", None)
 
     return {
         "description": _build_top_level_description(),
@@ -4239,7 +4321,9 @@ DELEGATE_TASK_SCHEMA = {
                     "Optional model override for this delegation (e.g. "
                     "'kimi-k3', 'gpt-5.6-luna'). Overrides the configured "
                     "delegation model for all children in this call; "
-                    "provider/base_url stay from config."
+                    "provider/base_url stay from config. When "
+                    "delegation.allowed_models is configured, the override "
+                    "must be in that operator allowlist."
                 ),
             },
             "tasks": {

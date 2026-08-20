@@ -64,6 +64,7 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("goal", props)
         self.assertIn("tasks", props)
         self.assertIn("context", props)
+        self.assertIn("model", props)
         # toolsets is intentionally NOT exposed to the model — subagents always
         # inherit the parent's toolsets. Letting the model name toolsets was a
         # capability-selection surface the model should not control.
@@ -130,6 +131,35 @@ class TestDelegateRequirements(unittest.TestCase):
         # Static top-level text must not embed stale limits.
         self.assertNotIn("up to 7", overrides["description"])
         self.assertNotIn("max_spawn_depth", overrides["description"])
+
+    def test_dynamic_schema_limits_model_override_to_operator_allowlist(self):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        allowed = ["gpt-5.3-codex-spark", "gpt-5.6-luna", "gpt-5.6-terra"]
+        with patch(
+            "tools.delegate_tool._load_config",
+            return_value={"allowed_models": allowed},
+        ):
+            overrides = _build_dynamic_schema_overrides()
+
+        model_schema = overrides["parameters"]["properties"]["model"]
+        self.assertEqual(model_schema["enum"], allowed)
+        self.assertIn("gpt-5.6-terra", model_schema["description"])
+
+    def test_dynamic_schema_accepts_cli_serialized_allowlist(self):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        serialized = '["gpt-5.3-codex-spark", "gpt-5.6-luna"]'
+        with patch(
+            "tools.delegate_tool._load_config",
+            return_value={"allowed_models": serialized},
+        ):
+            overrides = _build_dynamic_schema_overrides()
+
+        self.assertEqual(
+            overrides["parameters"]["properties"]["model"]["enum"],
+            ["gpt-5.3-codex-spark", "gpt-5.6-luna"],
+        )
 
 class TestChildSystemPrompt(unittest.TestCase):
     def test_goal_only(self):
@@ -305,6 +335,55 @@ class TestDelegateTask(unittest.TestCase):
 
             _, kwargs = MockAgent.call_args
             self.assertEqual(kwargs["model"], "kimi-k3")
+
+    def test_allowlisted_model_override_reaches_child(self):
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "allowed_models": ["gpt-5.3-codex-spark", "gpt-5.6-luna"],
+        }
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value=cfg),
+            patch("run_agent.AIAgent") as MockAgent,
+        ):
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(
+                goal="Test allowlisted model",
+                model="gpt-5.3-codex-spark",
+                parent_agent=parent,
+            )
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["model"], "gpt-5.3-codex-spark")
+
+    def test_disallowed_model_override_fails_before_child_creation(self):
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "allowed_models": ["gpt-5.3-codex-spark", "gpt-5.6-luna"],
+        }
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value=cfg),
+            patch("run_agent.AIAgent") as MockAgent,
+        ):
+            result = json.loads(
+                delegate_task(
+                    goal="Do not use Sol",
+                    model="gpt-5.6-sol",
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertIn("error", result)
+        self.assertIn("delegation.allowed_models", result["error"])
+        MockAgent.assert_not_called()
 
     def test_no_model_override_keeps_configured_model(self):
         parent = _make_mock_parent(depth=0)
@@ -1277,6 +1356,7 @@ class TestDispatchDelegateTask(unittest.TestCase):
                 parent,
                 {
                     "goal": "test",
+                    "model": "gpt-5.6-terra",
                     "acp_command": "claude",
                     "acp_args": ["--acp", "--stdio"],
                     "tasks": [
@@ -1292,6 +1372,7 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_command", captured)
         self.assertNotIn("acp_args", captured)
         self.assertEqual(captured["goal"], "test")
+        self.assertEqual(captured["model"], "gpt-5.6-terra")
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
 

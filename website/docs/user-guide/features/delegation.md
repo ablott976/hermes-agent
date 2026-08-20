@@ -149,9 +149,22 @@ You can configure a different model for subagents via `config.yaml` — useful f
 delegation:
   model: "google/gemini-flash-2.0"    # Cheaper model for subagents
   provider: "openrouter"              # Optional: route subagents to a different provider
+  allowed_models:                     # Optional guardrail for per-call selection
+    - "google/gemini-flash-2.0"
+    - "anthropic/claude-haiku-4.5"
 ```
 
-If omitted, subagents use the same model as the parent.
+If omitted, subagents use the same model as the parent. A caller can select a different approved worker model for one delegation without changing the provider:
+
+```python
+delegate_task(
+    goal="Apply the already-specified formatting changes",
+    context="The exact files and acceptance checks are listed below...",
+    model="google/gemini-flash-2.0",
+)
+```
+
+When `delegation.allowed_models` is configured, Hermes exposes those values as the tool's model enum and rejects any other override before creating a child. If the key is absent, overrides remain unrestricted for backward compatibility; an explicitly empty list disables per-call model selection.
 
 ### Cost strategy: frontier planner, inexpensive workers
 
@@ -168,7 +181,7 @@ delegation:
 
 Resolution order: `delegation.base_url` (direct endpoint) takes precedence, then `delegation.provider` (full credential bundle resolved via the runtime provider system), and when neither is set children inherit the parent's provider and credentials; `delegation.model` applies in all cases, and when it is empty children inherit the parent's model.
 
-Note that the pin is global: `delegate_task` has no per-task model parameter, so every child in a batch runs on the configured delegation model. For quality-sensitive subtasks that need a stronger model, either leave `delegation.model` unset for that session or hand the task to the [kanban board](kanban.md#per-task-model-override), which does support a per-task model override.
+The per-call selector applies to every child in that `delegate_task` call. To use different worker models, dispatch separate calls; a single batch still shares one model. For durable work that needs an independently pinned model, use the [kanban board](kanban.md#per-task-model-override).
 
 ## Inherited Tool Access
 
