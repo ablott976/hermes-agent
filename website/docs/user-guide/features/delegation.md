@@ -166,6 +166,30 @@ delegate_task(
 
 When `delegation.allowed_models` is configured, Hermes exposes those values as the tool's model enum and rejects any other override before creating a child. If the key is absent, overrides remain unrestricted for backward compatibility; an explicitly empty list disables per-call model selection.
 
+### Operator-defined semantic routes
+
+For policy-driven model selection, configure named routes. Each route requires a non-empty `model` and valid `reasoning_effort`; `role` defaults to `leaf`, and `allow_fallback` defaults to `false`.
+
+```yaml
+# In ~/.hermes/config.yaml
+delegation:
+  max_spawn_depth: 2
+  allowed_models:
+    - gpt-5.3-codex-spark
+    - gpt-5.6-luna
+    - gpt-5.6-terra
+  routes:
+    orchestration: {model: gpt-5.6-sol, reasoning_effort: xhigh, role: orchestrator}
+    verification: {model: gpt-5.6-sol, reasoning_effort: xhigh, role: leaf}
+    coding: {model: gpt-5.6-terra, reasoning_effort: xhigh, role: leaf}
+```
+
+Valid routes appear as the model-facing `route` enum. `delegate_task(route="verification")` fixes every child in that call to Sol with `xhigh` reasoning and the leaf role; caller and per-task roles cannot override it. The route cannot be combined with `model=...`, and it cannot override provider, base URL, API key, or API mode. Those credentials continue to come from the delegation configuration or parent inheritance. Parent fallback models are not passed to a routed child unless the route explicitly includes `allow_fallback: true`.
+
+The direct selector remains limited to Spark, Luna, and Terra in this policy; Sol is reachable only through the named routes. A route covers the whole `delegate_task` call, including all members of a `tasks` batch. Use separate calls for mixed-route batches.
+
+`max_spawn_depth: 2` is required here for the `orchestration` route to retain `role: orchestrator` and spawn leaf workers. At the default depth of `1`, Hermes safely degrades that requested role to `leaf` while keeping the route's model and reasoning settings.
+
 ### Cost strategy: frontier planner, inexpensive workers
 
 Decomposing a problem into well-specified subtasks takes frontier-level judgment; executing a subtask that already comes with a clear goal, full context, and an output contract usually doesn't. Meanwhile the children are where the tokens go — a parallel batch of subagents typically burns the large majority of a run's total tokens, so the worker model is where the cost actually lives. Pinning `delegation.model` to an inexpensive model while your main session stays on a frontier model keeps the planning quality where it matters and cuts spend where the volume is:
@@ -181,7 +205,7 @@ delegation:
 
 Resolution order: `delegation.base_url` (direct endpoint) takes precedence, then `delegation.provider` (full credential bundle resolved via the runtime provider system), and when neither is set children inherit the parent's provider and credentials; `delegation.model` applies in all cases, and when it is empty children inherit the parent's model.
 
-The per-call selector applies to every child in that `delegate_task` call. To use different worker models, dispatch separate calls; a single batch still shares one model. For durable work that needs an independently pinned model, use the [kanban board](kanban.md#per-task-model-override).
+The per-call model selector or semantic route applies to every child in that `delegate_task` call. To use different worker models or routes, dispatch separate calls; a single batch still shares one selection. For durable work that needs an independently pinned model, use the [kanban board](kanban.md#per-task-model-override).
 
 ## Inherited Tool Access
 

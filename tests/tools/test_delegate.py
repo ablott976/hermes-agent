@@ -65,6 +65,7 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("tasks", props)
         self.assertIn("context", props)
         self.assertIn("model", props)
+        self.assertIn("route", props)  # dynamically hidden without valid routes
         # toolsets is intentionally NOT exposed to the model — subagents always
         # inherit the parent's toolsets. Letting the model name toolsets was a
         # capability-selection surface the model should not control.
@@ -1333,6 +1334,352 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         call_kwargs = MockAgent.call_args[1]
         self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "low"})
 
+
+class TestDelegationRoutes(unittest.TestCase):
+    """Operator-defined semantic delegation routes."""
+
+    ROUTES = {
+        "orchestration": {
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "xhigh",
+            "role": "orchestrator",
+        },
+        "verification": {
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "xhigh",
+            "role": "leaf",
+        },
+        "coding": {
+            "model": "gpt-5.6-terra",
+            "reasoning_effort": "xhigh",
+            "role": "leaf",
+        },
+    }
+
+    @staticmethod
+    def _mock_child():
+        child = MagicMock()
+        child.run_conversation.return_value = {
+            "final_response": "done",
+            "completed": True,
+            "api_calls": 1,
+            "messages": [],
+        }
+        child._delegate_saved_tool_names = []
+        child._credential_pool = None
+        child.session_prompt_tokens = 0
+        child.session_completion_tokens = 0
+        child.model = "test"
+        return child
+
+    def _run_route(self, cfg, route, *, caller_role=None):
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["terminal"]
+        parent.reasoning_config = {"enabled": True, "effort": "medium"}
+        parent._fallback_chain = [{"model": "parent-fallback"}]
+        child = self._mock_child()
+        with (
+            patch("tools.delegate_tool._load_config", return_value=cfg),
+            patch("run_agent.AIAgent", return_value=child) as MockAgent,
+        ):
+            delegate_task(
+                goal="Complete the routed task",
+                route=route,
+                role=caller_role,
+                parent_agent=parent,
+            )
+        return parent, child, MockAgent.call_args[1]
+
+    def test_dynamic_schema_routes_support_dict_and_json_config_and_hide_when_empty(self):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        for route_config in (self.ROUTES, json.dumps(self.ROUTES)):
+            with self.subTest(route_config_type=type(route_config).__name__), patch(
+                "tools.delegate_tool._load_config",
+                return_value={"routes": route_config},
+            ):
+                properties = _build_dynamic_schema_overrides()["parameters"]["properties"]
+                self.assertEqual(properties["route"]["enum"], list(self.ROUTES))
+                self.assertIn("every child", properties["route"]["description"])
+                self.assertIn("orchestration", properties["route"]["description"])
+
+        for config in ({}, {"routes": {}}):
+            with self.subTest(config=config), patch(
+                "tools.delegate_tool._load_config", return_value=config
+            ):
+                properties = _build_dynamic_schema_overrides()["parameters"]["properties"]
+                self.assertNotIn("route", properties)
+
+    def test_dynamic_schema_hides_route_when_every_definition_is_malformed(self):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+        from tools.registry import registry
+
+        cfg = {
+            "routes": {
+                "missing_model": {"reasoning_effort": "xhigh"},
+                "bad_effort": {
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "invalid",
+                },
+            }
+        }
+        with patch("tools.delegate_tool._load_config", return_value=cfg):
+            direct = _build_dynamic_schema_overrides()["parameters"]["properties"]
+            registered = registry.get_definitions({"delegate_task"})[0]["function"]
+
+        self.assertNotIn("route", direct)
+        self.assertNotIn("route", registered["parameters"]["properties"])
+
+    def test_unknown_and_malformed_routes_fail_before_child_creation(self):
+        parent = _make_mock_parent(depth=0)
+        cases = (
+            (
+                {"routes": self.ROUTES},
+                "missing",
+                "Unknown delegation route",
+            ),
+            (
+                {
+                    "routes": {
+                        "broken": {
+                            "model": "gpt-5.6-sol",
+                            "reasoning_effort": "not-an-effort",
+                        }
+                    }
+                },
+                "broken",
+                "invalid reasoning_effort",
+            ),
+        )
+        for cfg, route, expected_error in cases:
+            with self.subTest(route=route):
+                with (
+                    patch("tools.delegate_tool._load_config", return_value=cfg),
+                    patch("run_agent.AIAgent") as MockAgent,
+                ):
+                    result = json.loads(
+                        delegate_task(
+                            goal="Do not create a child",
+                            route=route,
+                            parent_agent=parent,
+                        )
+                    )
+                    self.assertIn(expected_error, result["error"])
+                    MockAgent.assert_not_called()
+
+    def test_route_and_raw_model_conflict_fails_before_child_creation(self):
+        parent = _make_mock_parent(depth=0)
+        with (
+            patch("tools.delegate_tool._load_config", return_value={"routes": self.ROUTES}),
+            patch("run_agent.AIAgent") as MockAgent,
+        ):
+            result = json.loads(
+                delegate_task(
+                    goal="Route/model conflict",
+                    route="coding",
+                    model="gpt-5.6-terra",
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertIn("route and model", result["error"])
+        MockAgent.assert_not_called()
+
+    def test_empty_route_keeps_raw_model_override_compatibility(self):
+        parent = _make_mock_parent(depth=0)
+        child = self._mock_child()
+        cfg = {
+            "allowed_models": ["gpt-5.6-terra"],
+            "routes": self.ROUTES,
+        }
+        with (
+            patch("tools.delegate_tool._load_config", return_value=cfg),
+            patch("run_agent.AIAgent", return_value=child) as MockAgent,
+        ):
+            delegate_task(
+                goal="Keep raw model compatibility",
+                route="  ",
+                model="gpt-5.6-terra",
+                parent_agent=parent,
+            )
+
+        self.assertEqual(MockAgent.call_args[1]["model"], "gpt-5.6-terra")
+
+    def test_pre_route_positional_parent_agent_layout_remains_compatible(self):
+        parent = _make_mock_parent(depth=0)
+        child = self._mock_child()
+        with (
+            patch("tools.delegate_tool._load_config", return_value={}),
+            patch("run_agent.AIAgent", return_value=child) as MockAgent,
+        ):
+            delegate_task(
+                "Positional compatibility",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                parent,
+            )
+
+        MockAgent.assert_called_once()
+
+    def test_orchestration_route_fixes_sol_xhigh_role_and_disables_parent_fallback(self):
+        cfg = {"routes": self.ROUTES, "max_spawn_depth": 2}
+        _parent, child, kwargs = self._run_route(
+            cfg, "orchestration", caller_role="leaf"
+        )
+
+        self.assertEqual(kwargs["model"], "gpt-5.6-sol")
+        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "xhigh"})
+        self.assertEqual(kwargs["fallback_model"], None)
+        self.assertEqual(child._delegate_role, "orchestrator")
+
+    def test_orchestration_route_degrades_to_leaf_at_flat_depth(self):
+        _parent, child, kwargs = self._run_route(
+            {"routes": self.ROUTES, "max_spawn_depth": 1},
+            "orchestration",
+        )
+
+        self.assertEqual(kwargs["model"], "gpt-5.6-sol")
+        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "xhigh"})
+        self.assertEqual(child._delegate_role, "leaf")
+
+    def test_orchestration_route_degrades_to_leaf_when_kill_switch_is_off(self):
+        _parent, child, kwargs = self._run_route(
+            {
+                "routes": self.ROUTES,
+                "max_spawn_depth": 2,
+                "orchestrator_enabled": False,
+            },
+            "orchestration",
+        )
+
+        self.assertEqual(kwargs["model"], "gpt-5.6-sol")
+        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "xhigh"})
+        self.assertEqual(child._delegate_role, "leaf")
+
+    def test_verification_route_fixes_sol_xhigh_and_leaf_role(self):
+        _parent, child, kwargs = self._run_route(
+            {"routes": self.ROUTES, "max_spawn_depth": 2},
+            "verification",
+            caller_role="orchestrator",
+        )
+
+        self.assertEqual(kwargs["model"], "gpt-5.6-sol")
+        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "xhigh"})
+        self.assertEqual(child._delegate_role, "leaf")
+
+    def test_coding_route_fixes_terra_xhigh_and_leaf_role_from_json_config(self):
+        _parent, child, kwargs = self._run_route(
+            {"routes": json.dumps(self.ROUTES)},
+            "coding",
+            caller_role="orchestrator",
+        )
+
+        self.assertEqual(kwargs["model"], "gpt-5.6-terra")
+        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "xhigh"})
+        self.assertEqual(child._delegate_role, "leaf")
+
+    def test_routed_batch_applies_one_fixed_policy_to_every_child(self):
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["terminal"]
+        parent.reasoning_config = {"enabled": True, "effort": "medium"}
+        parent._fallback_chain = [{"model": "parent-fallback"}]
+        children = [self._mock_child(), self._mock_child()]
+        cfg = {
+            "routes": self.ROUTES,
+            "max_concurrent_children": 2,
+            "max_spawn_depth": 2,
+        }
+        with (
+            patch("tools.delegate_tool._load_config", return_value=cfg),
+            patch("run_agent.AIAgent", side_effect=children) as MockAgent,
+        ):
+            delegate_task(
+                tasks=[
+                    {"goal": "Verify the first independent implementation path"},
+                    {"goal": "Verify the second independent implementation path"},
+                ],
+                route="verification",
+                parent_agent=parent,
+            )
+
+        self.assertEqual(MockAgent.call_count, 2)
+        for child, call in zip(children, MockAgent.call_args_list):
+            kwargs = call.kwargs
+            self.assertEqual(kwargs["model"], "gpt-5.6-sol")
+            self.assertEqual(
+                kwargs["reasoning_config"],
+                {"enabled": True, "effort": "xhigh"},
+            )
+            self.assertIsNone(kwargs["fallback_model"])
+            self.assertEqual(child._delegate_role, "leaf")
+
+    def test_route_yaml_false_disables_reasoning_without_overriding_credentials(self):
+        routes = {
+            "disabled": {
+                "model": "gpt-5.6-terra",
+                "reasoning_effort": False,
+                # These route extras are deliberately ignored: credentials are
+                # always resolved from delegation config or parent inheritance.
+                "provider": "untrusted",
+                "base_url": "https://untrusted.example/v1",
+                "api_key": "untrusted-key",
+                "api_mode": "anthropic_messages",
+            }
+        }
+        parent, _child, kwargs = self._run_route({"routes": routes}, "disabled")
+
+        self.assertEqual(kwargs["reasoning_config"], {"enabled": False})
+        self.assertEqual(kwargs["provider"], parent.provider)
+        self.assertEqual(kwargs["base_url"], parent.base_url)
+        self.assertEqual(kwargs["api_key"], parent.api_key)
+        self.assertEqual(kwargs["api_mode"], parent.api_mode)
+
+    def test_route_allow_fallback_true_preserves_parent_fallback(self):
+        routes = dict(self.ROUTES)
+        routes["with_fallback"] = {
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "xhigh",
+            "allow_fallback": True,
+        }
+        parent, _child, kwargs = self._run_route(
+            {"routes": routes}, "with_fallback"
+        )
+
+        self.assertEqual(kwargs["fallback_model"], parent._fallback_chain)
+
+    def test_no_route_keeps_configured_and_parent_reasoning_and_fallback_behavior(self):
+        cases = (
+            (
+                {"reasoning_effort": "low"},
+                {"enabled": True, "effort": "low"},
+            ),
+            (
+                {},
+                {"enabled": True, "effort": "medium"},
+            ),
+        )
+        for cfg, expected_reasoning in cases:
+            with self.subTest(cfg=cfg):
+                parent = _make_mock_parent(depth=0)
+                parent.enabled_toolsets = ["terminal"]
+                parent.reasoning_config = {"enabled": True, "effort": "medium"}
+                parent._fallback_chain = [{"model": "parent-fallback"}]
+                child = self._mock_child()
+                with (
+                    patch("tools.delegate_tool._load_config", return_value=cfg),
+                    patch("run_agent.AIAgent", return_value=child) as MockAgent,
+                ):
+                    delegate_task(goal="No route regression", parent_agent=parent)
+
+                kwargs = MockAgent.call_args[1]
+                self.assertEqual(kwargs["reasoning_config"], expected_reasoning)
+                self.assertEqual(kwargs["fallback_model"], parent._fallback_chain)
+
 # =========================================================================
 # Dispatch helper, progress events, concurrency
 # =========================================================================
@@ -1375,6 +1722,35 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertEqual(captured["model"], "gpt-5.6-terra")
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
+
+    def test_route_forwarded_by_dispatcher_and_registry_fallback(self):
+        import run_agent
+        from tools.registry import registry
+
+        captured = []
+
+        def fake_delegate_task(**kwargs):
+            captured.append(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {"goal": "dispatcher route", "route": "coding"},
+            )
+            registry.get_entry("delegate_task").handler(
+                {
+                    "goal": "registry route",
+                    "route": "verification",
+                    "model": "gpt-5.6-sol",
+                },
+                parent_agent=parent,
+            )
+
+        self.assertEqual(captured[0]["route"], "coding")
+        self.assertEqual(captured[1]["route"], "verification")
+        self.assertEqual(captured[1]["model"], "gpt-5.6-sol")
 
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
