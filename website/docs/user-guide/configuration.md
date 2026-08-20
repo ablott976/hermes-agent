@@ -2313,16 +2313,21 @@ Configure subagent behavior for the delegate tool:
 
 ```yaml
 delegation:
+  max_spawn_depth: 2                     # Allow routed orchestrators to spawn leaf workers
   # model: "google/gemini-3-flash-preview"  # Override model (empty = inherit parent)
   # provider: "openrouter"                  # Override provider (empty = inherit parent)
-  # allowed_models:                          # Optional allowlist for delegate_task(model=...)
-  #   - "google/gemini-3-flash-preview"
-  #   - "anthropic/claude-haiku-4.5"
+  allowed_models:                            # Direct delegate_task(model=...) choices
+    - gpt-5.3-codex-spark
+    - gpt-5.6-luna
+    - gpt-5.6-terra
+  routes:                                    # Operator-defined semantic choices
+    orchestration: {model: gpt-5.6-sol, reasoning_effort: xhigh, role: orchestrator}
+    verification: {model: gpt-5.6-sol, reasoning_effort: xhigh, role: leaf}
+    coding: {model: gpt-5.6-terra, reasoning_effort: xhigh, role: leaf}
   # base_url: "http://localhost:1234/v1"    # Direct OpenAI-compatible endpoint (takes precedence over provider)
   # api_key: "local-key"                    # API key for base_url (falls back to OPENAI_API_KEY)
   # api_mode: ""                            # Wire protocol for base_url: "chat_completions", "codex_responses", or "anthropic_messages". Empty = auto-detect from URL (e.g. /anthropic suffix → anthropic_messages). Set explicitly for non-standard endpoints the heuristic can't detect.
   max_concurrent_children: 3                # Parallel children per batch (floor 1, no ceiling). Also via DELEGATION_MAX_CONCURRENT_CHILDREN env var.
-  max_spawn_depth: 1                        # Delegation tree depth cap (1-3, clamped). 1 = flat (default): parent spawns leaves that cannot delegate. 2 = orchestrator children can spawn leaf grandchildren. 3 = three levels.
   orchestrator_enabled: true                # Global kill switch. When false, role="orchestrator" is ignored and every child is forced to leaf regardless of max_spawn_depth.
 ```
 
@@ -2330,15 +2335,21 @@ delegation:
 
 `delegate_task` also accepts an optional per-call `model` override. It changes only the model for that delegation; provider, endpoint, and credentials continue to come from the delegation configuration. Set `delegation.allowed_models` to restrict the model-facing selector to an operator-approved list. When the key is absent, per-call overrides are unrestricted for backward compatibility; an explicitly empty list disables the selector.
 
+**Semantic routes:** `delegation.routes` is an optional mapping of operator-defined names to a required non-empty `model` and required `reasoning_effort` (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`; YAML `false` disables reasoning). Each route may also set `role: leaf|orchestrator` (default `leaf`) and `allow_fallback: true|false` (default `false`). Valid routes appear as the `delegate_task(route=...)` enum. A route fixes the model, parsed reasoning configuration, role, and fallback policy for every child in that call; it cannot be combined with the raw `model` selector. The route never supplies provider, endpoint, API key, or API mode: those still come entirely from `delegation` configuration or parent inheritance.
+
+In the example above, direct selection remains limited to Spark, Luna, and Terra. Sol is deliberately reachable only through the `orchestration` and `verification` routes. One route applies to the entire single-task or batch call. Submit separate `delegate_task` calls when work needs mixed routes.
+
+The example sets `max_spawn_depth: 2` because the default depth of `1` forces every first-level child to `leaf`, including a route that requests `role: orchestrator`. Keep the default when Sol should plan without spawning workers; raise it deliberately when nested orchestration is required.
+
 **Direct endpoint override:** If you want the obvious custom-endpoint path, set `delegation.base_url`, `delegation.api_key`, and `delegation.model`. That sends subagents directly to that OpenAI-compatible endpoint and takes precedence over `delegation.provider`. If `delegation.api_key` is omitted, Hermes falls back to `OPENAI_API_KEY` only.
 
 **Wire protocol (`api_mode`):** Hermes auto-detects the wire protocol from `delegation.base_url` (e.g. paths ending in `/anthropic` → `anthropic_messages`; Codex / native Anthropic / Kimi-coding hostnames keep their existing detection). For endpoints the heuristic can't classify — for example Azure AI Foundry, MiniMax, Zhipu GLM, or LiteLLM proxies fronting an Anthropic-shaped backend — set `delegation.api_mode` explicitly to one of `chat_completions`, `codex_responses`, or `anthropic_messages`. Leave it empty (the default) to keep auto-detection.
 
 The delegation provider uses the same credential resolution as CLI/gateway startup. All configured providers are supported: `openrouter`, `nous`, `copilot`, `zai`, `kimi-coding`, `minimax`, `minimax-cn`. When a provider is set, the system automatically resolves the correct base URL, API key, and API mode — no manual credential wiring needed.
 
-**Precedence:** `delegation.base_url` in config → `delegation.provider` in config → parent provider (inherited). Per-call `delegate_task(model=...)` → `delegation.model` in config → parent model (inherited). A per-call model changes only the model name while keeping the configured/inherited provider credentials, and is rejected when it is outside a configured `delegation.allowed_models` list.
+**Precedence:** `delegation.base_url` in config → `delegation.provider` in config → parent provider (inherited). Per-call `delegate_task(model=...)` → `delegation.model` in config → parent model (inherited). A per-call model changes only the model name while keeping the configured/inherited provider credentials, and is rejected when it is outside a configured `delegation.allowed_models` list. `delegate_task(route=...)` instead selects the route's fixed model and reasoning/role/fallback policy while retaining this same provider-resolution chain; route fallback is off unless that route sets `allow_fallback: true`.
 
-**Width and depth:** `max_concurrent_children` caps how many subagents run in parallel per batch (default `3`, floor of 1, no ceiling). Can also be set via the `DELEGATION_MAX_CONCURRENT_CHILDREN` env var. When the model submits a `tasks` array longer than the cap, `delegate_task` returns a tool error explaining the limit rather than silently truncating. `max_spawn_depth` controls the delegation tree depth (clamped to 1-3). At the default `1`, delegation is flat: children cannot spawn grandchildren, and passing `role="orchestrator"` silently degrades to `leaf`. Raise to `2` so orchestrator children can spawn leaf grandchildren; `3` for three-level trees. The agent opts into orchestration per call via `role="orchestrator"`; `orchestrator_enabled: false` forces every child back to leaf regardless. Cost scales multiplicatively — at `max_spawn_depth: 3` with `max_concurrent_children: 3`, the tree can reach 3×3×3 = 27 concurrent leaf agents. See [Subagent Delegation → Depth Limit and Nested Orchestration](features/delegation.md#depth-limit-and-nested-orchestration) for usage patterns.
+**Width and depth:** `max_concurrent_children` caps how many subagents run in parallel per batch (default `3`, floor of 1, no ceiling). Can also be set via the `DELEGATION_MAX_CONCURRENT_CHILDREN` env var. When the model submits a `tasks` array longer than the cap, `delegate_task` returns a tool error explaining the limit rather than silently truncating. `max_spawn_depth` controls the delegation tree depth (default `1`, floor of 1, no hard ceiling). At `1`, delegation is flat: children cannot spawn grandchildren, and passing `role="orchestrator"` silently degrades to `leaf`. Raise to `2` so orchestrator children can spawn leaf grandchildren; `3` for three-level trees. The agent opts into orchestration per call via `role="orchestrator"`; `orchestrator_enabled: false` forces every child back to leaf regardless. Cost scales multiplicatively — at `max_spawn_depth: 3` with `max_concurrent_children: 3`, the tree can reach 3×3×3 = 27 concurrent leaf agents. See [Subagent Delegation → Depth Limit and Nested Orchestration](features/delegation.md#depth-limit-and-nested-orchestration) for usage patterns.
 
 ## Clarify
 

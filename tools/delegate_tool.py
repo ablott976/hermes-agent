@@ -22,6 +22,7 @@ import contextvars
 import json
 import logging
 import re
+from collections.abc import Mapping
 
 logger = logging.getLogger(__name__)
 import os
@@ -1318,6 +1319,11 @@ def _build_child_agent(
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
     override_max_tokens: Optional[int] = None,
+    # Parsed route reasoning config and fallback policy. These are supplied
+    # only by a selected operator-defined delegation route; normal calls keep
+    # the historical delegation.reasoning_effort / parent-fallback behavior.
+    override_reasoning_config: Optional[Dict[str, Any]] = None,
+    inherit_parent_fallback: bool = True,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -1545,33 +1551,43 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
-    # Resolve reasoning config: delegation override > parent inherit
+    # Resolve reasoning config: selected route > delegation override > parent
+    # inherit. Route parsing happens before child construction, so this is
+    # already a parsed reasoning_config dict rather than a raw effort string.
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
-    child_reasoning = parent_reasoning
-    try:
-        # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
-        # False (``reasoning_effort: false``) to "" and inherit the parent
-        # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
-        if delegation_effort or delegation_effort is False:
-            from hermes_constants import parse_reasoning_effort
+    child_reasoning: Any
+    if override_reasoning_config is not None:
+        child_reasoning = dict(override_reasoning_config)
+    else:
+        child_reasoning = parent_reasoning
+        try:
+            # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
+            # False (``reasoning_effort: false``) to "" and inherit the parent
+            # instead of disabling thinking for children.
+            delegation_effort = delegation_cfg.get("reasoning_effort")
+            if delegation_effort or delegation_effort is False:
+                from hermes_constants import parse_reasoning_effort
 
-            parsed = parse_reasoning_effort(delegation_effort)
-            if parsed is not None:
-                child_reasoning = parsed
-            else:
-                logger.warning(
-                    "Unknown delegation.reasoning_effort '%s', inheriting parent level",
-                    delegation_effort,
-                )
-    except Exception as exc:
-        logger.debug("Could not load delegation reasoning_effort: %s", exc)
+                parsed = parse_reasoning_effort(delegation_effort)
+                if parsed is not None:
+                    child_reasoning = parsed
+                else:
+                    logger.warning(
+                        "Unknown delegation.reasoning_effort '%s', inheriting parent level",
+                        delegation_effort,
+                    )
+        except Exception as exc:
+            logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
     # agent does.  _fallback_chain is a list accepted by AIAgent's
     # fallback_model parameter (which handles both list and dict forms).
-    parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    parent_fallback = (
+        getattr(parent_agent, "_fallback_chain", None) or None
+        if inherit_parent_fallback
+        else None
+    )
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -3139,6 +3155,7 @@ def delegate_task(
     output_schema: Optional[Dict[str, Any]] = None,
     model: Optional[str] = None,
     parent_agent=None,
+    route: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -3150,7 +3167,9 @@ def delegate_task(
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
-    delegation.max_spawn_depth.  Per-task role beats the top-level one.
+    delegation.max_spawn_depth. Per-task role beats the top-level one unless
+    an operator-defined route is selected; a route fixes every child's role,
+    model, reasoning configuration, and fallback behavior for the whole call.
 
     Returns JSON with results array, one entry per task.
     """
@@ -3196,6 +3215,14 @@ def delegate_task(
     model_override, model_error = _validate_model_override(model, cfg)
     if model_error:
         return tool_error(model_error)
+    selected_route, route_error = _resolve_delegation_route(route, cfg)
+    if route_error:
+        return tool_error(route_error)
+    if model_override and selected_route is not None:
+        return tool_error(
+            "delegate_task route and model cannot be used together; select "
+            "an operator-defined route or use the raw model override."
+        )
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
@@ -3225,6 +3252,10 @@ def delegate_task(
     # from the delegation config (cliproxy by default).
     if model_override:
         creds["model"] = model_override
+    elif selected_route is not None:
+        # Routes are model-only policy objects. Provider credentials, endpoint,
+        # and API mode always remain from delegation config or parent inheritance.
+        creds["model"] = selected_route["model"]
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -3341,9 +3372,13 @@ def delegate_task(
     # subagent-lifecycle API).
     children = []
     for i, t in enumerate(task_list):
-        # Per-task role beats top-level; normalise again so unknown
-        # per-task values warn and degrade to leaf uniformly.
-        effective_role = _normalize_role(t.get("role") or top_role)
+        # A selected route is operator-authoritative. Otherwise preserve the
+        # historical per-task-over-top-level role precedence and normalization.
+        effective_role = (
+            selected_route["role"]
+            if selected_route is not None
+            else _normalize_role(t.get("role") or top_role)
+        )
         # T1-24: schema'd tasks get the contract appended to their context
         # so the child knows the expected output shape before it starts.
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
@@ -3369,6 +3404,16 @@ def delegate_task(
             override_api_mode=creds["api_mode"],
             override_request_overrides=creds.get("request_overrides"),
             override_max_tokens=creds.get("max_output_tokens"),
+            override_reasoning_config=(
+                selected_route["reasoning_config"]
+                if selected_route is not None
+                else None
+            ),
+            inherit_parent_fallback=(
+                selected_route["allow_fallback"]
+                if selected_route is not None
+                else True
+            ),
             override_acp_command=creds.get("command"),
             override_acp_args=creds.get("args"),
             role=effective_role,
@@ -4138,6 +4183,130 @@ def _validate_model_override(
     return normalized, None
 
 
+def _load_delegation_routes(
+    cfg: Optional[dict] = None,
+) -> tuple[Mapping[Any, Any], Optional[str]]:
+    """Load ``delegation.routes``, accepting a config-set JSON object string.
+
+    This intentionally validates only the container. Individual route entries
+    are checked when selected, allowing one malformed operator route to remain
+    invisible in the model schema without disabling other valid routes.
+    """
+    config = cfg if isinstance(cfg, dict) else _load_config()
+    if "routes" not in config or config.get("routes") is None:
+        return {}, None
+
+    raw = config.get("routes")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            return {}, (
+                "delegation.routes must be a mapping or JSON object string "
+                f"({exc})."
+            )
+    if not isinstance(raw, Mapping):
+        return {}, "delegation.routes must be a mapping or JSON object string."
+    return raw, None
+
+
+def _parse_delegation_route_definition(
+    route_name: str,
+    definition: Any,
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Validate one operator route and return its fixed child settings."""
+    if not isinstance(definition, Mapping):
+        return None, f"Delegation route '{route_name}' must be an object."
+
+    model = definition.get("model")
+    if not isinstance(model, str) or not model.strip():
+        return None, (
+            f"Delegation route '{route_name}' must set a non-empty string model."
+        )
+
+    if "reasoning_effort" not in definition:
+        return None, f"Delegation route '{route_name}' must set reasoning_effort."
+    reasoning_effort = definition.get("reasoning_effort")
+    from hermes_constants import parse_reasoning_effort
+
+    reasoning_config = parse_reasoning_effort(reasoning_effort)
+    if reasoning_config is None:
+        return None, (
+            f"Delegation route '{route_name}' has invalid reasoning_effort "
+            f"{reasoning_effort!r}. Use none, minimal, low, medium, high, "
+            "xhigh, max, ultra, or YAML false."
+        )
+
+    raw_role = definition.get("role", "leaf")
+    if not isinstance(raw_role, str) or raw_role.strip().lower() not in {
+        "leaf",
+        "orchestrator",
+    }:
+        return None, (
+            f"Delegation route '{route_name}' role must be 'leaf' or "
+            "'orchestrator'."
+        )
+
+    raw_allow_fallback = definition.get("allow_fallback", False)
+    if not isinstance(raw_allow_fallback, bool):
+        return None, (
+            f"Delegation route '{route_name}' allow_fallback must be a boolean."
+        )
+
+    return {
+        "model": model.strip(),
+        "reasoning_config": dict(reasoning_config),
+        "role": raw_role.strip().lower(),
+        "allow_fallback": is_truthy_value(raw_allow_fallback, default=False),
+    }, None
+
+
+def _resolve_delegation_route(
+    route: Any,
+    cfg: Optional[dict] = None,
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Resolve and fully validate a model-selected delegation route."""
+    if route is None:
+        return None, None
+    if not isinstance(route, str):
+        return None, "Delegation route must be a string."
+    route_name = route.strip()
+    if not route_name:
+        return None, None
+
+    routes, routes_error = _load_delegation_routes(cfg)
+    if routes_error:
+        return None, routes_error
+    if route_name not in routes:
+        configured = _get_valid_delegation_route_names(cfg)
+        configured_text = ", ".join(configured) if configured else "none"
+        return None, (
+            f"Unknown delegation route '{route_name}' (configured routes: "
+            f"{configured_text})."
+        )
+    return _parse_delegation_route_definition(route_name, routes[route_name])
+
+
+def _get_valid_delegation_route_names(cfg: Optional[dict] = None) -> List[str]:
+    """Return only fully valid route names for the dynamic model schema."""
+    routes, routes_error = _load_delegation_routes(cfg)
+    if routes_error:
+        return []
+
+    names: List[str] = []
+    for raw_name, definition in routes.items():
+        if (
+            not isinstance(raw_name, str)
+            or not raw_name.strip()
+            or raw_name != raw_name.strip()
+        ):
+            continue
+        parsed, error = _parse_delegation_route_definition(raw_name, definition)
+        if parsed is not None and error is None:
+            names.append(raw_name)
+    return names
+
+
 # ---------------------------------------------------------------------------
 # OpenAI Function-Calling Schema
 # ---------------------------------------------------------------------------
@@ -4204,7 +4373,9 @@ def _build_tasks_param_description() -> str:
         f"Batch mode: tasks to run in parallel (up to {max_children} for this "
         f"user, set via delegation.max_concurrent_children). Each gets "
         "its own subagent with isolated context and terminal session. "
-        "When provided, top-level goal/context/role are ignored."
+        "When provided, top-level goal/context/role are ignored. A top-level "
+        "route still applies to every child; use separate delegate_task calls "
+        "for mixed-route work."
     )
 
 
@@ -4275,6 +4446,23 @@ def _build_dynamic_schema_overrides() -> dict:
             # An explicit empty allowlist disables the model-facing override.
             overrides_params["properties"].pop("model", None)
 
+    valid_routes = _get_valid_delegation_route_names()
+    if valid_routes:
+        overrides_params["properties"]["route"]["enum"] = valid_routes
+        overrides_params["properties"]["route"]["description"] = (
+            "Operator-defined semantic route for every child in this "
+            "delegation. A route fixes the model, reasoning configuration, "
+            "role, and fallback policy; it cannot be combined with model. "
+            "Use separate delegate_task calls for mixed-route batches. "
+            "Available routes: "
+            + ", ".join(valid_routes)
+            + "."
+        )
+    else:
+        # Keep optional config policy invisible when no fully valid routes are
+        # available, matching the existing dynamic model-allowlist behavior.
+        overrides_params["properties"].pop("route", None)
+
     return {
         "description": _build_top_level_description(),
         "parameters": overrides_params,
@@ -4325,6 +4513,10 @@ DELEGATE_TASK_SCHEMA = {
                     "delegation.allowed_models is configured, the override "
                     "must be in that operator allowlist."
                 ),
+            },
+            "route": {
+                "type": "string",
+                "description": "(rebuilt at get_definitions() time)",
             },
             "tasks": {
                 "type": "array",
@@ -4446,6 +4638,8 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        model=args.get("model"),
+        route=args.get("route"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
         parent_agent=kw.get("parent_agent"),
