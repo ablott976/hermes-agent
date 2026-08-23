@@ -3728,6 +3728,19 @@ class AIAgent:
                     "database). Your message should already be saved — "
                     "please send it again in a moment."
                 )
+            if cause == "corrupt":
+                return (
+                    prefix
+                    + "the turn was stopped because the state database "
+                    "reported structural corruption (the transcript would "
+                    "have been lost on restart). Freeing disk space will "
+                    "not help. Recovery options:\n"
+                    "1. Run `hermes doctor --fix`\n"
+                    "2. Salvage with: sqlite3 ~/.hermes/state.db \".recover\" "
+                    "(then replace state.db)\n"
+                    "3. Restore from a backup in ~/.hermes/backups/\n"
+                    "Then send your message again."
+                )
             if cause == "disk":
                 return (
                     prefix
